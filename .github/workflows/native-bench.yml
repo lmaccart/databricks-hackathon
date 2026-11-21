@@ -1,410 +1,66 @@
 name: Native amd64 performance check
-run-name: Native amd64 — ${{ inputs.revision || github.sha }}
+run-name: Cold-cache diagnostic — 7fd1b76 vs 14ccc10
 on:
   workflow_dispatch:
-    inputs:
-      revision:
-        description: Optional candidate commit to check out (defaults to the selected ref)
-        type: string
-      baseline:
-        description: Full SHA of the timed control (default is the original scored entry)
-        type: string
-        default: cc9f33ee6c3ccf9799dd89bac6dbfd8ce81abc4e
-      challenge:
-        description: Check both 20M seeds row-for-row, run x86 tests, and time the second seed
-        type: boolean
-        default: false
-      profile:
-        description: Sample the candidate with Linux perf after timing
-        type: boolean
-        default: false
-      extended:
-        description: Also measure allocator and whole-binary ISA experiments
-        type: boolean
-        default: false
-      containers:
-        description: Also compare the actual restricted amd64 Docker images
-        type: boolean
-        default: false
-      scale:
-        description: Check every 60M row on native Linux; with scale_pairs, also compare a second 60M seed
-        type: boolean
-        default: false
-      scale_pairs:
-        description: Also time three paired full 60M container runs under the 14 GiB no-swap cap
-        type: boolean
-        default: false
-      oracle:
-        description: Compare 20 seeds at 10k, 100k and 1M events against the independent Python implementation
-        type: boolean
-        default: false
-      floor:
-        description: Also measure event byte scanning, strict field decoding, and ID/timestamp decoding in isolation
-        type: boolean
-        default: false
-  push:
-    branches: [bench/native-amd64, bench/container, bench/scale]
-
 permissions:
   contents: read
-
 jobs:
-  compare:
+  coldcheck:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.revision || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Build the scored and candidate binaries
+      - name: Record environment and build exact packaged images
         shell: bash
-        env:
-          CONTROL: ${{ inputs.baseline || 'cc9f33ee6c3ccf9799dd89bac6dbfd8ce81abc4e' }}
         run: |
-          set -eu
-          [[ "$CONTROL" =~ ^[0-9a-f]{40}$ ]]
-          echo "benchmark source: $(git rev-parse HEAD); control: $CONTROL"
-          rustup toolchain install 1.100.0 --profile minimal
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
-          git worktree add --detach "$RUNNER_TEMP/control" "$CONTROL"
-          if [[ "${{ inputs.containers }}" == true ]]; then
-            # Compare the executables actually shipped by each Dockerfile, including compiler profiles.
-            for spec in "ss-bench:scored|$RUNNER_TEMP/control|scored" "ss-bench:current|.|candidate"; do
-              IFS='|' read -r image context exe <<<"$spec"
-              t0=$SECONDS
-              docker build --platform linux/amd64 -t "$image" "$context"
-              echo "image build: $exe $((SECONDS - t0)) s"
-              cid=$(docker create "$image")
-              docker cp "$cid:/usr/local/bin/shopping_sessions" "$RUNNER_TEMP/$exe"
-              if readelf -d "$RUNNER_TEMP/$exe" | grep 'NEEDED.*libhwy' >/dev/null; then
-                mkdir -p "$RUNNER_TEMP/ss-libs"
-                for so in libhwy.so.1 libhwy_contrib.so.1; do
-                  docker cp -L "$cid:/usr/lib/x86_64-linux-gnu/$so" "$RUNNER_TEMP/ss-libs/$so"
-                done
-                echo "LD_LIBRARY_PATH=$RUNNER_TEMP/ss-libs" >>"$GITHUB_ENV"
-              fi
-              docker rm "$cid" >/dev/null
-              docker image inspect "$image" | jq -r '.[0].Config.Env[] |
-                select(test("^MIMALLOC_(PURGE_DELAY|ALLOW_THP)=-?[0-9]+$"))' >"$RUNNER_TEMP/$exe.allocator-env"
-            done
-            if [[ -s "$RUNNER_TEMP/scored.allocator-env" || -s "$RUNNER_TEMP/candidate.allocator-env" ]]; then
-              # Wrap both sides if either image configures its allocator. Keep
-              # DATA_DIR/OUTPUT_DIR from the native test, not the Docker mounts.
-              for exe in scored candidate; do
-                mv "$RUNNER_TEMP/$exe" "$RUNNER_TEMP/$exe.bin"
-                {
-                  echo '#!/bin/sh'
-                  sed 's/^/export /' "$RUNNER_TEMP/$exe.allocator-env"
-                  echo 'exec "$0.bin" "$@"'
-                } >"$RUNNER_TEMP/$exe"
-                chmod +x "$RUNNER_TEMP/$exe"
-              done
-            fi
-            exit 0
-          fi
-          cargo +1.100.0 build --release --locked --manifest-path "$RUNNER_TEMP/control/fast/Cargo.toml"
-          cp "$CARGO_TARGET_DIR/release/shopping_sessions" "$RUNNER_TEMP/scored"
-          cargo +1.100.0 clean --release --package shopping_sessions --manifest-path "$RUNNER_TEMP/control/fast/Cargo.toml"
-          cargo +1.100.0 build --release --locked --manifest-path fast/Cargo.toml
-          cp "$CARGO_TARGET_DIR/release/shopping_sessions" "$RUNNER_TEMP/candidate"
-      - name: Get and verify public generator and dev answer
+          set -euo pipefail
+          echo "workflow commit $(git rev-parse HEAD)"
+          test "$(nproc)" -ge 4
+          lscpu | grep -E 'Model name:|CPU\(s\):|Thread\(s\) per core:'
+          uname -a
+          docker version
+          df -hT "$RUNNER_TEMP"
+          findmnt -T "$RUNNER_TEMP"
+          lsblk -o NAME,TYPE,SIZE,ROTA,MODEL,FSTYPE,MOUNTPOINTS
+          git worktree add --detach "$RUNNER_TEMP/control" 7fd1b7602280cfce05ac97b6afb703fa42c0b6ba
+          git worktree add --detach "$RUNNER_TEMP/finalist" 14ccc10f1dfc0845760640eeee2fa3db62b3e87a
+          git -C "$RUNNER_TEMP/control" rev-parse HEAD HEAD^{tree}
+          git -C "$RUNNER_TEMP/finalist" rev-parse HEAD HEAD^{tree}
+          docker build --platform linux/amd64 -t coldcheck:control "$RUNNER_TEMP/control"
+          docker build --platform linux/amd64 -t coldcheck:finalist "$RUNNER_TEMP/finalist"
+          docker image inspect coldcheck:control coldcheck:finalist --format '{{.RepoTags}} {{.Id}}'
+      - name: Prepare official generator and comparison tool
         shell: bash
         working-directory: ${{ runner.temp }}
         run: |
-          set -eu
-          for name in generator dev-answer; do
-            curl --fail --silent --show-error --location --retry 2 \
-              "https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/$name.zip" -o "$name.zip"
-          done
-          sha256sum -c <<'SUMS'
-          13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  generator.zip
-          7eb8e1f0b1f431d178d28ac9437ce85809c44eb6393fdd42fb59857f30834fa9  dev-answer.zip
-          SUMS
-          unzip -q generator.zip
-          unzip -q dev-answer.zip
-          cargo +1.100.0 build --release --locked --manifest-path generator/Cargo.toml
-          generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
-          generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output practice
-      - name: Check exact dev rows and benchmark start to exit
-        shell: bash
-        run: |
           set -euo pipefail
-          python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/pip" -q install pyarrow
-          t=$(nproc)
-          if (( t > 8 )); then t=8; fi
-          export NCPU=$t RAYON_NUM_THREADS=$t
-          DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$RUNNER_TEMP/dev-out" "$RUNNER_TEMP/candidate" >"$RUNNER_TEMP/stdout"
-          test ! -s "$RUNNER_TEMP/stdout"
-          "$RUNNER_TEMP/venv/bin/python" tools/compare_outputs.py "$RUNNER_TEMP/dev-answer" "$RUNNER_TEMP/dev-out"
-          {
-            echo "### Native Linux/amd64 — $(git rev-parse HEAD)"
-            echo '```'
-            lscpu | grep -E 'Model name:|Thread.s. per core:'
-            echo "Rayon workers: $t; five pairs; process start to exit, no container startup"
-            python3 tools/bench_pair.py "$RUNNER_TEMP/scored" "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/practice" \
-              --threads "$t" --tmpdir "$RUNNER_TEMP" --phases
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Challenge — exact practice and leap-day rows
-        if: ${{ inputs.challenge }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
-          t=$(nproc); if (( t > 8 )); then t=8; fi
-          export NCPU=$t RAYON_NUM_THREADS=$t POLARS_MAX_THREADS=$t
-          tool="$GITHUB_WORKSPACE/tools/bench_pair.py"
-          py="$RUNNER_TEMP/venv/bin/python"
-          cargo +1.100.0 test --locked --release --manifest-path fast/Cargo.toml
-          cd "$RUNNER_TEMP"
-          ./venv/bin/pip -q install polars
-          curl -fsSL --retry 2 'https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/starter-duckdb.zip' -o starter.zip
-          echo 'b84ff8726c43749043c33c250548a9ac9987b9132d28ac818a47515bd128f77c  starter.zip' | sha256sum -c -
-          unzip -qo starter.zip
-          "$py" starter-duckdb/scripts/run_fixtures.py starter-duckdb/fixtures -- "$PWD/candidate"
-          ./generator/target/release/generate --seed 15 --events 20000000 --clicks 5000000 --output leap
-          for dataset in practice leap; do
-            for exe in scored candidate; do
-              DATA_DIR="$PWD/$dataset" OUTPUT_DIR="$PWD/$exe-out" ./"$exe" > stdout-check
-              test ! -s stdout-check
-            done
-            "$py" starter-duckdb/scripts/compare.py scored-out candidate-out
-            rm -r scored-out candidate-out
-          done
-          echo '### Seed 15, 20M events and 5M clicks' >> "$GITHUB_STEP_SUMMARY"
-          python3 "$tool" "$PWD/scored" "$PWD/candidate" "$PWD/leap" --threads "$t" --tmpdir "$PWD" --phases | tee -a "$GITHUB_STEP_SUMMARY"
-          rm -r leap
-      - name: Separate scanning and decoding costs
-        if: ${{ inputs.floor }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
-          t=$(nproc); if (( t > 8 )); then t=8; fi
-          cargo +1.100.0 build --locked --release --manifest-path fast/Cargo.toml --example input_floor
-          echo '### Event input only; no output, joins or sessions' >>"$GITHUB_STEP_SUMMARY"
-          RAYON_NUM_THREADS="$t" "$CARGO_TARGET_DIR/release/examples/input_floor" "$RUNNER_TEMP/practice" | tee -a "$GITHUB_STEP_SUMMARY"
-          if [[ -f fast/src/events/budget.rs ]]; then
-            SS_BENCH_DATA="$RUNNER_TEMP/practice" RAYON_NUM_THREADS="$t" \
-              cargo +1.100.0 test --locked --release --manifest-path fast/Cargo.toml \
-              typed_routing_budget -- --ignored --nocapture | tee -a "$GITHUB_STEP_SUMMARY"
-          fi
-      - name: Sample native on-CPU work
-        if: ${{ inputs.profile }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP"
-          if ! command -v perf >/dev/null || ! perf --version >/dev/null 2>&1; then
-            sudo apt-get -qq update
-            sudo apt-get -qq install -y linux-tools-generic
-          fi
-          perf=$(find /usr/lib/linux-tools -name perf -type f 2>/dev/null | sort -V | tail -1 || true)
-          perf=${perf:-$(command -v perf)}
-          t=$(nproc); if (( t > 8 )); then t=8; fi
-          sudo env DATA_DIR="$PWD/practice" OUTPUT_DIR="$PWD/profile-out" RAYON_NUM_THREADS="$t" \
-            "$perf" record -e cpu-clock:u -F 999 -o "$PWD/ss.perf" -- "$PWD/candidate"
-          sudo "$perf" report -i "$PWD/ss.perf" --stdio --no-children --percent-limit 0.9 --sort dso,symbol
-      - name: Compare default allocator and mimalloc on the identical binary
-        if: ${{ inputs.extended }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Use the scorer image's distribution and shared library. No system install.
-          docker run --rm -v "$RUNNER_TEMP:/result" debian:bookworm-slim sh -ec '
-            apt-get -qq update
-            apt-get -qq install -y --no-install-recommends libmimalloc2.0
-            cp -L /usr/lib/x86_64-linux-gnu/libmimalloc.so.2 /result/libmimalloc.so
-          '
-          t=$(nproc); if (( t > 8 )); then t=8; fi
-          {
-            echo '### Allocator only, identical candidate executable'
-            echo '```'
-            python3 tools/bench_pair.py "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/practice" \
-              --threads "$t" --tmpdir "$RUNNER_TEMP" --candidate-env "LD_PRELOAD=$RUNNER_TEMP/libmimalloc.so"
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Compare a guarded x86 feature build with the portable binary
-        if: ${{ inputs.extended }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          export SS_EXEC_DIR="$RUNNER_TEMP/multiversion" CARGO_TARGET_DIR="$RUNNER_TEMP/target"
-          mkdir -p "$SS_EXEC_DIR"
-          cp "$RUNNER_TEMP/candidate" "$SS_EXEC_DIR/base"
-          RUSTFLAGS='-Ctarget-feature=+sse4.2,+popcnt,+avx2,+bmi1,+bmi2,+aes' \
-            cargo +1.100.0 build --target x86_64-unknown-linux-gnu --release --locked --manifest-path fast/Cargo.toml
-          cp "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/shopping_sessions" "$SS_EXEC_DIR/isa"
-          rustc +1.100.0 --edition 2024 -Copt-level=s -Cpanic=abort -Ctarget-feature=+crt-static \
-            tools/isa/dispatch.rs -o "$SS_EXEC_DIR/dispatch"
-          t=$(nproc); if (( t > 8 )); then t=8; fi
-          export RAYON_NUM_THREADS=$t
-          DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$RUNNER_TEMP/isa-dev" "$SS_EXEC_DIR/dispatch"
-          "$RUNNER_TEMP/venv/bin/python" tools/compare_outputs.py "$RUNNER_TEMP/dev-answer" "$RUNNER_TEMP/isa-dev"
-          {
-            echo '### CPU dispatch (launch overhead included)'
-            echo '```'
-            python3 tools/bench_pair.py "$SS_EXEC_DIR/base" "$SS_EXEC_DIR/dispatch" "$RUNNER_TEMP/practice" \
-              --threads "$t" --tmpdir "$RUNNER_TEMP"
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Compare one versus two workers per available logical CPU
-        if: ${{ !inputs.challenge && !inputs.profile && !inputs.oracle && !inputs.floor }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          t=$(nproc); if (( t > 8 )); then t=8; fi
-          {
-            echo "### Pool size only: $t vs $((2*t)) workers"
-            echo '```'
-            python3 tools/bench_pair.py "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/practice" \
-              --threads "$t" --candidate-threads "$((2*t))" --tmpdir "$RUNNER_TEMP"
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Verify 60 official-generator cases against the Python oracle
-        if: ${{ inputs.oracle }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The script locates the reference and comparer relative to tools/.
-          git show "$GITHUB_SHA:tools/official_diff.py" >tools/ci_oracle_diff.py
-          RAYON_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 "$RUNNER_TEMP/venv/bin/python" tools/ci_oracle_diff.py \
-            --generator "$RUNNER_TEMP/generator/target/release/generate" --binary "$RUNNER_TEMP/candidate" --jobs 2
-          git show "$GITHUB_SHA:tools/grammar_diff.py" >tools/ci_grammar_diff.py
-          "$RUNNER_TEMP/venv/bin/python" tools/ci_grammar_diff.py "$RUNNER_TEMP/candidate"
-          git show "$GITHUB_SHA:tools/opaque_diff.py" >tools/ci_opaque_diff.py
-          "$RUNNER_TEMP/venv/bin/python" tools/ci_opaque_diff.py "$RUNNER_TEMP/dev" "$RUNNER_TEMP/candidate"
-          git show "$GITHUB_SHA:tools/graph_diff.py" >tools/ci_graph_diff.py
-          "$RUNNER_TEMP/venv/bin/python" tools/ci_graph_diff.py "$RUNNER_TEMP/candidate"
-          echo '### Python oracle: all 60 generated cases matched on native amd64' >>"$GITHUB_STEP_SUMMARY"
-      - name: Compare the actual scorer images on native Linux
-        if: ${{ inputs.containers || github.ref_name == 'bench/container' || github.ref_name == 'bench/scale' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker build --platform linux/amd64 -t ss-bench:scored "$RUNNER_TEMP/control"
-          docker build --platform linux/amd64 -t ss-bench:current .
-          t=$(nproc); if (( t > 8 )); then t=8; fi
-          export NCPU=$t DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$RUNNER_TEMP/dev-docker" SCRATCH_DIR="$RUNNER_TEMP/docker-scratch"
-          mkdir -p "$OUTPUT_DIR" "$SCRATCH_DIR"
-          SS_BENCH_IMAGE=ss-bench:current tools/bench_container.sh >"$RUNNER_TEMP/docker.stdout"
-          test ! -s "$RUNNER_TEMP/docker.stdout"
-          "$RUNNER_TEMP/venv/bin/python" tools/compare_outputs.py "$RUNNER_TEMP/dev-answer" "$OUTPUT_DIR"
-          {
-            echo '### Full restricted docker run, including CLI startup/removal'
-            echo '```'
-            # Root can remove timed output directories created by container UID 1000.
-            sudo python3 tools/bench_pair.py tools/bench_container.sh tools/bench_container.sh "$RUNNER_TEMP/practice" \
-              --threads "$t" --tmpdir "$RUNNER_TEMP" --baseline-env SS_BENCH_IMAGE=ss-bench:scored \
-              --candidate-env SS_BENCH_IMAGE=ss-bench:current --phases
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Distinguish container launch from pipeline work
-        if: ${{ inputs.containers && inputs.floor }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          t=$(nproc); if (( t > 8 )); then t=8; fi
-          git show "$GITHUB_SHA:tools/container_clock.py" >"$RUNNER_TEMP/clock.py"
-          git show "$GITHUB_SHA:tools/bench_container.sh" >"$RUNNER_TEMP/clock-adapter"
-          chmod +x "$RUNNER_TEMP/clock-adapter"
-          sudo python3 "$RUNNER_TEMP/clock.py" "$RUNNER_TEMP/clock-adapter" "$RUNNER_TEMP/candidate" \
-            "$RUNNER_TEMP/practice" "$RUNNER_TEMP" ss-bench:current "$t" | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Validate final-scale output under a no-swap container limit
-        if: ${{ inputs.scale || inputs.scale_pairs || github.ref_name == 'bench/scale' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP"
-          rm -rf -- "$RUNNER_TEMP/practice"   # generated by this ephemeral job
-          ./generator/target/release/generate --seed 13 --events 60000000 --clicks 15000000 --output final-scale
-          t=$(nproc); if (( t > 8 )); then t=8; fi
-          if ! docker image inspect ss-bench:current >/dev/null 2>&1; then
-            docker build --platform linux/amd64 -t ss-bench:current "$GITHUB_WORKSPACE"
-          fi
-          mkdir out-60 scratch-60; chmod 777 out-60 scratch-60
-          TIMEFORMAT='60M full docker run: %3R seconds'
-          time docker run --rm --platform linux/amd64 --network none --read-only \
-            --cpus "$t" --memory 14g --memory-swap 14g --pids-limit 4096 --user 1000:1000 \
-            --tmpfs /tmp:size=64m --cap-drop ALL --security-opt no-new-privileges \
-            -e NCPU="$t" -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-            -v "$PWD/final-scale:/data:ro" -v "$PWD/out-60:/output" -v "$PWD/scratch-60:/scratch" \
-            ss-bench:current >stdout-60
-          test ! -s stdout-60
-          # The old binary is an exact comparison, not a timing control here.
-          # Limit oracle-side parallel scratch on the smaller hosted machine.
-          RAYON_NUM_THREADS=2 MALLOC_ARENA_MAX=2 DATA_DIR="$RUNNER_TEMP/final-scale" \
-            OUTPUT_DIR="$RUNNER_TEMP/expected-60" "$RUNNER_TEMP/scored"
-          "$RUNNER_TEMP/venv/bin/pip" -q install polars
           curl --fail --silent --show-error --location --retry 2 \
-            'https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/starter-duckdb.zip' -o starter.zip
+            https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip -o generator.zip
+          echo '13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  generator.zip' | sha256sum -c -
+          curl --fail --silent --show-error --location --retry 2 \
+            https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/starter-duckdb.zip -o starter.zip
           echo 'b84ff8726c43749043c33c250548a9ac9987b9132d28ac818a47515bd128f77c  starter.zip' | sha256sum -c -
-          unzip -qo starter.zip 'starter-duckdb/scripts/*.py'
-          POLARS_MAX_THREADS="$t" "$RUNNER_TEMP/venv/bin/python" starter-duckdb/scripts/compare.py expected-60 out-60
-      - name: Pair final-scale Docker runs on the same machine
-        if: ${{ inputs.scale_pairs }}
+          unzip -q generator.zip
+          unzip -q starter.zip 'starter-duckdb/scripts/*.py'
+          rustup toolchain install 1.100.0 --profile minimal
+          cargo +1.100.0 build --release --locked --manifest-path generator/Cargo.toml
+          python3 -m venv venv
+          venv/bin/pip -q install polars
+      - name: Compare cold and warmed images
         shell: bash
         run: |
           set -euo pipefail
-          if ! docker image inspect ss-bench:scored >/dev/null 2>&1; then
-            docker build --platform linux/amd64 -t ss-bench:scored "$RUNNER_TEMP/control"
-          fi
-          # Take the timing harness from the workflow revision, even when testing an older entry.
-          adapter="$RUNNER_TEMP/bench-container"
-          git show "$GITHUB_SHA:tools/bench_container.sh" >"$adapter"
-          chmod +x "$adapter"
-          git show "$GITHUB_SHA:tools/bench_pair.py" >"$RUNNER_TEMP/scale-pair.py"
-          t=$(nproc); if (( t > 8 )); then t=8; fi
-          {
-            echo "### 60M events, 15M clicks — full Docker, 14 GiB, no swap, $t workers"
-            echo '```'
-            sudo env SS_BENCH_MEMORY_GB=14 python3 "$RUNNER_TEMP/scale-pair.py" "$adapter" "$adapter" \
-              "$RUNNER_TEMP/final-scale" --tmpdir "$RUNNER_TEMP" --threads "$t" --runs 3 --phases \
-               --baseline-env SS_BENCH_IMAGE=ss-bench:scored --candidate-env SS_BENCH_IMAGE=ss-bench:current
-             echo '```'
-           } | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Measure final-scale application memory under the same no-swap limit
-        if: ${{ inputs.scale_pairs && (inputs.oracle || inputs.scale) }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          git show "$GITHUB_SHA:tools/container_peak.c" >"$RUNNER_TEMP/container_peak.c"
-          cc -O2 -Wall -Wextra -Werror -static "$RUNNER_TEMP/container_peak.c" -o "$RUNNER_TEMP/container_peak"
-          cd "$RUNNER_TEMP"
-          mkdir out-peak scratch-peak; chmod 777 out-peak scratch-peak
-          t=$(nproc); if (( t > 8 )); then t=8; fi
-          docker run --rm --platform linux/amd64 --network none --read-only \
-            --cpus "$t" --memory 14g --memory-swap 14g --pids-limit 4096 --user 1000:1000 \
-            --tmpfs /tmp:size=64m --cap-drop ALL --security-opt no-new-privileges \
-            -e NCPU="$t" -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-            -v "$PWD/container_peak:/peak:ro" -v "$PWD/final-scale:/data:ro" \
-            -v "$PWD/out-peak:/output" -v "$PWD/scratch-peak:/scratch" --entrypoint /peak \
-            ss-bench:current /usr/local/bin/shopping_sessions >peak.stdout 2>peak.stderr
-          test ! -s peak.stdout
-          grep '^memory-budget:' peak.stderr | tee -a "$GITHUB_STEP_SUMMARY"
-          POLARS_MAX_THREADS="$t" ./venv/bin/python starter-duckdb/scripts/compare.py expected-60 out-peak
-      - name: Verify a second independently generated final-scale input in the actual image
-        if: ${{ inputs.scale && inputs.scale_pairs }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP"
-          rm -r final-scale  # generated by the completed seed-13 step on this runner
-          ./generator/target/release/generate --seed 948307 --events 60000000 --clicks 15000000 --output holdout-60
-          RAYON_NUM_THREADS=2 MALLOC_ARENA_MAX=2 DATA_DIR="$PWD/holdout-60" OUTPUT_DIR="$PWD/expected-holdout" ./scored >control.stdout
-          test ! -s control.stdout
-          mkdir out-holdout scratch-holdout; chmod 777 out-holdout scratch-holdout
-          t=$(nproc); if (( t > 8 )); then t=8; fi
-          docker run --rm --platform linux/amd64 --network none --read-only \
-            --cpus "$t" --memory 14g --memory-swap 14g --pids-limit 4096 --user 1000:1000 \
-            --tmpfs /tmp:size=64m --cap-drop ALL --security-opt no-new-privileges \
-            -e NCPU="$t" -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-            -v "$PWD/container_peak:/peak:ro" -v "$PWD/holdout-60:/data:ro" \
-            -v "$PWD/out-holdout:/output" -v "$PWD/scratch-holdout:/scratch" --entrypoint /peak \
-            ss-bench:current /usr/local/bin/shopping_sessions >holdout.stdout 2>holdout.stderr
-          test ! -s holdout.stdout
-          grep '^memory-budget:' holdout.stderr | tee -a "$GITHUB_STEP_SUMMARY"
-          POLARS_MAX_THREADS="$t" ./venv/bin/python starter-duckdb/scripts/compare.py expected-holdout out-holdout
+          sudo python3 tools/coldcheck_terra.py "$RUNNER_TEMP" \
+            "$RUNNER_TEMP/generator/target/release/generate" \
+            "$RUNNER_TEMP/venv/bin/python" "$RUNNER_TEMP/starter-duckdb/scripts/compare.py" \
+            2>&1 | tee "$RUNNER_TEMP/coldcheck.log"
+      - name: Preserve diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coldcheck-log
+          path: ${{ runner.temp }}/coldcheck.log
+          if-no-files-found: warn
