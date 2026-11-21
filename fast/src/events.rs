@@ -40,10 +40,10 @@ fn parse<'a>(
     ws: i64,
     we: i64,
     hs: &RandomState,
-) -> (Vec<Vec<PEv>>, Vec<Vec<Claim>>) {
+) -> (Vec<Vec<PEv>>, Vec<Claim>, Vec<Vec<u64>>) {
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Vec<PEv>> = (0..NS).map(|_| Vec::with_capacity(reserve)).collect();
-    let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
+    let mut claims = Vec::with_capacity(reserve * NS);
     let mut emit = |e: Pending| {
         let mut target = NONE;
         if e.uid != 0 {
@@ -57,7 +57,7 @@ fn parse<'a>(
                 cat: e.cat,
             });
         }
-        claims[shard(hs.hash_one(e.id))].push(Claim {
+        claims.push(Claim {
             id: e.id,
             ingest: e.ingest,
             target,
@@ -107,67 +107,73 @@ fn parse<'a>(
     for i in n.saturating_sub(ring.len())..n {
         emit(ring[i % ring.len()]);
     }
-    (payload, claims)
-}
-
-#[inline]
-fn probe(id: u64, mask: usize) -> (usize, u64) {
-    let x = (id ^ (id >> 27)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    let bits = 1u64.rotate_left((x >> 52) as u32) | 1u64.rotate_left((x >> 58) as u32);
-    (((x >> 17) as usize) & mask, bits)
-}
-
-fn losers(parts: Vec<(usize, Vec<Claim>)>) -> Vec<Location> {
-    let n: usize = parts.iter().map(|(_, v)| v.len()).sum();
-    // Local blocked Bloom: the second occurrence of any ID necessarily finds
-    // both bits already set and marks it suspect. False positives go to an
-    // EXACT key table. The second pass therefore includes the *first* claim of
-    // every duplicate, too; no assumption about ingest order or validity.
-    let words = n.div_ceil(8).next_power_of_two();
-    let mut bloom = vec![(0u64, 0u64); words];
-    let mask = words - 1;
-    let mut suspects = 0usize;
-    for (_, claims) in &parts {
-        for c in claims {
-            let (i, b) = probe(c.id, mask);
-            let (seen, repeated) = &mut bloom[i];
-            if *seen & b == b {
-                *repeated |= b;
-                suspects += 1;
-            }
-            *seen |= b;
-        }
+    let mut descriptors: Vec<Vec<u64>> = (0..NS).map(|_| Vec::with_capacity(reserve)).collect();
+    for (i, claim) in claims.iter().enumerate() {
+        let hash = hs.hash_one(claim.id);
+        descriptors[shard(hash)].push(((hash as u32 as u64) << 32) | i as u64);
     }
+    (payload, claims, descriptors)
+}
+
+#[derive(Clone, Copy)]
+struct Slot {
+    tag: u32,
+    index: u32,
+    batch: usize,
+}
+
+fn losers(parts: Vec<(usize, Vec<u64>)>, claims: &[Vec<Claim>]) -> Vec<Location> {
+    let n: usize = parts.iter().map(|(_, v)| v.len()).sum();
     let mut remove = Vec::new();
-    if suspects == 0 {
+    if n == 0 {
         return remove;
     }
-    let mut best = Map::with_capacity_and_hasher(suspects, rs());
-    for (batch, claims) in parts {
-        for c in claims {
-            let (i, b) = probe(c.id, mask);
-            if bloom[i].1 & b != b {
-                continue;
-            }
-            let loc = Location {
-                batch,
-                target: c.target,
-            };
-            let lost = match best.entry(c.id) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((c.ingest, loc));
-                    continue;
+    let size = n.checked_mul(2).unwrap().next_power_of_two();
+    let mut table = vec![
+        Slot {
+            tag: 0,
+            index: NONE,
+            batch: 0
+        };
+        size
+    ];
+    let mask = size - 1;
+    for (batch, descriptors) in parts {
+        for descriptor in descriptors {
+            let tag = (descriptor >> 32) as u32;
+            let index = descriptor as u32;
+            let mut pos = tag as usize & mask;
+            loop {
+                let slot = &mut table[pos];
+                if slot.index == NONE {
+                    *slot = Slot { tag, index, batch };
+                    break;
                 }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if c.ingest < e.get().0 {
-                        e.insert((c.ingest, loc)).1
-                    } else {
-                        loc
+                if slot.tag == tag {
+                    let current = claims[batch][index as usize];
+                    let best = claims[slot.batch][slot.index as usize];
+                    // Tags are only a filter; the codec key is an exact ID.
+                    if current.id == best.id {
+                        let lost = if current.ingest < best.ingest {
+                            let loc = Location {
+                                batch: slot.batch,
+                                target: best.target,
+                            };
+                            *slot = Slot { tag, index, batch };
+                            loc
+                        } else {
+                            Location {
+                                batch,
+                                target: current.target,
+                            }
+                        };
+                        if lost.target != NONE {
+                            remove.push(lost);
+                        }
+                        break;
                     }
                 }
-            };
-            if lost.target != NONE {
-                remove.push(lost);
+                pos = (pos + 1) & mask;
             }
         }
     }
@@ -186,16 +192,21 @@ pub(super) fn by_person<'a>(
     let parsed: Vec<_> = chunks.par_iter().map(|c| parse(c, sm, people, ws, we, hs)).collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
-    let mut claims: Vec<Vec<_>> = (0..NS).map(|_| Vec::new()).collect();
-    for (batch, (payload, cs)) in parsed.into_iter().enumerate() {
+    let mut claims = Vec::with_capacity(parsed.len());
+    let mut descriptors: Vec<Vec<_>> = (0..NS).map(|_| Vec::new()).collect();
+    for (batch, (payload, cs, ds)) in parsed.into_iter().enumerate() {
         payloads.push(payload);
-        for (bucket, c) in claims.iter_mut().zip(cs) {
-            if !c.is_empty() {
-                bucket.push((batch, c));
+        claims.push(cs);
+        for (bucket, d) in descriptors.iter_mut().zip(ds) {
+            if !d.is_empty() {
+                bucket.push((batch, d));
             }
         }
     }
-    let removals: Vec<_> = claims.into_par_iter().map(losers).collect();
+    let removals: Vec<_> = descriptors
+        .into_par_iter()
+        .map(|parts| losers(parts, &claims))
+        .collect();
     let mut by_batch: Vec<Vec<u32>> = (0..payloads.len()).map(|_| Vec::new()).collect();
     for locations in removals {
         for loc in locations {
@@ -219,37 +230,91 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bloom_alias_keeps_distinct_id_and_invalid_winner_kills_valid_loser() {
-        // With one word, different IDs can have exactly the same two bit
-        // positions. Force such a collision rather than relying on a random seed.
-        let id = 13;
-        let alias = (id + 1..).find(|&k| probe(k, 0) == probe(id, 0)).unwrap();
-        let lost = losers(vec![
-            (
-                0,
-                vec![
-                    Claim {
-                        id,
-                        ingest: 3,
-                        target: 0,
-                    },
-                    Claim {
-                        id: alias,
-                        ingest: 4,
-                        target: 1,
-                    },
-                ],
-            ),
-            (
-                1,
-                vec![Claim {
-                    id,
-                    ingest: 1,
-                    target: NONE,
-                }],
-            ),
-        ]);
+    fn tag_collision_keeps_distinct_id_and_invalid_winner_kills_valid_loser() {
+        // Force both a tag collision and an open-addressing collision.
+        let claims = vec![
+            vec![
+                Claim {
+                    id: 13,
+                    ingest: 3,
+                    target: 0,
+                },
+                Claim {
+                    id: 14,
+                    ingest: 4,
+                    target: 1,
+                },
+            ],
+            vec![Claim {
+                id: 13,
+                ingest: 1,
+                target: NONE,
+            }],
+        ];
+        let tag = 7u64 << 32;
+        let lost = losers(vec![(0, vec![tag, tag | 1]), (1, vec![tag])], &claims);
         assert_eq!(lost.len(), 1);
         assert_eq!((lost[0].batch, lost[0].target), (0, 0));
+    }
+
+    #[test]
+    fn colliding_tags_match_exact_minimum_for_all_processing_orders() {
+        let mut claims = vec![Vec::new(); 4];
+        for i in 0..400u32 {
+            let batch = (i as usize * 7 + 1) % claims.len();
+            claims[batch].push(Claim {
+                id: (i % 83 + 1) as u64,
+                ingest: i64::from((i * 173) % 401),
+                target: if i % 11 == 0 { NONE } else { i },
+            });
+        }
+        for reverse in [false, true] {
+            let mut parts: Vec<_> = claims
+                .iter()
+                .enumerate()
+                .map(|(batch, cs)| {
+                    let mut descriptors: Vec<_> = (0..cs.len()).map(|i| (23u64 << 32) | i as u64).collect();
+                    if reverse {
+                        descriptors.reverse();
+                    }
+                    (batch, descriptors)
+                })
+                .collect();
+            if reverse {
+                parts.reverse();
+            }
+            let mut expected = Vec::new();
+            let mut best = std::collections::HashMap::new();
+            for (batch, cs) in claims.iter().enumerate() {
+                for c in cs {
+                    let loc = Location {
+                        batch,
+                        target: c.target,
+                    };
+                    match best.entry(c.id) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert((c.ingest, loc));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            let lost = if c.ingest < e.get().0 {
+                                e.insert((c.ingest, loc)).1
+                            } else {
+                                loc
+                            };
+                            if lost.target != NONE {
+                                expected.push((lost.batch, lost.target));
+                            }
+                        }
+                    }
+                }
+            }
+            let mut actual: Vec<_> = losers(parts, &claims)
+                .into_iter()
+                .map(|loc| (loc.batch, loc.target))
+                .collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+        }
     }
 }

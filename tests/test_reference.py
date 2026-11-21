@@ -214,6 +214,22 @@ class EventsOrder(unittest.TestCase):
         ])
         self.assertEqual(set(u), {("u3", "2026-10-02")})
 
+    def test_shuffled_duplicate_claims_across_files(self):
+        t = "2026-10-02T10:00:00Z"
+        for reverse in (False, True):
+            rows = [
+                ev("invalid", "later", t, ingest="2026-10-02T10:00:10Z"),
+                ev("winner", "wrong", t, ingest="2026-10-02T10:00:10Z"),
+                ev("malformed", "kept", t, ingest="2026-10-02T10:00:10Z"),
+                ev("invalid", "earlier", "bad", ingest="2026-10-02T10:00:00Z"),
+                ev("winner", "right", t, ingest="2026-10-02T10:00:00Z"),
+                'malformed,"bad"quote,bad,2026-10-02T09:00:00Z,view,p1,',
+            ]
+            if reverse:
+                rows.reverse()
+            u, _ = run_case(events=rows[:3], extra={"events/part-1.csv": rows[3:]})
+            self.assertEqual(set(u), {("right", "2026-10-02"), ("kept", "2026-10-02")})
+
     def test_late(self):
         t = "2026-10-02T10:00:00Z"
         u, _ = run_case(events=[

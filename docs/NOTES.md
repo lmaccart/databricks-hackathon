@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Thin claims experiment — 2026-11-20
+
+Candidate: per-chunk contiguous claims, 8-byte fingerprint/index descriptors and a shard-local exact open-addressed witness table, without rescanning CSV. Forced tag collisions and shuffled invalid/malformed duplicates are tested. Reference and binary tests, 36/36 official fixtures, 10 small differential seeds and the official dev answer match. The parent session will benchmark the 20M input; against its reported 1.78 s baseline, the candidate median and timing delta are not yet measured. This remains an experiment, not a demonstrated speedup.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.
