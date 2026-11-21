@@ -10,8 +10,12 @@ on:
         description: Also compare the actual restricted amd64 Docker images
         type: boolean
         default: false
+      scale:
+        description: Also compare every output row at 60M on native Linux
+        type: boolean
+        default: false
   push:
-    branches: [bench/native-amd64, bench/container]
+    branches: [bench/native-amd64, bench/container, bench/scale]
 
 permissions:
   contents: read
@@ -131,7 +135,7 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Compare the actual scorer images on native Linux
-        if: ${{ inputs.containers || github.ref_name == 'bench/container' }}
+        if: ${{ inputs.containers || github.ref_name == 'bench/container' || github.ref_name == 'bench/scale' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -152,3 +156,35 @@ jobs:
               --candidate-env SS_BENCH_IMAGE=ss-bench:current --phases
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Validate final-scale output under a no-swap container limit
+        if: ${{ inputs.scale || github.ref_name == 'bench/scale' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          ./generator/target/release/generate --seed 13 --events 60000000 --clicks 15000000 --output final-scale
+          t=$(nproc); if (( t > 8 )); then t=8; fi
+          # Use the already validated rebuild as oracle; its 60M result was
+          # previously compared row-for-row with the 5.03 s scored binary.
+          git -C "$GITHUB_WORKSPACE" worktree add --detach "$RUNNER_TEMP/scale-oracle" 3f1d667a9af155f711bdebcbe909f91b70762fa9
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target" RAYON_NUM_THREADS=$t NCPU=$t
+          cargo +1.100.0 build --release --locked --manifest-path scale-oracle/fast/Cargo.toml
+          DATA_DIR="$RUNNER_TEMP/final-scale" OUTPUT_DIR="$RUNNER_TEMP/expected-60" "$CARGO_TARGET_DIR/release/shopping_sessions"
+          if ! docker image inspect ss-bench:current >/dev/null 2>&1; then
+            docker build --platform linux/amd64 -t ss-bench:current "$GITHUB_WORKSPACE"
+          fi
+          mkdir out-60 scratch-60; chmod 777 out-60 scratch-60
+          TIMEFORMAT='60M full docker run: %3R seconds'
+          time docker run --rm --platform linux/amd64 --network none --read-only \
+            --cpus "$t" --memory 14g --memory-swap 14g --pids-limit 4096 --user 1000:1000 \
+            --tmpfs /tmp:size=64m --cap-drop ALL --security-opt no-new-privileges \
+            -e NCPU="$t" -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
+            -v "$PWD/final-scale:/data:ro" -v "$PWD/out-60:/output" -v "$PWD/scratch-60:/scratch" \
+            ss-bench:current >stdout-60
+          test ! -s stdout-60
+          "$RUNNER_TEMP/venv/bin/pip" -q install polars
+          curl --fail --silent --show-error --location --retry 2 \
+            'https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/starter-duckdb.zip' -o starter.zip
+          echo 'b84ff8726c43749043c33c250548a9ac9987b9132d28ac818a47515bd128f77c  starter.zip' | sha256sum -c -
+          unzip -qo starter.zip 'starter-duckdb/scripts/*.py'
+          POLARS_MAX_THREADS="$t" "$RUNNER_TEMP/venv/bin/python" starter-duckdb/scripts/compare.py expected-60 out-60
