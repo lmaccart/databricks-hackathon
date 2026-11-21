@@ -1,5 +1,24 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Allocator challenger — 2026-11-21
+
+Pinned the established `mimalloc` Rust wrapper at 0.1.52 (lockfile resolves
+`libmimalloc-sys` 0.1.49, embedding upstream mimalloc 3.3.2). Linux builds
+select `MiMalloc` with Rust's `#[global_allocator]`; non-Linux builds explicitly
+use `std::alloc::System`, so the macOS development build does not depend on
+mimalloc. This is a linked Rust allocator, not the earlier `LD_PRELOAD`
+control noted below. The prior v2/preload result was only +2.6% on native Intel
+and came from a different pipeline; no performance claim is made for this
+challenger. This machine has no native Linux runtime, so Linux linking and
+allocator performance still need confirmation on native Linux CI. A local
+`x86_64-unknown-linux-gnu` build was attempted without Docker but could not
+start because this Homebrew toolchain has no Linux `core`/`std` target
+installed; no large dataset timing was run.
+The native macOS System-allocator build passed, as did all 24 Rust tests,
+`cargo fmt --check`, and Clippy with warnings denied. `make test` could not
+complete because PyArrow is not installed; this checkout has no dev set or
+official fixture files available.
+
 ## Round four: slot-indexed range reduction — 2026-11-21
 
 Port of `be4a89c` onto `4933dbe` for a direct final-scale comparison. The flat CAS graph is unchanged: the physical slot anchors identity and `slot & 255` still selects its owner. The range path indexes the owner-local histogram by `slot >> 8`, without a rank remap or another hash. Compact offsets and exact bins feed the same `finish_user_day` and `finish_person` calls as the full-width path. The columnar writer is unchanged from `4ad0e5d`. Singletons that cannot claim a slot and windows too wide for a 32-bit offset keep full-width time and exact identity. The prior standalone range branch reportedly won all ten 20M pairs by 3.5% / 2.5% against `a32d0b7`; those figures are not timings for this integration.

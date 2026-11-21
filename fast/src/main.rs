@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+mod allocator;
 mod dims;
 mod events;
 mod links;
