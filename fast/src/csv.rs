@@ -73,10 +73,7 @@ fn chunks_sized<'a>(file: &'a [u8], cols: &[&str], path: &Path, size: usize) -> 
         return out;
     }
     let hdr_end = memchr(b'\n', file).unwrap_or(file.len());
-    let header: Vec<&[u8]> = file[..hdr_end]
-        .split(|&c| c == b',')
-        .map(header_name)
-        .collect();
+    let header: Vec<&[u8]> = file[..hdr_end].split(|&c| c == b',').map(header_name).collect();
     let mut idx = [0usize; 8];
     for (k, c) in cols.iter().enumerate() {
         idx[k] = header
@@ -121,10 +118,7 @@ pub fn kernel() -> &'static str {
     if has_avx2() {
         return "avx2";
     }
-    std::any::type_name::<Native>()
-        .rsplit("::")
-        .next()
-        .unwrap_or("?")
+    std::any::type_name::<Native>().rsplit("::").next().unwrap_or("?")
 }
 
 #[inline(always)]
@@ -139,9 +133,7 @@ fn dispatch<'a, F: FnMut(&Row<'a>)>(c: &Chunk<'a>, window: usize, f: &mut F) {
 
 #[cfg(target_arch = "x86_64")]
 fn has_avx2() -> bool {
-    is_x86_feature_detected!("avx2")
-        && is_x86_feature_detected!("bmi1")
-        && is_x86_feature_detected!("popcnt")
+    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi1") && is_x86_feature_detected!("popcnt")
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -170,12 +162,7 @@ fn scan<'a, C: Classify, F: FnMut(&Row<'a>)>(c: &Chunk<'a>, window: usize, f: &m
 
 /// `N >= 2`: rows of exactly N fields in slot order; 0: the general path.
 #[inline(always)]
-fn windows<'a, C: Classify, F: FnMut(&Row<'a>), const N: usize>(
-    data: &'a [u8],
-    window: usize,
-    slot: &[u8],
-    f: &mut F,
-) {
+fn windows<'a, C: Classify, F: FnMut(&Row<'a>), const N: usize>(data: &'a [u8], window: usize, slot: &[u8], f: &mut F) {
     // A small chunk (a small file) needs no full-size lists.
     let window = window.min(data.len().next_multiple_of(64));
     let mut lists = Lists::new(window);
@@ -249,13 +236,7 @@ impl Lists {
 
     /// Emit the well-formed rows among the first `lines` lines of window `w`.
     #[inline(always)]
-    fn rows<'a, F: FnMut(&Row<'a>), const N: usize>(
-        &self,
-        w: &'a [u8],
-        lines: usize,
-        slot: &[u8],
-        f: &mut F,
-    ) {
+    fn rows<'a, F: FnMut(&Row<'a>), const N: usize>(&self, w: &'a [u8], lines: usize, slot: &[u8], f: &mut F) {
         let commas = &self.commas[..];
         let mut c = 0; // first comma at or after the row start
         let mut rs = 0u32; // row start
@@ -265,17 +246,11 @@ impl Lists {
             let b = (le / 64) as usize;
             // SAFETY: le < w.len(), so its block was classified.
             let qe = unsafe {
-                self.before.get_unchecked(b)
-                    + (self.quotes.get_unchecked(b) & ((1u64 << (le % 64)) - 1)).count_ones()
+                self.before.get_unchecked(b) + (self.quotes.get_unchecked(b) & ((1u64 << (le % 64)) - 1)).count_ones()
             };
             if N >= 2 {
                 // SAFETY: c never passes the commas before le; ENDs pad N past them.
-                let (a, z) = unsafe {
-                    (
-                        *commas.get_unchecked(c + N - 2),
-                        *commas.get_unchecked(c + N - 1),
-                    )
-                };
+                let (a, z) = unsafe { (*commas.get_unchecked(c + N - 2), *commas.get_unchecked(c + N - 1)) };
                 if (a < le) & (z > le) {
                     // Exactly N - 1 commas in the row: its N fields end at them and at le.
                     let mut wrapped = 0;
@@ -737,10 +712,7 @@ mod tests {
         let file = format!("a,b\n{body}");
         assert_eq!(check(file.as_bytes(), &["a", "b"]), want);
         // the same lines on the general path: reordered selection
-        let swapped: Rows = want
-            .iter()
-            .map(|r| vec![r[1].clone(), r[0].clone()])
-            .collect();
+        let swapped: Rows = want.iter().map(|r| vec![r[1].clone(), r[0].clone()]).collect();
         assert_eq!(check(file.as_bytes(), &["b", "a"]), swapped);
     }
 
@@ -767,11 +739,7 @@ mod tests {
             file.push('\n');
         }
         let got = check(file.as_bytes(), &["p", "q", "r"]);
-        assert_eq!(
-            got.len(),
-            bad.len(),
-            "every bad line dropped, every good kept"
-        );
+        assert_eq!(got.len(), bad.len(), "every bad line dropped, every good kept");
 
         // Two neighbours with one stray quote each; their sum is even.
         let pair = "x,y\n\"a,b\na,b\"\n\"x\",\"y\"\n";
@@ -793,8 +761,7 @@ mod tests {
             let mut file = cols.join(",") + "\n";
             for k in 0..n {
                 for bad in ["\"v", "v\"", "\"", "\"\"\"", "\"v\"v\"", "v\"\"v"] {
-                    let line: Vec<&str> =
-                        (0..n).map(|j| if j == k { bad } else { "\"w\"" }).collect();
+                    let line: Vec<&str> = (0..n).map(|j| if j == k { bad } else { "\"w\"" }).collect();
                     file += &line.join(",");
                     file += "\n";
                 }
@@ -942,15 +909,7 @@ mod tests {
                     &[row.split(',').next().unwrap(), "y"]
                 };
                 let got = check_with(file.as_bytes(), &cols, &WINDOWS, &[usize::MAX]);
-                assert_eq!(
-                    got,
-                    if want.is_empty() {
-                        vec![]
-                    } else {
-                        rows(&[want])
-                    },
-                    "{file:?}"
-                );
+                assert_eq!(got, if want.is_empty() { vec![] } else { rows(&[want]) }, "{file:?}");
             }
         }
     }
@@ -959,8 +918,7 @@ mod tests {
     fn header_maps_columns_by_name() {
         let file = b"\"v\",extra,\"\",id\n1,x,y,a\n\"2\",x,y,\"b\"\n3,x\"y,z,c\n";
         assert_eq!(check(file, &["id", "v"]), rows(&[&["a", "1"], &["b", "2"]]));
-        let shuffled =
-            "price_cents,ts,event_id,product_id,user_id,event_type,ingest_ts\n9,t,e,p,u,view,i\n";
+        let shuffled = "price_cents,ts,event_id,product_id,user_id,event_type,ingest_ts\n9,t,e,p,u,view,i\n";
         assert_eq!(
             check(shuffled.as_bytes(), &COLS7),
             rows(&[&["e", "u", "t", "i", "view", "p", "9"]])
@@ -983,9 +941,7 @@ mod tests {
         ];
         for len in 0..=7u32 {
             for code in 0..4usize.pow(len) {
-                let body: Vec<u8> = (0..len)
-                    .map(|i| ALPHABET[code / 4usize.pow(i) % 4])
-                    .collect();
+                let body: Vec<u8> = (0..len).map(|i| ALPHABET[code / 4usize.pow(i) % 4]).collect();
                 for (h, cols) in headers {
                     let mut file = format!("{h}\n").into_bytes();
                     file.extend_from_slice(&body);
