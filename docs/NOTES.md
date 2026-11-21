@@ -4,6 +4,8 @@
 
 Leif reports **1.78 s** on the rebuild submitted before the final-scale CI job finished, down from **5.03 s** on `cc9f33e` (**2.83× faster**). The exact submitted SHA was not specified. Use [`4f75f52`](https://github.com/lmaccart/databricks-hackathon/commit/4f75f526cef27623e406d2ec1008b40eb1935f23) as the fixed control for the next round; the subsequent `bcdc149` commit only recorded the CI result. These official and CI clocks are tracked separately.
 
+[Two-seed native experiments against the 1.78 s build](PERF_178.md) include per-trial measurements and exact-comparison logs.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.
