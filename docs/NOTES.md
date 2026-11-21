@@ -1,5 +1,22 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
+
+Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.
+
+[Final verification against the 1.78 s rebuild control `4f75f52`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871823659) used a single four-worker Intel Xeon 6975P-C. Medians are from alternating order with one warmup per build:
+
+| Input | Pairs | Control | `9758471` | Less time |
+|---|---:|---:|---:|---:|
+| 20M events + 5M clicks, seed 7, native | 5 | 2.106 s | 1.805 s | 14.3% |
+| 20M events + 5M clicks, seed 15, native | 5 | 2.088 s | 1.801 s | 13.7% |
+| 20M events + 5M clicks, seed 7, full Docker | 5 | 2.201 s | **1.903 s** | **13.6%** |
+| 60M events + 15M clicks, seed 13, full Docker | 3 | 6.755 s | **5.882 s** | **12.9%** |
+
+The candidate won **18/18 pairs**. The 60M Docker pairs were 6.824 → 5.936, 6.755 → 5.882, and 6.619 → 5.828 s. A separate first 60M run took 11.327 s; the official comparer matched all **6,615,971 rows**, with no duplicate keys or stdout. The same job also passed all **60 official-generator comparisons against Python on Linux/amd64**.
+
+It also beat the previous pick, `18d1d8c`, [directly on a four-worker Intel Xeon 6975P-C](https://github.com/lmaccart/databricks-hackathon/actions/runs/44872074349). Process medians fell from **1.848 to 1.783 s** and **1.825 to 1.757 s** on the two 20M seeds (3.5% / 3.7%). Full Docker medians were **1.949 → 1.890 s at 20M** and **6.141 → 5.972 s at 60M**. The candidate won all five practice-size and all three final-size Docker pairs. The full 60M output matched under **14 GiB, no swap**, including all 6,587,957 user-days and 28,014 campaign-days. These are CI times; the last confirmed practice score is **1.78 s**.
+
 ## Compact duplicate claims and manifest-derived UTC dates — 2026-11-21 UTC
 
 The [`62ad4de` candidate](https://github.com/lmaccart/databricks-hackathon/commit/62ad4dec65ed865cc5dcccc95d013c3954998490) cuts a duplicate claim from 24 to 16 bytes. The shard supplies the high eight bits of a **reversible** 64-bit ID token; the remaining 56 bits are compared exactly within that shard. Whole-second F1 ingests fit as signed seconds through year 9999. Other ingests keep full milliseconds in a per-chunk side table. An immutable clock derived from the actual manifest checks exact UTC date bytes; a miss uses the full timestamp parser.
