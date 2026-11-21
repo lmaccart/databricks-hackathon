@@ -12,6 +12,24 @@ pub(super) fn mix(key: u64) -> u64 {
     x ^ (x >> 33)
 }
 
+/// `mix` is a permutation, so the routing hash can *be* the person token.
+/// Unpack it only when spelling a key for the output.
+#[inline]
+pub(super) fn unmix(x: u64) -> u64 {
+    const INVERSE: u64 = {
+        let k = 0xa24b_aed4_963e_e407u64;
+        let mut inv = 1u64;
+        let mut i = 0;
+        while i < 6 {
+            inv = inv.wrapping_mul(2u64.wrapping_sub(k.wrapping_mul(inv)));
+            i += 1;
+        }
+        inv
+    };
+    let y = (x ^ (x >> 33)).wrapping_mul(INVERSE);
+    y ^ (y >> 27) ^ (y >> 54)
+}
+
 #[derive(Clone, Copy, Default)]
 struct Slot {
     key: u64,
@@ -50,7 +68,7 @@ impl<'a> People<'a> {
         let h = mix(key);
         let lane = &self.lanes[h as usize & (LANES - 1)];
         let s = lane.slots[lane.find(key, h)];
-        if s.key != 0 { s.value } else { key }
+        if s.key != 0 { s.value } else { h }
     }
 }
 
@@ -176,7 +194,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         for slot in &mut lane.slots {
             if slot.key != 0 {
                 slot.value =
-                    keys[root(&parent, (offsets[s] + slot.value as usize) as u32) as usize];
+                    mix(keys[root(&parent, (offsets[s] + slot.value as usize) as u32) as usize]);
             }
         }
     });

@@ -30,8 +30,11 @@ fn parse<'a>(
     we: i64,
     hs: &RandomState,
 ) -> (Vec<Vec<PEv>>, Vec<Vec<Claim>>) {
-    let mut payload: Vec<Vec<PEv>> = (0..NS).map(|_| Vec::new()).collect();
-    let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::new()).collect();
+    let reserve = reserve_per_shard(c.data);
+    let mut payload: Vec<Vec<PEv>> = (0..NS).map(|_| Vec::with_capacity(reserve)).collect();
+    let mut claims: Vec<Vec<Claim>> = (0..NS)
+        .map(|_| Vec::with_capacity(reserve + reserve / 8))
+        .collect();
     for_rows(c, |r| {
         if r[0].is_empty() {
             return;
@@ -60,7 +63,7 @@ fn parse<'a>(
                     *sm.product_cat.get(r[5]).unwrap_or(&sm.unknown_cat)
                 };
                 let person = people.resolve(r[1]);
-                let p = shard(hs.hash_one(person));
+                let p = shard(person);
                 target = (payload[p].len() * NS + p) as u32;
                 payload[p].push(PEv {
                     person,
@@ -183,4 +186,44 @@ pub(super) fn by_person<'a>(
             }
         });
     payloads
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bloom_alias_keeps_distinct_id_and_invalid_winner_kills_valid_loser() {
+        // With one word, different IDs can have exactly the same two bit
+        // positions. Force such a collision rather than relying on a random seed.
+        let id = 13;
+        let alias = (id + 1..).find(|&k| probe(k, 0) == probe(id, 0)).unwrap();
+        let lost = losers(vec![
+            (
+                0,
+                vec![
+                    Claim {
+                        id,
+                        ingest: 3,
+                        target: 0,
+                    },
+                    Claim {
+                        id: alias,
+                        ingest: 4,
+                        target: 1,
+                    },
+                ],
+            ),
+            (
+                1,
+                vec![Claim {
+                    id,
+                    ingest: 1,
+                    target: NONE,
+                }],
+            ),
+        ]);
+        assert_eq!(lost.len(), 1);
+        assert_eq!((lost[0].batch, lost[0].target), (0, 0));
+    }
 }

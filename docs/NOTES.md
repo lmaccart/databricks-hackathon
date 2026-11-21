@@ -15,6 +15,9 @@ Leif reports **5.03 s** for `cc9f33e`. At the user-reported 0.68 s lead that is 
 | Exact 64-bit person keys vs `cc9f33e` | 1.909 s | 1.489 s | 22.0% |
 | Direct payload routing + small duplicate claims vs person keys | 1.556 s | 1.253 s | 19.5% |
 | Parallel identity graph + exact flat lookup vs direct routing | 1.525 s | 1.346 s | 11.7% |
+| Reversible routing token, sampled bucket reservations and consuming gather vs flat lookup | 1.194 s | 1.157 s | 3.1% |
+
+Opus also tried the opposite event layout, first scattering 40-byte source-span rows by event ID, then passing only frequency-filter collisions to a full byte comparison. On the unmodified scored pipeline this measured 2.149 → 1.927 s (10.3%). The integrated entry uses direct payload routing instead; these are alternative algorithms, not additive gains.
 
 Short ASCII person names are byte-packed, reversible keys; non-ASCII, long names and IDs ending in NUL are assigned exact interned keys in a disjoint namespace. Canonical names are still chosen by comparing original bytes. Session-event records shrink from 48 to 24 bytes and the comparator no longer follows string pointers. Zero-padded IDs, mixed case, embedded NUL and long names are covered by the suite.
 

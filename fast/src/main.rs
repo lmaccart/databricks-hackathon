@@ -357,6 +357,33 @@ fn shard(h: u64) -> usize {
     ((h >> 40) as usize) % NS
 }
 
+// A small live sample is only an allocation hint. Vectors still grow normally
+// for skewed shards, short records, long records, or a non-representative prefix.
+fn reserve_per_shard(data: &[u8]) -> usize {
+    let n = data.len().min(16 * 1024);
+    if n == 0 { return 0; }
+    let lines = memchr::memchr_iter(b'\n', &data[..n]).count();
+    lines.saturating_mul(data.len()) / n / NS
+}
+
+fn by_destination<T>(batches: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
+    let mut jobs: Vec<Vec<_>> = (0..NS).map(|_| Vec::with_capacity(batches.len())).collect();
+    for batch in batches {
+        for (dest, rows) in jobs.iter_mut().zip(batch) {
+            if !rows.is_empty() { dest.push(rows); }
+        }
+    }
+    jobs
+}
+
+fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
+    if pieces.len() <= 1 { return pieces.pop().unwrap_or_default(); }
+    let size: usize = pieces.iter().map(Vec::len).sum();
+    let mut rows = Vec::with_capacity(size);
+    for piece in pieces { rows.extend_from_slice(&piece); }
+    rows
+}
+
 fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, hs: &RandomState) -> Vec<Vec<ClRow<'a>>> {
     let mut b: Vec<Vec<ClRow>> = (0..NS).map(|_| Vec::new()).collect();
     for_rows(c, |r| {
@@ -379,7 +406,7 @@ fn dedup_clicks<'a>(
     parsed: &[Vec<Vec<ClRow<'a>>>],
     s: usize,
     names: &People<'a>,
-    hs: &RandomState,
+    _hs: &RandomState,
 ) -> Vec<Vec<PCl<'a>>> {
     let n: usize = parsed.iter().map(|p| p[s].len()).sum();
     let mut seen: Map<&'a [u8], ()> = Map::with_capacity_and_hasher(n, rs());
@@ -390,7 +417,7 @@ fn dedup_clicks<'a>(
                 continue;
             }
             let person = names.resolve(uid);
-            out[shard(hs.hash_one(person))].push(PCl { person, ts, cid, camp });
+            out[shard(person)].push(PCl { person, ts, cid, camp });
         }
     }
     out
@@ -610,14 +637,11 @@ fn main() {
     drop(cl_parsed);
     log("clicks deduped");
 
-    let outs: Vec<ShardOut> = (0..NS)
-        .into_par_iter()
-        .map(|p| {
-            let evs: Vec<PEv> = ev_by_person.iter().flat_map(|v| v[p].iter().copied()).collect();
-            let cls: Vec<PCl> = cl_by_person.iter().flat_map(|v| v[p].iter().copied()).collect();
-            process_shard(evs, cls, &sm)
-        })
-        .collect();
+    let mut jobs: Vec<_> = by_destination(ev_by_person).into_iter()
+        .zip(by_destination(cl_by_person)).collect();
+    jobs.sort_unstable_by_key(|(e, c)| std::cmp::Reverse(
+        e.iter().map(Vec::len).sum::<usize>() + c.iter().map(Vec::len).sum::<usize>()));
+    let outs: Vec<_> = jobs.into_par_iter().map(|(e, c)| process_shard(gather(e), gather(c), &sm)).collect();
     log("sessions done");
 
     let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
@@ -677,7 +701,7 @@ fn main() {
                 let rows: Vec<&UserRow> = group.iter().flat_map(|o| o.users.iter()).collect();
                 let mut keys = arrow_array::builder::StringBuilder::with_capacity(rows.len(), 9 * rows.len());
                 for r in &rows {
-                    keys.append_value(s(names.codec.bytes(r.person, &mut [0; 9])));
+                    keys.append_value(s(names.codec.bytes(links::unmix(r.person), &mut [0; 9])));
                 }
                 let cols: Vec<ArrayRef> = vec![
                     Arc::new(keys.finish()),
