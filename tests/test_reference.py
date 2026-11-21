@@ -505,6 +505,28 @@ class Clicks(unittest.TestCase):
 
 
 class ByteDistinctIds(unittest.TestCase):
+    def test_guarded_click_link_mixed_forms_and_equal_time_ties(self):
+        t = "2026-10-09T12:00:00Z"
+        k = ms(t) - HOUR
+        clicks = [
+            f"zclick007,user00007,c_1,{k}",
+            f'"aclick008","alias0008","c_2","2026-10-09T07:00:00-04:00"',
+            f"bclick009,user00007,c_3,2026-10-09T11:00:00Z",
+            f"0,alias0008,c_1,{k}",  # short ID takes the strict fallback
+            f'00,alias0008,c_3,"{k}"x',  # malformed, cannot win
+            f"000,alias0008,c_3,{k}\r",  # CR is part of the timestamp
+        ]
+        links = ['"user00007","alias0008"', "alias0008,short", "user00007,bad,extra"]
+        for order in (clicks, list(reversed(clicks))):
+            with self.subTest(reverse=order is not clicks):
+                users, campaigns = run_case(
+                    events=[ev("event0007", "user00007", t)], clicks=order, links=links)
+                day = "2026-10-09"
+                self.assertEqual(set(users), {("alias0008", day)})
+                self.assertEqual(campaigns[("c_1", day)]["sessions"], 1)
+                for name in ("c_1", "c_2", "c_3"):
+                    self.assertEqual(campaigns[(name, day)]["assisted_sessions"], 1)
+
     def test_dimension_spellings_and_pipelined_click_ties(self):
         s = ms("2026-10-09T12:00:00Z")
         products = ["p1,first", "p2,second", "p3,third", "p4,fourth", "p5,fifth", "p01,padded", "P1,upper",

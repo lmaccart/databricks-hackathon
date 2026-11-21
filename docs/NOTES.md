@@ -1,5 +1,20 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Experimental guarded click and link parser — 2026-11-21 UTC
+
+On canonical headers, pack 7–9 byte click and user IDs during validation,
+look up the actual campaign through the existing exact dense/map dimension,
+and verify F1/F2/13-digit F3 timestamps and the final newline. Link endpoints
+use the same ID guard. Other rows retry one physical line through strict CSV;
+reordered/extra headers use the normal scanner. The event path shares the ID,
+quote/separator and one-line fallback helpers. Click prefetch and FIFO remain.
+
+Validation: 23 Rust tests including click/link byte mutation against strict CSV
+and clock, 40 Python cases for each implementation, 36/36 official fixtures
+for both, ten 20k dirty seeds, official 10k seeds 1/7/15 including leap day,
+and both dev comparers (144,438 rows) matched. No large runs or timing pairs:
+performance delta is **unmeasured**; compare on native Intel before promotion.
+
 ## Experimental word-offset event parser — 2026-11-21 UTC
 
 For the seven-column canonical header, validate and pack 7–9 byte ASCII IDs

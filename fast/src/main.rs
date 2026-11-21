@@ -18,12 +18,14 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+mod click_word;
 mod dims;
 mod events;
 mod links;
 mod output;
 mod person;
 mod stream;
+mod word;
 use links::{Identity, People, person_names};
 use person::Codec;
 use stream::{Packing, Payload, Stream, Temporal};
@@ -221,6 +223,40 @@ struct Clicks {
     wide: Vec<PCl>,
 }
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct PendingClick {
+    uid: u64,
+    hash: u64,
+    cid: u64,
+    ts: i64,
+    camp: u32,
+}
+
+#[inline]
+fn decode_click<'a>(
+    r: &[&'a [u8]; 8],
+    sm: &Small,
+    (lo, we, clock): (i64, i64, &ManifestClock),
+    codec: &Codec<'a>,
+) -> Option<PendingClick> {
+    if r[0].is_empty() || r[1].is_empty() {
+        return None;
+    }
+    let camp = sm.camp_idx.get(r[2])?;
+    let ts = clock.parse_ts(r[3]);
+    if ts == BAD || ts < lo || ts >= we {
+        return None;
+    }
+    let uid = codec.key(r[1]);
+    Some(PendingClick {
+        uid,
+        hash: links::mix(uid),
+        cid: codec.key(r[0]),
+        ts,
+        camp,
+    })
+}
+
 fn parse_clicks<'a>(
     c: &Chunk<'a>,
     sm: &Small,
@@ -228,7 +264,6 @@ fn parse_clicks<'a>(
     names: &People<'a>,
     packed: bool,
 ) -> Vec<Clicks> {
-    let (lo, we, clock) = window;
     let hint = reserve_per_shard(c.data);
     let mut b: Vec<_> = (0..NS)
         .map(|_| Clicks {
@@ -236,14 +271,6 @@ fn parse_clicks<'a>(
             packed: Vec::with_capacity(if packed { hint / 2 } else { 0 }),
         })
         .collect();
-    #[derive(Clone, Copy, Default)]
-    struct PendingClick {
-        uid: u64,
-        hash: u64,
-        cid: u64,
-        ts: i64,
-        camp: u32,
-    }
     let mut emit = |row: PendingClick| {
         let (dest, person) = match names.lookup(row.uid, row.hash) {
             Identity::Linked(p) if packed => (&mut b[shard(p)].packed, u64::from(p as u32)),
@@ -259,31 +286,13 @@ fn parse_clicks<'a>(
     };
     let mut ring = [PendingClick::default(); 16];
     let mut n = 0usize;
-    for_rows(c, |r| {
-        // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
-        let (cid, uid, camp) = (r[0], r[1], r[2]);
-        if cid.is_empty() || uid.is_empty() {
-            return;
-        }
-        let Some(ci) = sm.camp_idx.get(camp) else { return };
-        let ts = clock.parse_ts(r[3]);
-        if ts == BAD || ts < lo || ts >= we {
-            return;
-        }
-        let key = names.codec.key(uid);
-        let hash = links::mix(key);
-        names.prefetch(hash);
+    click_word::for_clicks(c, sm, window, &names.codec, |next| {
+        names.prefetch(next.hash);
         let i = n % ring.len();
         if n >= ring.len() {
             emit(ring[i]);
         }
-        ring[i] = PendingClick {
-            uid: key,
-            hash,
-            ts,
-            cid: names.codec.key(cid),
-            camp: ci,
-        };
+        ring[i] = next;
         n += 1;
     });
     for i in n.saturating_sub(ring.len())..n {
