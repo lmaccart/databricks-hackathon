@@ -195,14 +195,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
                     }
                     let ka = keys[a as usize];
                     let kb = keys[b as usize];
-                    // The ASCII encoding is order preserving for its domain.
-                    // Spill numbers are not; compare their original bytes.
-                    let swap = if (ka | kb) >> 63 == 0 {
-                        ka > kb
-                    } else {
-                        codec.bytes(ka, &mut [0; 9]) > codec.bytes(kb, &mut [0; 9])
-                    };
-                    if swap {
+                    if codec.less(kb, ka) {
                         std::mem::swap(&mut a, &mut b);
                     }
                     // Every successful edge points to a strictly smaller name.
