@@ -13,7 +13,7 @@ struct Claim {
 
 // An emitted event has at least six commas. At most one row extends past
 // CHUNK, so the stream kind, per-stream ordinal and shard fit in the claim.
-const _: () = assert!(NS == 256 && (CHUNK / 6 + 1) * 4 * NS < u32::MAX as usize);
+const _: () = assert!(NS == 256 && (CHUNK / 6 + 1) * 2 * NS < u32::MAX as usize);
 const NONE: u32 = u32::MAX;
 const KEY_BITS: u32 = u64::BITS - NS.trailing_zeros();
 const KEY_MASK: u64 = (1 << KEY_BITS) - 1;
@@ -151,12 +151,12 @@ fn parse<'a>(
     sm: &Small,
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
-) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
+) -> (Vec<Stream<Raw>>, Vec<Vec<Claim>>, Vec<i64>) {
     let reserve = reserve_per_shard(c.data);
-    let mut payload: Vec<Payload> = (0..NS)
+    let mut payload: Vec<Stream<Raw>> = (0..NS)
         .map(|_| {
-            let mut p = Payload::default();
-            p.wide.times.reserve(reserve);
+            let mut p = Stream::default();
+            p.times.reserve(reserve);
             p
         })
         .collect();
@@ -166,7 +166,24 @@ fn parse<'a>(
         let mut target = NONE;
         if e.uid != 0 {
             let p = shard(e.hash);
-            let slot = payload[p].push(Identity::Standalone(e.hash), e.ts, e.price, e.cat, None, people);
+            let dest = &mut payload[p];
+            let key = Raw {
+                person: e.hash,
+                ts: e.ts,
+            };
+            let slot = if e.price == 0 {
+                let i = dest.times.len();
+                dest.times.push(key);
+                i * 2
+            } else {
+                let i = dest.purchases.len();
+                dest.purchases.push(Purchase {
+                    key,
+                    price: e.price,
+                    cat: e.cat,
+                });
+                i * 2 + 1
+            };
             target = (slot * NS + p) as u32;
         }
         // This shard supplies the omitted high bits; within it equality of
@@ -277,7 +294,7 @@ pub(super) fn by_person<'a>(
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
     log: &impl Fn(&str),
-) -> Vec<Vec<Payload>> {
+) -> Vec<Vec<Stream<Raw>>> {
     let parsed: Vec<_> = chunks.par_iter().map(|c| parse(c, sm, people, window)).collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
@@ -307,19 +324,16 @@ pub(super) fn by_person<'a>(
             let x = target as usize;
             let bucket = &mut payload[x % NS];
             let slot = x / NS;
-            let index = slot / 4;
-            match slot % 4 {
-                0 => bucket.packed.times[index] = u64::MAX,
-                1 => bucket.packed.purchases[index].price = 0,
-                2 => bucket.wide.times[index].ts = BAD,
-                _ => bucket.wide.purchases[index].price = 0,
+            let index = slot / 2;
+            if slot % 2 == 0 {
+                bucket.times[index].ts = BAD;
+            } else {
+                bucket.purchases[index].price = 0;
             }
         }
         for dest in payload {
-            dest.packed.times.retain(|&key| key != u64::MAX);
-            dest.packed.purchases.retain(|p| p.price != 0);
-            dest.wide.times.retain(|key| key.ts != BAD);
-            dest.wide.purchases.retain(|p| p.price != 0);
+            dest.times.retain(|key| key.ts != BAD);
+            dest.purchases.retain(|p| p.price != 0);
         }
     });
     payloads

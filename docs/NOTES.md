@@ -1,5 +1,15 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Fused raw join / dense owner bands — 2026-11-21
+
+Experiment based on `7444732`. Number canonical roots only in their actual owner shard. After dedup, the raw join reuses each raw lane's exact link table: vacant slots allocate singleton ranks after the linked prefix, and existing alias slots already carry the producer-local route to the linked owner's band and the rank within it. Both families scatter directly into the same 64-person bands. A per-band histogram lays out contiguous per-person timestamp slices for time-only sorting. Purchases and clicks use band-local side sorts. An event's band key takes 4 or 8 bytes if the manifest span permits, with a full-width fallback; opaque names still use the lossless codec, and alias pieces from different sources merge by the same owner band.
+
+Limitations: this still stores full raw event keys until the join, and sparse producer/owner-band pairs allocate independent vectors. Descriptor routing between join and session workers remains serial; skewed owners and peak memory at scale are unmeasured. No optional time-band histogram, 20M/60M run, or Docker run.
+
+Checks: 42 edge cases against each implementation, 21 Rust tests, 36 official fixtures, exact public dev answer with empty stdout, 10 dirty 30k-event seeds, and 10 official-generator/oracle comparisons at 10k/100k (including leap day). An opaque 10k-event rewrite with NUL-containing IDs, reordered columns, and omitted final line endings matched with one and eight workers.
+
+Small native check only: five alternating warm pairs on the official 1M-event dev set with four workers. Compared with a fresh build of `7444732`, median elapsed time was 0.093 → 0.086 s (6.7% less; won 5/5). The timer's session phase was 21 → 17 ms, and join was 10 → 9 ms. These are not practice-scale measurements.
+
 ## Raw-user partitioned identity join experiment — 2026-11-21
 
 Parse typed event and click payloads by raw-user shard, dedup events against those raw slot locations, and join each shard against its own exact link-table lane. A direct-mapped exact-token cache avoids repeated probes for hot IDs. Standalone events/clicks stay in their original buffers; linked rows move to canonical-owner shards. Link graph construction remains complete and precedes parsing. This increases interim event width and linked-row copying, so performance and 60M peak RSS need parent-side measurement; no 20M/60M benchmark was run here.

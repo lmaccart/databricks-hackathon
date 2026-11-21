@@ -18,15 +18,15 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+mod bands;
 mod dims;
 mod events;
 mod links;
 mod output;
 mod person;
-mod stream;
-use links::{Identity, People, person_names};
+use bands::{Purchase, Raw, Stream};
+use links::{People, person_names};
 use person::Codec;
-use stream::{Packing, Payload, Stream, Temporal};
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
@@ -203,33 +203,15 @@ fn by_destination<T>(batches: Vec<Vec<T>>, nonempty: impl Fn(&T) -> bool) -> Vec
     jobs
 }
 
-fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
-    if pieces.len() <= 1 {
-        return pieces.pop().unwrap_or_default();
-    }
-    let size: usize = pieces.iter().map(Vec::len).sum();
-    let mut rows = Vec::with_capacity(size);
-    for piece in pieces {
-        rows.extend_from_slice(&piece);
-    }
-    rows
-}
-
-#[derive(Default)]
-struct Clicks {
-    packed: Vec<PCl>,
-    wide: Vec<PCl>,
-}
-
-fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, window: (i64, i64, &ManifestClock), names: &People<'a>) -> Vec<Clicks> {
+fn parse_clicks<'a>(
+    c: &Chunk<'a>,
+    sm: &Small,
+    window: (i64, i64, &ManifestClock),
+    names: &People<'a>,
+) -> Vec<Vec<PCl>> {
     let (lo, we, clock) = window;
     let hint = reserve_per_shard(c.data);
-    let mut b: Vec<_> = (0..NS)
-        .map(|_| Clicks {
-            wide: Vec::with_capacity(hint),
-            packed: Vec::new(),
-        })
-        .collect();
+    let mut b: Vec<_> = (0..NS).map(|_| Vec::with_capacity(hint)).collect();
     for_rows(c, |r| {
         // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
         let (cid, uid, camp) = (r[0], r[1], r[2]);
@@ -243,7 +225,7 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, window: (i64, i64, &ManifestClock
         }
         let key = names.codec.key(uid);
         let hash = links::mix(key);
-        b[shard(hash)].wide.push(PCl {
+        b[shard(hash)].push(PCl {
             person: hash,
             ts,
             cid: names.codec.key(cid),
@@ -251,107 +233,6 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, window: (i64, i64, &ManifestClock
         });
     });
     b
-}
-
-// Each task probes just one raw-user partition of the exact link table.
-// A small direct-mapped cache resolves repeated hot IDs without another probe.
-struct JoinCache<'a, 'b> {
-    people: &'a People<'b>,
-    keys: Vec<u64>,
-    values: Vec<Identity>,
-}
-
-impl<'a, 'b> JoinCache<'a, 'b> {
-    fn new(people: &'a People<'b>) -> Self {
-        Self {
-            people,
-            keys: vec![0; 4096],
-            values: vec![Identity::Standalone(0); 4096],
-        }
-    }
-
-    #[inline]
-    fn resolve(&mut self, hash: u64) -> Identity {
-        let i = hash as usize & (self.keys.len() - 1);
-        if self.keys[i] != hash {
-            self.keys[i] = hash;
-            self.values[i] = self.people.lookup(links::unmix(hash), hash);
-        }
-        self.values[i]
-    }
-}
-
-type JoinJobs = Vec<(Vec<Payload>, Vec<Clicks>)>;
-
-fn join_raw(
-    events: Vec<Vec<Payload>>,
-    clicks: Vec<Vec<Clicks>>,
-    people: &People,
-    packing: Option<Packing>,
-) -> JoinJobs {
-    let raw_events = by_destination(events, |p| !p.wide.times.is_empty() || !p.wide.purchases.is_empty());
-    let raw_clicks = by_destination(clicks, |p| !p.wide.is_empty());
-    let joined: Vec<_> = raw_events
-        .into_par_iter()
-        .zip(raw_clicks.into_par_iter())
-        .map(|(mut evs, mut cls)| {
-            let mut cache = JoinCache::new(people);
-            let mut moved_e: Vec<Payload> = (0..NS).map(|_| Payload::default()).collect();
-            let mut moved_c: Vec<Clicks> = (0..NS).map(|_| Clicks::default()).collect();
-            for part in &mut evs {
-                part.wide.times.retain(|row| match cache.resolve(row.person) {
-                    Identity::Standalone(_) => true,
-                    id @ Identity::Linked(p) => {
-                        moved_e[shard(p)].push(id, row.ts, 0, 0, packing, people);
-                        false
-                    }
-                });
-                part.wide.purchases.retain(|row| match cache.resolve(row.key.person) {
-                    Identity::Standalone(_) => true,
-                    id @ Identity::Linked(p) => {
-                        moved_e[shard(p)].push(id, row.key.ts, row.price, row.cat, packing, people);
-                        false
-                    }
-                });
-            }
-            for part in &mut cls {
-                part.wide.retain(|row| match cache.resolve(row.person) {
-                    Identity::Standalone(_) => true,
-                    Identity::Linked(p) => {
-                        let dest = &mut moved_c[shard(p)];
-                        let mut row = *row;
-                        if packing.is_some() {
-                            row.person = u64::from(p as u32);
-                            dest.packed.push(row);
-                        } else {
-                            row.person = people.original(p as u32);
-                            dest.wide.push(row);
-                        }
-                        false
-                    }
-                });
-            }
-            (evs, cls, moved_e, moved_c)
-        })
-        .collect();
-    let mut jobs: JoinJobs = (0..NS).map(|_| (Vec::new(), Vec::new())).collect();
-    for (raw, (evs, cls, moved_e, moved_c)) in joined.into_iter().enumerate() {
-        jobs[raw].0.extend(evs);
-        jobs[raw].1.extend(cls);
-        for (dest, (e, c)) in moved_e.into_iter().zip(moved_c).enumerate() {
-            if !e.packed.times.is_empty()
-                || !e.packed.purchases.is_empty()
-                || !e.wide.times.is_empty()
-                || !e.wide.purchases.is_empty()
-            {
-                jobs[dest].0.push(e);
-            }
-            if !c.packed.is_empty() || !c.wide.is_empty() {
-                jobs[dest].1.push(c);
-            }
-        }
-    }
-    jobs
 }
 
 // ------------------------------------------------------------------ sessions
@@ -390,74 +271,66 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
     best.map(|b| b as u32)
 }
 
-fn process_stream<T: Temporal>(
-    pieces: Vec<Stream<T>>,
-    mut cls: Vec<PCl>,
-    sm: &Small,
-    people: &People,
-    layout: T::Layout,
-    ShardOut { users, camps }: &mut ShardOut,
-) {
-    let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
-    let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
-    if ne == 0 {
-        return;
-    }
-    let mut evs = Vec::with_capacity(ne);
-    let mut purchases = Vec::with_capacity(np);
-    for s in pieces {
-        evs.extend_from_slice(&s.times);
-        evs.extend(s.purchases.iter().map(|p| p.key));
-        purchases.extend_from_slice(&s.purchases);
-    }
-    evs.sort_unstable();
-    purchases.sort_unstable_by_key(|p| p.key);
-    cls.sort_unstable_by_key(|c| (c.person, c.ts));
-    let ncamp = sm.camp_names.len();
-    let mut cnt = vec![0usize; ncamp]; // copies enter and leave the window together
-    let mut active: Vec<u32> = Vec::new(); // campaigns with cnt > 0
-    let mut pos = vec![0u32; ncamp]; // index of a campaign inside `active`
-    let mut catsum = vec![0i64; sm.cat_names.len()];
+struct Sessionizer<'a, 'b, 'c> {
+    sm: &'a Small<'b>,
+    codec: &'a Codec<'c>,
+    origin: i64,
+    out: ShardOut,
+    cnt: Vec<usize>,
+    active: Vec<u32>,
+    pos: Vec<u32>,
+    catsum: Vec<i64>,
+}
 
-    let mut ci = 0usize;
-    let mut i = 0usize;
-    let mut pi = 0usize;
-    while i < evs.len() {
-        let rank = evs[i].person(layout);
-        let person = T::name(rank, people);
-        let mut j = i;
-        while j < evs.len() && evs[j].person(layout) == rank {
-            j += 1;
+impl<'a, 'b, 'c> Sessionizer<'a, 'b, 'c> {
+    fn new(sm: &'a Small<'b>, codec: &'a Codec<'c>, origin: i64) -> Self {
+        Self {
+            sm,
+            codec,
+            origin,
+            out: ShardOut {
+                users: Vec::new(),
+                camps: Map::with_hasher(rs()),
+            },
+            cnt: vec![0; sm.camp_names.len()],
+            active: Vec::new(),
+            pos: vec![0; sm.camp_names.len()],
+            catsum: vec![0; sm.cat_names.len()],
         }
-        while ci < cls.len() && cls[ci].person < rank {
-            ci += 1;
-        }
-        let c0 = ci;
-        while ci < cls.len() && cls[ci].person == rank {
-            ci += 1;
-        }
-        let clicks = &cls[c0..ci];
+    }
+
+    fn person<K: bands::BandKey>(&mut self, person: u64, evs: &[K::Time], purchases: &[Purchase<K>], clicks: &[PCl]) {
+        let Self {
+            sm,
+            codec,
+            origin,
+            out: ShardOut { users, camps },
+            cnt,
+            active,
+            pos,
+            catsum,
+        } = self;
+        let mut pi = 0;
         let (mut lo, mut hi) = (0usize, 0usize);
         let mut latest = 0;
-
-        let mut cur_day: i32 = i32::MIN;
+        let mut cur_day = None;
         let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
 
-        let mut k = i;
-        while k < j {
+        let mut k = 0;
+        while k < evs.len() {
             // one session is evs[k..m]
-            let start = evs[k].ts(layout);
+            let start = origin.wrapping_add(evs[k].into() as i64);
             let mut m = k + 1;
-            while m < j && evs[m].gap(evs[m - 1]) <= GAP as u64 {
+            while m < evs.len() && evs[m].into() - evs[m - 1].into() <= GAP as u64 {
                 m += 1;
             }
             let day = start.div_euclid(DAY) as i32;
-            if day != cur_day {
-                if cur_day != i32::MIN {
-                    let top = top_category(&catsum, &sm.cat_rank);
+            if cur_day != Some(day) {
+                if let Some(prior) = cur_day {
+                    let top = top_category(catsum, &sm.cat_rank);
                     users.push(UserRow {
                         person,
-                        day: cur_day,
+                        day: prior,
                         sessions: d_sess,
                         events: d_ev,
                         revenue: d_rev,
@@ -465,7 +338,7 @@ fn process_stream<T: Temporal>(
                     });
                     catsum.iter_mut().for_each(|x| *x = 0);
                 }
-                cur_day = day;
+                cur_day = Some(day);
                 (d_sess, d_ev, d_rev) = (0, 0, 0);
             }
             let mut rev = 0i64;
@@ -474,8 +347,8 @@ fn process_stream<T: Temporal>(
             // consume ALL purchases at the last instant, including exact ties.
             let p0 = pi;
             let end = evs[m - 1];
-            debug_assert!(purchases.get(pi).is_none_or(|p| p.key >= evs[k]));
-            while pi < np && purchases[pi].key <= end {
+            debug_assert!(purchases.get(pi).is_none_or(|p| p.key.time() >= evs[k]));
+            while pi < purchases.len() && purchases[pi].key.time() <= end {
                 let e = &purchases[pi];
                 rev += e.price as i64;
                 catsum[e.cat as usize] += e.price as i64;
@@ -487,10 +360,7 @@ fn process_stream<T: Temporal>(
 
             // slide the click window to [start - 7d, start]
             while hi < clicks.len() && clicks[hi].ts <= start {
-                if hi == 0
-                    || clicks[hi].ts != clicks[latest].ts
-                    || people.codec.less(clicks[hi].cid, clicks[latest].cid)
-                {
+                if hi == 0 || clicks[hi].ts != clicks[latest].ts || codec.less(clicks[hi].cid, clicks[latest].cid) {
                     latest = hi;
                 }
                 let c = clicks[hi].camp as usize;
@@ -521,48 +391,27 @@ fn process_stream<T: Temporal>(
             e[0] += 1;
             e[1] += (pi != p0) as i64;
             e[2] += rev;
-            for &a in &active {
+            for &a in active.iter() {
                 camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
             }
             k = m;
         }
-        let top = top_category(&catsum, &sm.cat_rank);
+        let top = top_category(catsum, &sm.cat_rank);
         users.push(UserRow {
             person,
-            day: cur_day,
+            day: cur_day.unwrap(),
             sessions: d_sess,
             events: d_ev,
             revenue: d_rev,
             top,
         });
         catsum.iter_mut().for_each(|x| *x = 0);
-        for &a in &active {
+        for &a in active.iter() {
             cnt[a as usize] = 0;
         }
         active.clear();
-        i = j;
+        debug_assert_eq!(pi, purchases.len());
     }
-    debug_assert_eq!(pi, np);
-}
-
-fn process_shard(
-    evs: Vec<Payload>,
-    cls: Vec<Clicks>,
-    sm: &Small,
-    people: &People,
-    packing: Option<Packing>,
-) -> ShardOut {
-    let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
-    let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
-    let mut out = ShardOut {
-        users: Vec::new(),
-        camps: Map::with_hasher(rs()),
-    };
-    if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
-    }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
-    out
 }
 
 // ------------------------------------------------------------------ output
@@ -616,8 +465,7 @@ fn main() {
         ],
     );
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
-    let names = person_names(&link_chunks);
-    let packing = Packing::new(ws, we, names.count);
+    let mut names = person_names(&link_chunks);
     log(&format!("links: {} linked ids", names.count));
 
     let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), &log);
@@ -629,19 +477,7 @@ fn main() {
         .collect();
     log("clicks parsed");
 
-    let len =
-        |e: &Payload| e.packed.times.len() + e.packed.purchases.len() + e.wide.times.len() + e.wide.purchases.len();
-    let mut jobs = join_raw(ev_by_person, cl_by_person, &names, packing);
-    log("identity join");
-    jobs.sort_unstable_by_key(|(e, c)| {
-        std::cmp::Reverse(
-            e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
-        )
-    });
-    let outs: Vec<_> = jobs
-        .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
-        .collect();
+    let outs = bands::run(ev_by_person, cl_by_person, &sm, &mut names, ws, we, &log);
     log("sessions done");
 
     let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
@@ -684,7 +520,7 @@ fn main() {
                 &ud,
                 &shards,
                 parts,
-                &|p, out| out.extend_from_slice(names.codec.bytes(links::unmix(p), &mut [0; 9])),
+                &|p, out| out.extend_from_slice(names.codec.bytes(p, &mut [0; 9])),
                 &sm.cat_names,
             )
         },

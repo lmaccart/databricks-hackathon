@@ -610,6 +610,52 @@ class DedupMalformedVsInvalid(unittest.TestCase):
 
 
 class CrossFilePeople(unittest.TestCase):
+    def test_dense_bands_join_same_owner_shard_and_foreign_aliases(self):
+        def shard(name):
+            key = 0
+            for b in name.encode().ljust(9, b"\0"):
+                key = (key << 7) | b
+            h = ((key ^ (key >> 27)) * 0xa24baed4963ee407) & ((1 << 64) - 1)
+            return ((h ^ (h >> 33)) >> 40) & 255
+
+        # More than one band of roots and singletons in the SAME physical
+        # shard. Foreign aliases of one root span distinct raw shards/files.
+        roots, solos, foreign = [], [], {}
+        for i in range(100_000):
+            name = f"R{i}"
+            s = shard(name)
+            if s == shard("A"):
+                (roots if len(roots) < 64 else solos).append(name)
+                if len(solos) == 130:
+                    break
+            else:
+                foreign.setdefault(s, name)
+        self.assertEqual((len(roots), len(solos)), (64, 130))
+        a, b = list(foreign.values())[:2]
+        long = "opaque person \u00e9\0"
+        t = WS_MS
+        links = [f"{r},{r}" for r in roots] + [f"A,{a}", f"A,{b}"]
+        events = [ev(f"e{i}", uid, str(t)) for i, uid in enumerate(roots + solos)]
+        events += [ev("rb", b, str(t + 30 * MIN), "purchase", "p2", "17"),
+                   ev("opaque", long, str(t), "purchase", "p1", "23")]
+        extra = {
+            "events/part-1.csv": [ev("ra", a, str(t)), ev("tie", a, str(t + 30 * MIN))],
+            "clicks/part-1.csv": [f"a,{b},c_2,{t}"],
+        }
+        for end in ("2026-10-01T06:00:00Z", WE, str(2**63 - 1)):
+            with self.subTest(end=end):
+                users, camps = run_case(events, [f"z,{a},c_1,{t}"] * 3,
+                                        links, extra=extra, window=(WS, end))
+                day = "2026-10-01"
+                self.assertEqual(set(users), {(n, day) for n in ["A", long, *roots, *solos]})
+                r = users[("A", day)]
+                self.assertEqual((r["sessions"], r["events"], r["revenue_cents"], r["top_category"]),
+                                 (1, 3, 17, "hats"))
+                self.assertEqual(camps[("c_1", day)]["assisted_sessions"], 1)
+                self.assertEqual(camps[("c_2", day)]["revenue_cents"], 17)
+                self.assertEqual(camps[("organic", day)]["sessions"], 195)
+                self.assertEqual(camps[("organic", day)]["revenue_cents"], 23)
+
     def test_raw_partition_cache_collision_does_not_merge_people(self):
         # Find two distinct inline IDs sharing both the raw partition and
         # direct-mapped lookup-cache index; one is linked, one standalone.
