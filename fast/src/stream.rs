@@ -2,7 +2,7 @@
 //! payload until dedup, then contribute a key to the temporal stream as well.
 use super::{Identity, People};
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Wide {
     pub person: u64,
     pub ts: i64,

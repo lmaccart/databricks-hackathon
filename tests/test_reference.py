@@ -313,6 +313,46 @@ class EventsOrder(unittest.TestCase):
         self.assertEqual(set(u), {("u1", "2026-10-05")})
         self.assertEqual(u[("u1", "2026-10-05")]["revenue_cents"], 999)
 
+    def test_time_sweep_shifted_window_extrema_and_attribution(self):
+        ws = ms("1969-12-31T23:17:00Z")
+        gap = 30 * MIN
+        s = ws + gap - 1000
+        late = s + 2 * gap + 1
+        split = late + gap + 1
+        for links, person in [(["laptop,bridge", "bridge,phone"], "bridge"), ([], "phone")]:
+            with self.subTest(links=links):
+                alias = "laptop" if links else "phone"
+                # The earlier instant in the middle bin bridges the preceding
+                # bin. The later instant bridges the next bin.
+                middle = [ev(f"f{i}", "phone", str(s + gap + i % 2)) for i in range(256)]
+                u, c = run_case(
+                    window=("1969-12-31T23:17:00Z", "1970-01-01T03:00:00Z"),
+                    events=[
+                        ev("a", "phone", str(s + gap + 1), "purchase", "p1", "100"),
+                        ev("b", alias, str(late), "purchase", "p2", "300"),
+                        ev("c", "phone", str(split), "purchase", "p1", "75"),
+                        ev("d", alias, "1969-12-31T23:46:59Z", "purchase", "p2", "100"),
+                    ] + middle,
+                    links=links,
+                    clicks=[
+                        "2,phone,c_1,1969-12-31T23:46:59Z",
+                        f"10,{alias},c_2,1969-12-31T23:46:59Z",
+                        f"old,{person},c_1,1969-12-31T23:46:58Z",
+                        "next,phone,c_3,1969-12-31T23:47:00Z",
+                    ],
+                )
+                first, second = "1969-12-31", "1970-01-01"
+                cols = ("sessions", "events", "revenue_cents", "top_category")
+                self.assertEqual(tuple(u[(person, first)][f] for f in cols), (1, 259, 500, "hats"))
+                self.assertEqual(tuple(u[(person, second)][f] for f in cols), (1, 1, 75, "shoes"))
+                self.assertEqual(
+                    {k: tuple(v[f] for f in ("sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions"))
+                     for k, v in c.items()},
+                    {("c_1", first): (0, 0, 0, 1), ("c_2", first): (1, 1, 500, 1),
+                     ("c_1", second): (0, 0, 0, 1), ("c_2", second): (0, 0, 0, 1),
+                     ("c_3", second): (1, 1, 75, 1)},
+                )
+
     def test_top_category(self):
         t = "2026-10-02T10:00:00Z"
         u, _ = run_case(events=[

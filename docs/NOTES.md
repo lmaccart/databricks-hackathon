@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 2 candidate: compact ranked and wide time-bin sweep — 2026-11-20
+
+Adapted `803c112` to `012174f` without widening temporal keys or touching catalog, identity or click lookup. A sample screens out streams with few repeat people; an exact session-count cap aborts the sweep if the intervals do not compress the input by at least four events per session. A bounded manifest histogram scatters 8- or 16-byte keys, then per-bin extrema preserve exact gap checks. The same attribution code consumes sorted intervals and the sparse purchase sidecar on either path. No new 20M measurements; incremental comparison against `012174f` deferred to the parent.
+
 ## Round 2 integration: compact streams, exact catalog index and click prefetch — 2026-11-20
 
 The link graph already assigns each exact ID a node. Reuse its canonical root
