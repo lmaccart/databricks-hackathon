@@ -7,9 +7,16 @@ use std::hash::{BuildHasherDefault, Hasher};
 mod word;
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Claim {
-    key_and_target: u64,
-    order_and_target: u64,
+    lo: u32,
+    mid: u32,
+    hi: u32,
+}
+#[derive(Clone, Copy)]
+struct Exact {
+    target: u32,
+    ingest: i64,
 }
 
 // An emitted event has at least six commas. At most one row extends past
@@ -18,12 +25,19 @@ const _: () = assert!(NS == 256 && (CHUNK / 6 + 1) * 4 * NS < u32::MAX as usize)
 const NONE: u32 = u32::MAX;
 const KEY_BITS: u32 = u64::BITS - NS.trailing_zeros();
 const KEY_MASK: u64 = (1 << KEY_BITS) - 1;
-const TARGET_HI_BITS: u32 = 32 - NS.trailing_zeros();
-const TARGET_HI_MASK: u64 = (1 << TARGET_HI_BITS) - 1;
+const TARGET_BITS: u32 = 19;
+const SMALL_NONE: u32 = (1 << TARGET_BITS) - 1;
+// Leave enough escape indices for every possible well-formed row in a chunk;
+// even a completely unrepresentative window or a single dominant person works.
+const ESCAPE: u64 = (1 << 40) - (1 << 21);
 // Signed 39-bit seconds cover every four-digit F1 year. In the 40-bit field,
 // the two high bits are 00/11 for seconds and 01 for a side-table index.
 const SPILL_TAG: u64 = 1 << 38;
-const _: () = assert!(std::mem::size_of::<Claim>() == 16 && ((CHUNK / 6 + 1) as u64) < SPILL_TAG);
+const _: () = assert!(std::mem::size_of::<Claim>() == 12 && CHUNK / 6 + 1 < 1 << 21);
+
+fn time_origin(ws: i64) -> i64 {
+    ws.div_euclid(1000) - 2 * 86_400
+}
 
 impl Claim {
     #[inline]
@@ -39,31 +53,51 @@ impl Claim {
     }
 
     #[inline]
-    fn new(mixed: u64, target: u32, order: u64) -> Self {
+    fn new(mixed: u64, target: u32, order: u64, origin: i64, exact: &mut Vec<Exact>) -> Self {
+        let raw = order as i64;
+        let delta = raw.wrapping_sub(origin) as u64;
+        let state =
+            if raw < SPILL_TAG as i64 && delta < (ESCAPE >> TARGET_BITS) && (target < SMALL_NONE || target == NONE) {
+                (delta << TARGET_BITS) | u64::from(target & SMALL_NONE)
+            } else {
+                let index = exact.len();
+                exact.push(Exact { target, ingest: raw });
+                ESCAPE + index as u64
+            };
         Self {
-            key_and_target: (mixed & KEY_MASK) | (u64::from(target & (NS as u32 - 1)) << KEY_BITS),
-            order_and_target: (order << TARGET_HI_BITS) | u64::from(target >> NS.trailing_zeros()),
+            lo: mixed as u32,
+            mid: ((mixed >> 32) as u32 & 0xff_ffff) | ((state as u32) << 24),
+            hi: (state >> 8) as u32,
         }
     }
 
     #[inline]
     fn key(self) -> u64 {
-        self.key_and_target & KEY_MASK
+        u64::from(self.lo) | (u64::from(self.mid & 0xff_ffff) << 32)
     }
 
     #[inline]
-    fn target(self) -> u32 {
-        (((self.order_and_target & TARGET_HI_MASK) << NS.trailing_zeros()) | (self.key_and_target >> KEY_BITS)) as u32
-    }
-
-    #[inline]
-    fn ingest(self, spill: &[i64]) -> i64 {
-        let order = (self.order_and_target as i64) >> TARGET_HI_BITS;
-        if order >= SPILL_TAG as i64 {
-            spill[(order as u64 ^ SPILL_TAG) as usize]
-        } else {
-            order * 1000
+    fn unpack(self, origin: i64, exact: &[Exact]) -> Exact {
+        let state = (u64::from(self.hi) << 8) | u64::from(self.mid >> 24);
+        if state >= ESCAPE {
+            return exact[(state - ESCAPE) as usize];
         }
+        let t = state as u32 & SMALL_NONE;
+        Exact {
+            target: if t == SMALL_NONE { NONE } else { t },
+            ingest: (origin + (state >> TARGET_BITS) as i64) * 1000,
+        }
+    }
+}
+
+fn finish_exact(exact: &mut [Exact], spill: &[i64]) {
+    for e in exact {
+        let raw = e.ingest;
+        e.ingest = if raw >= SPILL_TAG as i64 {
+            spill[(raw as u64 ^ SPILL_TAG) as usize]
+        } else {
+            raw * 1000
+        };
     }
 }
 
@@ -153,7 +187,7 @@ fn parse<'a>(
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
-) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
+) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<Exact>) {
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Payload> = (0..NS)
         .map(|_| {
@@ -169,6 +203,8 @@ fn parse<'a>(
         .collect();
     let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
     let mut spill = Vec::new();
+    let mut exact = Vec::new();
+    let origin = time_origin(window.0);
     let mut emit = |e: Pending| {
         let mut target = NONE;
         if e.uid != 0 {
@@ -181,7 +217,15 @@ fn parse<'a>(
         }
         // This shard supplies the omitted high bits; within it equality of
         // the stored low bits is equality of the full byte-exact ID token.
-        claims[(e.claim_key >> KEY_BITS) as usize].push(Claim::new(e.claim_key, target, e.claim_order));
+        // Exceptional input timestamps already carry their input side-table
+        // index; finalize those after parsing ends, without rereading CSV.
+        claims[(e.claim_key >> KEY_BITS) as usize].push(Claim::new(
+            e.claim_key,
+            target,
+            e.claim_order,
+            origin,
+            &mut exact,
+        ));
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
@@ -199,18 +243,19 @@ fn parse<'a>(
     for i in n.saturating_sub(ring.len())..n {
         emit(ring[i % ring.len()]);
     }
-    (payload, claims, spill)
+    finish_exact(&mut exact, &spill);
+    (payload, claims, exact)
 }
 
 #[inline]
 fn probe_index(c: Claim, mask: usize) -> usize {
     // The mask excludes the colocated payload-shard byte.
-    c.key_and_target as usize & mask
+    c.lo as usize & mask
 }
 
 #[inline]
 fn probe(c: Claim, mask: usize) -> (usize, u64) {
-    let k = c.key_and_target;
+    let k = c.key();
     let bits = 1u64.rotate_left((k >> 36) as u32) | 1u64.rotate_left((k >> 42) as u32);
     (probe_index(c, mask), bits)
 }
@@ -232,7 +277,7 @@ fn prefetch(bloom: &[(u64, u64)], c: Claim, mask: usize) {
     let _ = ptr;
 }
 
-fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location> {
+fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<Exact>], origin: i64) -> Vec<Location> {
     let n: usize = parts.iter().map(|(_, v)| v.len()).sum();
     // Local blocked Bloom: the second occurrence of any ID necessarily finds
     // both bits already set and marks it suspect. False positives go to an
@@ -270,11 +315,8 @@ fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location>
             if bloom[i].1 & b != b {
                 continue;
             }
-            let loc = Location {
-                batch,
-                target: c.target(),
-            };
-            let ingest = c.ingest(&spills[batch]);
+            let Exact { target, ingest } = c.unpack(origin, &spills[batch]);
+            let loc = Location { batch, target };
             let lost = match best.entry(c.key()) {
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert((ingest, loc));
@@ -321,7 +363,11 @@ pub(super) fn by_person<'a>(
             }
         }
     }
-    let removals: Vec<_> = claims.into_par_iter().map(|parts| losers(parts, &spills)).collect();
+    let origin = time_origin(window.0);
+    let removals: Vec<_> = claims
+        .into_par_iter()
+        .map(|parts| losers(parts, &spills, origin))
+        .collect();
     let mut by_batch: Vec<Vec<u32>> = (0..payloads.len()).map(|_| Vec::new()).collect();
     for locations in removals {
         for loc in locations {
@@ -359,16 +405,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn coarse_claims_compare_far_future_with_modern_copy() {
+        let clock = ManifestClock::new(parse_ts(b"2028-02-01T00:00:00Z"), parse_ts(b"2028-03-01T00:00:00Z"));
+        let mut spill = vec![];
+        let order = |s: &[u8], spill: &mut Vec<i64>| {
+            let (ms, sec) = clock.ingest_for_claim(s);
+            Claim::order(ms, sec, spill)
+        };
+        let mut exact = vec![];
+        let origin = time_origin(parse_ts(b"2028-02-27T00:00:00Z"));
+        let future = Claim::new(3, 23, order(b"9999-12-31T23:59:59Z", &mut spill), origin, &mut exact);
+        let now = Claim::new(3, NONE, order(b"2028-02-29T00:00:00Z", &mut spill), origin, &mut exact);
+        assert_eq!(exact.len(), 1);
+        finish_exact(&mut exact, &spill);
+        let losers = losers(vec![(0, vec![future, now])], &[exact], origin);
+        assert_eq!(losers.len(), 1);
+        assert_eq!(losers[0].target, 23);
+    }
+
+    #[test]
     fn bloom_alias_keeps_distinct_id_and_invalid_winner_kills_valid_loser() {
         // Same shard, probe, and exact-table fingerprint, but distinct keys.
         let id = 13 | (217 << KEY_BITS);
         let alias = id ^ (1 << 24);
-        let later = Claim::new(id, 0, 3);
-        let distinct = Claim::new(alias, 1, 4);
+        let mut exact = Vec::new();
+        let later = Claim::new(id, 0, 3, 0, &mut exact);
+        let distinct = Claim::new(alias, 1, 4, 0, &mut exact);
         assert_eq!(probe(later, 1023), probe(distinct, 1023));
         let mut spill = Vec::new();
-        let invalid = Claim::new(id, NONE, Claim::order(1234, BAD, &mut spill));
-        let lost = losers(vec![(0, vec![later, distinct]), (1, vec![invalid])], &[vec![], spill]);
+        let invalid = Claim::new(id, NONE, Claim::order(1234, BAD, &mut spill), 0, &mut exact);
+        finish_exact(&mut exact, &spill);
+        let lost = losers(
+            vec![(0, vec![later, distinct]), (1, vec![invalid])],
+            &[vec![], exact],
+            0,
+        );
         assert_eq!(lost.len(), 1);
         assert_eq!((lost[0].batch, lost[0].target), (0, 0));
     }
@@ -392,9 +463,13 @@ mod tests {
                     b"not a timestamp",
                 ] {
                     let (ms, secs) = clock.ingest_for_claim(s);
-                    let claim = Claim::new(mixed, target, Claim::order(ms, secs, &mut spill));
-                    assert_eq!(claim.ingest(&spill), ts::parse_ingest(s));
-                    assert_eq!(claim.target(), target);
+                    let origin = time_origin(parse_ts(b"2000-02-28T00:00:00Z"));
+                    let mut exact = vec![];
+                    let claim = Claim::new(mixed, target, Claim::order(ms, secs, &mut spill), origin, &mut exact);
+                    finish_exact(&mut exact, &spill);
+                    let unpacked = claim.unpack(origin, &exact);
+                    assert_eq!(unpacked.ingest, ts::parse_ingest(s));
+                    assert_eq!(unpacked.target, target);
                     let reconstructed = claim.key() | ((mixed >> KEY_BITS) << KEY_BITS);
                     assert_eq!(id, codec.bytes(links::unmix(reconstructed), &mut [0; 9]));
                 }
