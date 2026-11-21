@@ -1,5 +1,31 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Link-build incidence experiment — 2026-11-21 05:20 UTC
+
+Experimental detached candidate; not accepted for production without the
+parent's full-scale benchmark and memory check. Each parsed endpoint records
+its edge position in its hash lane. That lane inserts exact keys and writes
+the corresponding node IDs directly, so the union phase no longer hashes and
+probes both endpoints again. The final immutable `Lane`/`Slot` lookup API and
+capacity rule are unchanged. The transient incidence records add roughly
+16 bytes per edge versus the original key vectors; duplicate-heavy lanes grow
+by unique IDs and shrink to the original final capacity. Chains still use the
+existing path-halving atomic union and byte-wise minimum comparison.
+
+- The final version passed the 32 binary edge tests, 15 Rust tests (including
+  a 3,000-node single-lane chain and 10,000 repeated whale links), 36 official
+  fixtures, ten kit dirty-data seeds at 20k events, and both dev comparers.
+  The reference also passed the 32 edge tests and 36 fixtures.
+- Five alternating pairs, eight workers, using **only the practice link files**
+  with empty event/click files: median process 0.054 → 0.051 s and logged link
+  stage 0.044 → 0.041 s. A preceding run was 0.047 → 0.044 s process and
+  0.039 → 0.035 s link stage. This is not a complete 20M-event run.
+- Five pairs on the full 1M dev input were noisy: an earlier build measured
+  0.067 → 0.062 s; the final build measured 0.074 → 0.088 s under changing
+  host load. Median logged link stage was 0.008 → 0.008 s in both. Neither
+  measurement establishes a >3% full-scale gain. No 20M/60M full run or RSS
+  capacity test was performed, as directed.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.

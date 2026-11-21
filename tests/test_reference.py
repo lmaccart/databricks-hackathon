@@ -273,6 +273,26 @@ class EventsOrder(unittest.TestCase):
 
 
 class LinkedIds(unittest.TestCase):
+    def test_cross_file_chains_duplicates_and_byte_minimum(self):
+        t = "2026-10-02T10:00:00Z"
+        names = [f"node{i:04d}" for i in range(800)]
+        links = [f"{a},{b}" for a, b in zip(names, names[1:])]
+        # The unused minimum is interned and byte-wise smaller than ASCII.
+        links += ["\x01long-unused-Ω,node0799", "node0400,node0400",
+                  "node0010,node0011", "node0011,node0010"]
+        links += ["é,z-other", "e\u0301,z-other", "é,é"]
+        u, c = run_case(
+            events=[ev("e1", names[0], t), ev("e2", names[-1], t),
+                    ev("e3", "é", t), ev("e4", "e\u0301", t)],
+            clicks=[f"k,{names[401]},c_1,{t}"],
+            links=links[::2], extra={"links/part-1.csv": links[1::2]},
+        )
+        self.assertEqual(set(u), {("\x01long-unused-Ω", "2026-10-02"),
+                                  ("e\u0301", "2026-10-02")})
+        self.assertEqual(u[("\x01long-unused-Ω", "2026-10-02")]["events"], 2)
+        self.assertEqual(u[("e\u0301", "2026-10-02")]["events"], 2)
+        self.assertEqual(c[("c_1", "2026-10-02")]["sessions"], 1)
+
     def test_chain_naming(self):
         t1, t2 = "2026-10-02T10:00:00Z", "2026-10-02T10:20:00Z"
         u, _ = run_case(
