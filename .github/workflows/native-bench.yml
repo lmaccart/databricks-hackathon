@@ -1,7 +1,23 @@
 name: Native amd64 performance check
+run-name: Native amd64 — ${{ inputs.revision || github.sha }}
 on:
   workflow_dispatch:
     inputs:
+      revision:
+        description: Optional candidate commit to check out (defaults to the selected ref)
+        type: string
+      baseline:
+        description: Full SHA of the timed control (default is the original scored entry)
+        type: string
+        default: cc9f33ee6c3ccf9799dd89bac6dbfd8ce81abc4e
+      challenge:
+        description: Check both 20M seeds row-for-row, run x86 tests, and time the second seed
+        type: boolean
+        default: false
+      profile:
+        description: Sample the candidate with Linux perf after timing
+        type: boolean
+        default: false
       extended:
         description: Also measure allocator and whole-binary ISA experiments
         type: boolean
@@ -27,17 +43,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.revision || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Build the scored and candidate binaries
         shell: bash
+        env:
+          CONTROL: ${{ inputs.baseline || 'cc9f33ee6c3ccf9799dd89bac6dbfd8ce81abc4e' }}
         run: |
           set -eu
+          [[ "$CONTROL" =~ ^[0-9a-f]{40}$ ]]
+          echo "benchmark source: $(git rev-parse HEAD); control: $CONTROL"
           rustup toolchain install 1.100.0 --profile minimal
           export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
-          git worktree add --detach "$RUNNER_TEMP/control" cc9f33ee6c3ccf9799dd89bac6dbfd8ce81abc4e
+          git worktree add --detach "$RUNNER_TEMP/control" "$CONTROL"
           cargo +1.100.0 build --release --locked --manifest-path "$RUNNER_TEMP/control/fast/Cargo.toml"
           cp "$CARGO_TARGET_DIR/release/shopping_sessions" "$RUNNER_TEMP/scored"
+          cargo +1.100.0 clean --release --package shopping_sessions --manifest-path "$RUNNER_TEMP/control/fast/Cargo.toml"
           cargo +1.100.0 build --release --locked --manifest-path fast/Cargo.toml
           cp "$CARGO_TARGET_DIR/release/shopping_sessions" "$RUNNER_TEMP/candidate"
       - name: Get and verify public generator and dev answer
@@ -71,7 +93,7 @@ jobs:
           test ! -s "$RUNNER_TEMP/stdout"
           "$RUNNER_TEMP/venv/bin/python" tools/compare_outputs.py "$RUNNER_TEMP/dev-answer" "$RUNNER_TEMP/dev-out"
           {
-            echo "### Native Linux/amd64 — $GITHUB_SHA"
+            echo "### Native Linux/amd64 — $(git rev-parse HEAD)"
             echo '```'
             lscpu | grep -E 'Model name:|Thread.s. per core:'
             echo "Rayon workers: $t; five pairs; process start to exit, no container startup"
@@ -79,6 +101,51 @@ jobs:
               --threads "$t" --tmpdir "$RUNNER_TEMP" --phases
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Challenge — exact practice and leap-day rows
+        if: ${{ inputs.challenge }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
+          t=$(nproc); if (( t > 8 )); then t=8; fi
+          export NCPU=$t RAYON_NUM_THREADS=$t POLARS_MAX_THREADS=$t
+          tool="$GITHUB_WORKSPACE/tools/bench_pair.py"
+          py="$RUNNER_TEMP/venv/bin/python"
+          cargo +1.100.0 test --locked --release --manifest-path fast/Cargo.toml
+          cd "$RUNNER_TEMP"
+          ./venv/bin/pip -q install polars
+          curl -fsSL --retry 2 'https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/starter-duckdb.zip' -o starter.zip
+          echo 'b84ff8726c43749043c33c250548a9ac9987b9132d28ac818a47515bd128f77c  starter.zip' | sha256sum -c -
+          unzip -qo starter.zip
+          "$py" starter-duckdb/scripts/run_fixtures.py starter-duckdb/fixtures -- "$PWD/candidate"
+          ./generator/target/release/generate --seed 15 --events 20000000 --clicks 5000000 --output leap
+          for dataset in practice leap; do
+            for exe in scored candidate; do
+              DATA_DIR="$PWD/$dataset" OUTPUT_DIR="$PWD/$exe-out" ./"$exe" > stdout-check
+              test ! -s stdout-check
+            done
+            "$py" starter-duckdb/scripts/compare.py scored-out candidate-out
+            rm -r scored-out candidate-out
+          done
+          echo '### Seed 15, 20M events and 5M clicks' >> "$GITHUB_STEP_SUMMARY"
+          python3 "$tool" "$PWD/scored" "$PWD/candidate" "$PWD/leap" --threads "$t" --tmpdir "$PWD" --phases | tee -a "$GITHUB_STEP_SUMMARY"
+          rm -r leap
+      - name: Sample native on-CPU work
+        if: ${{ inputs.profile }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          if ! command -v perf >/dev/null || ! perf --version >/dev/null 2>&1; then
+            sudo apt-get -qq update
+            sudo apt-get -qq install -y linux-tools-generic
+          fi
+          perf=$(find /usr/lib/linux-tools -name perf -type f 2>/dev/null | sort -V | tail -1 || true)
+          perf=${perf:-$(command -v perf)}
+          t=$(nproc); if (( t > 8 )); then t=8; fi
+          sudo env DATA_DIR="$PWD/practice" OUTPUT_DIR="$PWD/profile-out" RAYON_NUM_THREADS="$t" \
+            "$perf" record -e cpu-clock:u -F 999 -o "$PWD/ss.perf" -- "$PWD/candidate"
+          sudo "$perf" report -i "$PWD/ss.perf" --stdio --no-children --percent-limit 0.9 --sort dso,symbol
       - name: Compare default allocator and mimalloc on the identical binary
         if: ${{ inputs.extended }}
         shell: bash
@@ -123,6 +190,7 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Compare one versus two workers per available logical CPU
+        if: ${{ !inputs.challenge && !inputs.profile }}
         shell: bash
         run: |
           set -euo pipefail
