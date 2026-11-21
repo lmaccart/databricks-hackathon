@@ -10,9 +10,7 @@ struct Claim {
     target: u32,
 }
 
-// One chunk starts at most CHUNK+1 rows: extending its final line never adds a
-// second newline. A row index within a bucket + its bucket number fit in u32.
-const _: () = assert!(NS.is_power_of_two() && (CHUNK + 1) * NS < u32::MAX as usize);
+const _: () = assert!(NS.is_power_of_two());
 const NONE: u32 = u32::MAX;
 const KILLED: u32 = u32::MAX; // never a valid purchase price
 
@@ -34,14 +32,14 @@ struct Pending {
 }
 
 fn parse<'a>(
-    c: &Chunk<'a>,
+    batch: &batches::Batch<'a>,
     sm: &Small,
     people: &People<'a>,
     ws: i64,
     we: i64,
     hs: &RandomState,
 ) -> (Vec<Vec<PEv>>, Vec<Vec<Claim>>) {
-    let reserve = reserve_per_shard(c.data);
+    let reserve = reserve_batch(batch).min(batch.row_bound / NS);
     let mut payload: Vec<Vec<PEv>> = (0..NS).map(|_| Vec::with_capacity(reserve)).collect();
     let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
     let mut emit = |e: Pending| {
@@ -49,6 +47,7 @@ fn parse<'a>(
         if e.uid != 0 {
             let person = people.lookup(e.uid, e.hash);
             let p = shard(person);
+            debug_assert!(payload[p].len() < batch.row_bound);
             target = (payload[p].len() * NS + p) as u32;
             payload[p].push(PEv {
                 person,
@@ -65,45 +64,47 @@ fn parse<'a>(
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
-    for_rows(c, |r| {
-        if r[0].is_empty() {
-            return;
-        }
-        let id = people.codec.key(r[0]);
-        let ingest = parse_ingest(r[3]);
-        let ts = parse_ts(r[2]);
-        let mut next = Pending {
-            id,
-            ts,
-            ingest,
-            ..Default::default()
-        };
-        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
-            let purchase = match r[4] {
-                b"purchase" => parse_price(r[6]),
-                b"view" | b"cart" => Some(0),
-                _ => None,
-            };
-            if let Some(price) = purchase {
-                let cat = if price == 0 {
-                    0
-                } else {
-                    *sm.product_cat.get(r[5]).unwrap_or(&sm.unknown_cat)
-                };
-                next.uid = people.codec.key(r[1]);
-                next.hash = links::mix(next.uid);
-                people.prefetch(next.hash);
-                next.price = price;
-                next.cat = cat;
+    for c in &batch.chunks {
+        for_rows(c, |r| {
+            if r[0].is_empty() {
+                return;
             }
-        }
-        let i = n % ring.len();
-        if n >= ring.len() {
-            emit(ring[i]);
-        }
-        ring[i] = next;
-        n += 1;
-    });
+            let id = people.codec.key(r[0]);
+            let ingest = parse_ingest(r[3]);
+            let ts = parse_ts(r[2]);
+            let mut next = Pending {
+                id,
+                ts,
+                ingest,
+                ..Default::default()
+            };
+            if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
+                let purchase = match r[4] {
+                    b"purchase" => parse_price(r[6]),
+                    b"view" | b"cart" => Some(0),
+                    _ => None,
+                };
+                if let Some(price) = purchase {
+                    let cat = if price == 0 {
+                        0
+                    } else {
+                        *sm.product_cat.get(r[5]).unwrap_or(&sm.unknown_cat)
+                    };
+                    next.uid = people.codec.key(r[1]);
+                    next.hash = links::mix(next.uid);
+                    people.prefetch(next.hash);
+                    next.price = price;
+                    next.cat = cat;
+                }
+            }
+            let i = n % ring.len();
+            if n >= ring.len() {
+                emit(ring[i]);
+            }
+            ring[i] = next;
+            n += 1;
+        });
+    }
     for i in n.saturating_sub(ring.len())..n {
         emit(ring[i % ring.len()]);
     }
@@ -183,7 +184,8 @@ pub(super) fn by_person<'a>(
     hs: &RandomState,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Vec<PEv>>> {
-    let parsed: Vec<_> = chunks.par_iter().map(|c| parse(c, sm, people, ws, we, hs)).collect();
+    let batches = batches::group(chunks, rayon::current_num_threads(), true);
+    let parsed: Vec<_> = batches.par_iter().map(|b| parse(b, sm, people, ws, we, hs)).collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
     let mut claims: Vec<Vec<_>> = (0..NS).map(|_| Vec::new()).collect();

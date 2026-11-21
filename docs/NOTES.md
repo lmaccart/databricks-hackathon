@@ -1,5 +1,22 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Macro-batch experiment — 2026-11-20
+
+Event and click chunks now share output shard vectors within balanced work units,
+targeting four units per worker and at most 64 MiB except for one oversized
+line. The per-batch event location proof counts at least six commas per
+accepted row, a newline except possibly for the final row, and at most one
+line extending beyond a nominal chunk boundary. A giant line is isolated and
+counts as at most one row; the summed bounds cap even an entirely skewed shard
+below the `u32::MAX` sentinel. The hints sample line density and never decide
+correctness.
+
+Rust tests, 33 reference/binary tests, both sets of 36 fixtures, dev-answer
+comparison, 10 dirty-data seeds, and six official-generator comparisons (seeds
+1, 7, 15 at 10k and 100k) passed. This is an unbenchmarked experiment: no
+20M or Docker timing was run by request, so no performance improvement or
+3% acceptance threshold is established.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.

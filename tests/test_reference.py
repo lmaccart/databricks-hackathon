@@ -63,7 +63,10 @@ def _run_case_at(tmp, events, clicks, links, products, campaigns, extra=None, wi
     write(os.path.join(data, "clicks", "part-0.csv"), "click_id,user_id,campaign_id,ts", clicks)
     write(os.path.join(data, "links", "part-0.csv"), "user_id_a,user_id_b", links)
     for rel, lines in (extra or {}).items():  # more part files; may replace the header-only events/part-1
-        write(os.path.join(data, rel), HEADERS[rel.split("/")[0]], lines)
+        header = HEADERS[rel.split("/")[0]]
+        if isinstance(lines, tuple):
+            header, lines = lines
+        write(os.path.join(data, rel), header, lines)
     if os.environ.get("SS_BIN"):  # run an implementation binary instead of the reference
         import subprocess
         subprocess.run([os.environ["SS_BIN"]], check=True, stderr=subprocess.DEVNULL,
@@ -189,6 +192,40 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_multifile_reordered_duplicates_and_skew(self):
+        t = "2026-10-02T10:00:00Z"
+        later = "2026-10-02T10:01:00Z"
+        reversed_header = "price_cents,product_id,event_type,ingest_ts,ts,user_id,event_id"
+        click_header = "ts,campaign_id,user_id,click_id"
+        extra = {
+            "events/part-1.csv": (reversed_header, [
+                f",p1,view,{t},{t},winner,dup",
+                f",p1,view,{t},{t},,invalid_winner",
+            ]),
+            "clicks/reordered.csv": (click_header, [f"{t},c_1,winner,k1"]),
+        }
+        for i in range(60):
+            extra[f"events/part-{i + 2}.csv"] = [
+                ev(f"skew{i}_{j}", "winner", t) for j in range(50)
+            ]
+        u, c = run_case(events=[
+            ev("dup", "loser", t, ingest=later),
+            ev("invalid_winner", "loser", t, ingest=later),
+        ], extra=extra)
+        self.assertEqual(set(u), {("winner", "2026-10-02")})
+        self.assertEqual(u[("winner", "2026-10-02")]["events"], 3001)
+        self.assertEqual(c[("c_1", "2026-10-02")]["sessions"], 1)
+
+    def test_event_line_larger_than_chunk(self):
+        t = "2026-10-02T10:00:00Z"
+        giant_ignored_price = "x" * ((8 << 20) + 10)
+        u, _ = run_case(events=[
+            ev("before", "u", t),
+            ev("giant", "u", t, price=giant_ignored_price),
+            ev("after", "u", t),
+        ])
+        self.assertEqual(u[("u", "2026-10-02")]["events"], 3)
+
     def test_no_survivors_still_writes_both_empty_tables(self):
         u, c = run_case(events=[ev("e", "", WS)], clicks=[f"k,u,c_1,{WS}"])
         self.assertEqual((u, c), ({}, {}))

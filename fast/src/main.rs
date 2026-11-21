@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+mod batches;
 mod events;
 mod links;
 mod output;
@@ -182,13 +183,20 @@ fn shard(h: u64) -> usize {
 
 // A small live sample is only an allocation hint. Vectors still grow normally
 // for skewed shards, short records, long records, or a non-representative prefix.
-fn reserve_per_shard(data: &[u8]) -> usize {
-    let n = data.len().min(16 * 1024);
-    if n == 0 {
-        return 0;
-    }
-    let lines = memchr::memchr_iter(b'\n', &data[..n]).count();
-    lines.saturating_mul(data.len()) / n / NS
+fn reserve_batch(batch: &batches::Batch<'_>) -> usize {
+    batch
+        .chunks
+        .iter()
+        .map(|c| {
+            let n = c.data.len().min(16 * 1024);
+            if n == 0 {
+                return 0;
+            }
+            let lines = memchr::memchr_iter(b'\n', &c.data[..n]).count();
+            lines.saturating_mul(c.data.len()) / n
+        })
+        .fold(0usize, usize::saturating_add)
+        / NS
 }
 
 fn by_destination<T>(batches: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
@@ -215,28 +223,30 @@ fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
     rows
 }
 
-fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<'a>) -> Vec<Vec<PCl>> {
-    let hint = reserve_per_shard(c.data);
+fn parse_clicks<'a>(batch: &batches::Batch<'a>, sm: &Small, lo: i64, we: i64, names: &People<'a>) -> Vec<Vec<PCl>> {
+    let hint = reserve_batch(batch);
     let mut b: Vec<Vec<PCl>> = (0..NS).map(|_| Vec::with_capacity(hint)).collect();
-    for_rows(c, |r| {
-        // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
-        let (cid, uid, camp) = (r[0], r[1], r[2]);
-        if cid.is_empty() || uid.is_empty() {
-            return;
-        }
-        let Some(&ci) = sm.camp_idx.get(camp) else { return };
-        let ts = parse_ts(r[3]);
-        if ts == BAD || ts < lo || ts >= we {
-            return;
-        }
-        let person = names.resolve(uid);
-        b[shard(person)].push(PCl {
-            person,
-            ts,
-            cid: names.codec.key(cid),
-            camp: ci,
+    for c in &batch.chunks {
+        for_rows(c, |r| {
+            // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
+            let (cid, uid, camp) = (r[0], r[1], r[2]);
+            if cid.is_empty() || uid.is_empty() {
+                return;
+            }
+            let Some(&ci) = sm.camp_idx.get(camp) else { return };
+            let ts = parse_ts(r[3]);
+            if ts == BAD || ts < lo || ts >= we {
+                return;
+            }
+            let person = names.resolve(uid);
+            b[shard(person)].push(PCl {
+                person,
+                ts,
+                cid: names.codec.key(cid),
+                camp: ci,
+            });
         });
-    });
+    }
     b
 }
 
@@ -462,7 +472,8 @@ fn main() {
     let ev_by_person = events::by_person(&ev_chunks, &sm, &names, ws, we, &hs, &log);
     log("events deduped");
 
-    let cl_by_person = cl_chunks
+    let click_batches = batches::group(&cl_chunks, rayon::current_num_threads(), false);
+    let cl_by_person = click_batches
         .par_iter()
         .map(|c| parse_clicks(c, &sm, ws - WEEK, we, &names))
         .collect();

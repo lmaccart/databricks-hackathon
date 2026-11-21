@@ -34,6 +34,13 @@ pub struct Chunk<'a> {
     idx: [usize; 8],
 }
 
+impl<'a> Chunk<'a> {
+    pub fn split_at(self, at: usize) -> (Self, Self) {
+        let (a, b) = self.data.split_at(at);
+        (Self { data: a, ..self }, Self { data: b, ..self })
+    }
+}
+
 pub fn chunks_of<'a>(file: &'a [u8], cols: &[&str], path: &Path) -> Vec<Chunk<'a>> {
     chunks_sized(file, cols, path, crate::CHUNK)
 }
