@@ -50,7 +50,7 @@ mod csv;
 mod ts;
 
 use csv::{Chunk, chunks_of, for_rows};
-use ts::{parse_ingest, parse_ts};
+use ts::parse_ts;
 
 // ------------------------------------------------------------------ prices
 

@@ -1,5 +1,27 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 2 experiment: pair the event and ingest timestamps — 2026-11-20
+
+The AVX2 event kernel uses one 128-bit lane per clock for the F1+F1 and
+F2+F1 pairs. It checks both fields' ASCII templates before byte shuffles and
+multiply-adds decode the calendar and clock digits. Gregorian validation and
+UTC conversion stay scalar and shared with the original parser. F3 and rejected
+pairs retain the original scalar parser, including its ingest ordering. Only
+the event chunk picks the kernel; there is no new row batch or CSV change.
+
+Rust 1.100.0 passed `cargo check --locked --target x86_64-unknown-linux-gnu`,
+including the test target. With Rosetta's AVX exposure enabled, the x86-64
+test binary reported AVX2 dispatch and passed all 17 tests; disassembly of
+the release kernel showed YMM `vpshufb`, `vpmaddubsw`, and `vpmaddwd`.
+The scalar x86-64 test run also passed with AVX exposure disabled. The
+AVX2 x86-64 and scalar ARM binaries matched the official dev answer, all 36
+fixtures, all 34 Python tests, and 10 kit dirty seeds of 20,000 events.
+
+Native Linux/x86-64 performance is unmeasured. Gate any promotion on paired
+timings against `012174f`; use `SS_REQUIRE_AVX2=1 cargo test --locked --release`
+from `fast/` on an AVX2 runner so scalar-only execution cannot satisfy the
+SIMD coverage check.
+
 ## Round 2 integration: compact streams, exact catalog index and click prefetch — 2026-11-20
 
 The link graph already assigns each exact ID a node. Reuse its canonical root

@@ -73,13 +73,13 @@ fn parse<'a>(
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
+    let clock = ts::event_clock();
     for_rows(c, |r| {
         if r[0].is_empty() {
             return;
         }
         let id = people.codec.key(r[0]);
-        let ingest = parse_ingest(r[3]);
-        let ts = parse_ts(r[2]);
+        let (ts, ingest) = clock.parse(r[2], r[3]);
         let mut next = Pending {
             id,
             ts,

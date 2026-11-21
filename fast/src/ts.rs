@@ -7,6 +7,9 @@
 
 use crate::BAD;
 
+mod pair;
+pub use pair::event_clock;
+
 const LO7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
 const HI: u64 = 0x8080_8080_8080_8080;
 /// Per-byte addend: a byte passes if it is at most 9 (digit) or exactly 0 (literal).
@@ -75,6 +78,11 @@ fn iso<const F2: bool>(s: &[u8]) -> i64 {
     let y = b(a, 0) * 1000 + b(a, 1) * 100 + b(a, 2) * 10 + b(a, 3);
     let (mo, d) = (b(a, 5) * 10 + b(a, 6), b(t, 0) * 10 + b(t, 1));
     let (h, mi, se) = (b(t, 3) * 10 + b(t, 4), b(t, 6) * 10 + b(t, 7), b(z, 1) * 10 + b(z, 2));
+    iso_ms(y, mo, d, h, mi, se, off_min)
+}
+
+#[inline(always)]
+fn iso_ms(y: i64, mo: i64, d: i64, h: i64, mi: i64, se: i64, off_min: i64) -> i64 {
     if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 {
         return BAD;
     }
@@ -265,9 +273,56 @@ mod tests {
     }
 
     fn check(s: &[u8]) {
-        assert_eq!(parse_ts(s), want(s), "{:?}", String::from_utf8_lossy(s));
-        let ingest = if want(s) == BAD { i64::MAX } else { want(s) };
+        let expected = want(s);
+        assert_eq!(parse_ts(s), expected, "{:?}", String::from_utf8_lossy(s));
+        let ingest = if expected == BAD { i64::MAX } else { expected };
         assert_eq!(parse_ingest(s), ingest, "ingest {:?}", String::from_utf8_lossy(s));
+        let other = BASES[0].as_bytes();
+        let other_ms = 1_791_071_890_000;
+        let clock = event_clock();
+        assert_eq!(clock.parse(s, other), (expected, other_ms), "event {s:?}");
+        assert_eq!(clock.parse(other, s), (other_ms, ingest), "ingest {s:?}");
+        #[cfg(target_arch = "x86_64")]
+        if matches!(s.len(), 20 | 25) && clock.is_avx2() {
+            // A valid padded F3 still belongs to scalar. Check all ISO-shaped
+            // candidates directly so fallback cannot conceal a false rejection.
+            let iso = expected != BAD && s[4] == b'-';
+            assert_eq!(
+                unsafe { pair::try_pair_avx2(s, other) },
+                iso.then_some((expected, other_ms)),
+                "kernel event {s:?}"
+            );
+            if s.len() == 20 {
+                assert_eq!(
+                    unsafe { pair::try_pair_avx2(other, s) },
+                    iso.then_some((other_ms, expected)),
+                    "kernel ingest {s:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_dispatch_uses_both_lanes() {
+        use pair::try_pair_avx2;
+
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            assert!(!event_clock().is_avx2());
+            assert!(
+                std::env::var_os("SS_REQUIRE_AVX2").is_none(),
+                "runtime AVX2 not available"
+            );
+            return;
+        }
+        assert!(event_clock().is_avx2());
+        eprintln!("event clock dispatched to AVX2");
+        for s in &BASES[..3] {
+            let s = s.as_bytes();
+            let ingest = b"1900-02-28T23:01:02Z";
+            // Bypass the fallback so it cannot hide a rejected valid lane.
+            assert_eq!(unsafe { try_pair_avx2(s, ingest) }, Some((want(s), want(ingest))));
+        }
     }
 
     struct Rng(u64);
