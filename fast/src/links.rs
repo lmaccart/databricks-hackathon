@@ -129,110 +129,188 @@ fn root(parent: &[AtomicU32], mut x: u32) -> u32 {
     }
 }
 
+fn local_root(parent: &mut [u32], mut x: u32) -> u32 {
+    while parent[x as usize] != x {
+        parent[x as usize] = parent[parent[x as usize] as usize];
+        x = parent[x as usize];
+    }
+    x
+}
+
+fn local_id(key: u64, table: &mut Lane, keys: &mut Vec<u64>, parent: &mut Vec<u32>) -> u32 {
+    let mut slot = table.find(key, mix(key));
+    if table.slots[slot].key != 0 {
+        return table.slots[slot].value as u32;
+    }
+    if keys.len() * 2 >= table.slots.len() {
+        let cap = table.slots.len() * 2;
+        let mut larger = Lane {
+            slots: vec![Slot::default(); cap],
+            mask: cap - 1,
+        };
+        for &old in &table.slots {
+            if old.key != 0 {
+                let i = larger.find(old.key, mix(old.key));
+                larger.slots[i] = old;
+            }
+        }
+        *table = larger;
+        slot = table.find(key, mix(key));
+    }
+    let id = u32::try_from(keys.len()).expect("too many linked IDs");
+    table.slots[slot] = Slot { key, value: id as u64 };
+    keys.push(key);
+    parent.push(id);
+    id
+}
+
 pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
     let codec = Codec::new();
     let parsed: Vec<_> = chunks
         .par_iter()
         .map(|c| {
-            let mut edges = Vec::new();
-            let mut keys: Vec<Vec<u64>> = (0..LANES).map(|_| Vec::new()).collect();
+            let cap = (c.data.len() / 8 + 1).next_power_of_two().max(2);
+            let mut table = Lane {
+                slots: vec![Slot::default(); cap],
+                mask: cap - 1,
+            };
+            let mut keys = Vec::new();
+            let mut parent = Vec::new();
+            let mut sizes = Vec::<u32>::new();
             for_rows(c, |r| {
                 if r[0].is_empty() || r[1].is_empty() {
                     return;
                 }
-                let a = codec.key(r[0]);
-                let b = codec.key(r[1]);
-                edges.push((a, b));
-                for k in [a, b] {
-                    keys[mix(k) as usize & (LANES - 1)].push(k);
+                let a = local_id(codec.key(r[0]), &mut table, &mut keys, &mut parent);
+                let b = local_id(codec.key(r[1]), &mut table, &mut keys, &mut parent);
+                sizes.resize(keys.len(), 1);
+                let mut a = local_root(&mut parent, a);
+                let mut b = local_root(&mut parent, b);
+                if a != b {
+                    if sizes[a as usize] < sizes[b as usize] {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    parent[b as usize] = a;
+                    sizes[a as usize] += sizes[b as usize];
                 }
             });
-            (edges, keys)
+            let mut parts: Vec<Vec<u32>> = (0..LANES).map(|_| Vec::new()).collect();
+            for (i, &key) in keys.iter().enumerate() {
+                parent[i] = local_root(&mut parent, i as u32);
+                parts[mix(key) as usize & (LANES - 1)].push(i as u32);
+            }
+            (keys, parent, parts)
         })
         .collect();
-    let (edges, key_parts): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
-    let built: Vec<_> = (0..LANES)
-        .into_par_iter()
-        .map(|s| {
-            let n = key_parts.iter().map(|p| p[s].len()).sum::<usize>();
-            let mut keys = Vec::with_capacity(n);
-            for p in &key_parts {
-                keys.extend_from_slice(&p[s]);
-            }
-            keys.sort_unstable();
-            keys.dedup();
-            let cap = (keys.len() * 2 + 1).next_power_of_two();
-            let mut lane = Lane {
-                slots: vec![Slot::default(); cap],
-                mask: cap - 1,
-            };
-            for (j, &k) in keys.iter().enumerate() {
-                let i = lane.find(k, mix(k));
-                lane.slots[i] = Slot {
-                    key: k,
-                    value: j as u64,
-                };
-            }
-            (lane, keys)
-        })
-        .collect();
-    drop(key_parts);
-    let (mut lanes, groups): (Vec<_>, Vec<_>) = built.into_iter().unzip();
-    let mut offsets = [0; LANES];
+    let mut offsets = Vec::with_capacity(parsed.len());
     let mut count = 0usize;
-    for (s, g) in groups.iter().enumerate() {
-        offsets[s] = count;
-        count += g.len();
+    for (keys, _, _) in &parsed {
+        offsets.push(count);
+        count += keys.len();
     }
     assert!(
         u32::try_from(count).is_ok(),
         "too many linked IDs for addressable memory"
     );
-    let keys: Vec<u64> = groups.into_iter().flatten().collect();
-    let parent: Vec<_> = (0..count as u32).map(AtomicU32::new).collect();
-    let index = |key| {
-        let hash = mix(key);
-        let s = hash as usize & (LANES - 1);
-        (offsets[s] + lanes[s].slots[lanes[s].find(key, hash)].value as usize) as u32
-    };
-    edges
+    let built: Vec<_> = (0..LANES)
+        .into_par_iter()
+        .map(|s| {
+            let n = parsed.iter().map(|p| p.2[s].len()).sum::<usize>();
+            let cap = (n * 2 + 1).next_power_of_two();
+            let mut lane = Lane {
+                slots: vec![Slot::default(); cap],
+                mask: cap - 1,
+            };
+            let mut bridges = Vec::new();
+            let mut unique = 0usize;
+            for (part, (keys, _, parts)) in parsed.iter().enumerate() {
+                for &id in &parts[s] {
+                    let k = keys[id as usize];
+                    let node = (offsets[part] + id as usize) as u32;
+                    let slot = lane.find(k, mix(k));
+                    if lane.slots[slot].key == 0 {
+                        unique += 1;
+                        lane.slots[slot] = Slot {
+                            key: k,
+                            value: u64::from(node),
+                        };
+                    } else {
+                        bridges.push((lane.slots[slot].value as u32, node));
+                    }
+                }
+            }
+            // Repeated IDs across many chunks must not make the immutable
+            // lookup table needlessly larger than the distinct graph.
+            let compact = (unique * 2 + 1).next_power_of_two();
+            if compact < cap {
+                let mut smaller = Lane {
+                    slots: vec![Slot::default(); compact],
+                    mask: compact - 1,
+                };
+                for &entry in &lane.slots {
+                    if entry.key != 0 {
+                        let i = smaller.find(entry.key, mix(entry.key));
+                        smaller.slots[i] = entry;
+                    }
+                }
+                lane = smaller;
+            }
+            (lane, bridges)
+        })
+        .collect();
+    let (mut lanes, bridges): (Vec<_>, Vec<_>) = built.into_iter().unzip();
+    let parent: Vec<_> = parsed
+        .iter()
+        .enumerate()
+        .flat_map(|(s, (_, p, _))| {
+            let offset = offsets[s];
+            p.iter().map(move |&id| AtomicU32::new((offset + id as usize) as u32))
+        })
+        .collect();
+    let keys: Vec<_> = parsed.into_iter().flat_map(|(keys, _, _)| keys).collect();
+    bridges
         .par_iter()
         .flat_map(|part| part.par_chunks(8192))
         .for_each(|part| {
-            for &(a, b) in part {
-                let (mut a, mut b) = (index(a), index(b));
+            for &(mut a, mut b) in part {
                 loop {
                     a = root(&parent, a);
                     b = root(&parent, b);
                     if a == b {
                         break;
                     }
-                    let ka = keys[a as usize];
-                    let kb = keys[b as usize];
-                    // The ASCII encoding is order preserving for its domain.
-                    // Spill numbers are not; compare their original bytes.
-                    let swap = if (ka | kb) >> 63 == 0 {
-                        ka > kb
-                    } else {
-                        codec.bytes(ka, &mut [0; 9]) > codec.bytes(kb, &mut [0; 9])
-                    };
-                    if swap {
+                    if a > b {
                         std::mem::swap(&mut a, &mut b);
                     }
-                    // Every successful edge points to a strictly smaller name.
-                    // A concurrent union can change either root, never form a cycle.
+                    // Fixed root priority prevents cycles even if a concurrent
+                    // union changes the target before this CAS succeeds.
                     if parent[b as usize].compare_exchange(b, a, Relaxed, Relaxed).is_ok() {
                         break;
                     }
                 }
             }
         });
+    // The structural root need not be the smallest spelling. Reduce over all
+    // nodes, including aliases that occur in no event or click.
+    let minima: Vec<_> = (0..count as u32).map(AtomicU32::new).collect();
+    keys.par_iter().enumerate().for_each(|(i, &key)| {
+        let r = root(&parent, i as u32);
+        let min = &minima[r as usize];
+        let mut old = min.load(Relaxed);
+        while codec.less(key, keys[old as usize]) {
+            match min.compare_exchange_weak(old, i as u32, Relaxed, Relaxed) {
+                Ok(_) => break,
+                Err(actual) => old = actual,
+            }
+        }
+    });
     let mut roots = keys;
     roots.par_iter_mut().for_each(|k| *k = mix(*k));
-    lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
+    lanes.par_iter_mut().for_each(|lane| {
         for slot in &mut lane.slots {
             if slot.key != 0 {
-                let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
+                let component = root(&parent, slot.value as u32);
+                let rank = minima[component as usize].load(Relaxed);
                 let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
                 slot.value = LINKED | routing | u64::from(rank);
             }
@@ -243,5 +321,37 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         lanes,
         roots,
         count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_table_keeps_colliding_keys_through_growth() {
+        let mut table = Lane {
+            slots: vec![Slot::default(); 2],
+            mask: 1,
+        };
+        let mut keys = Vec::new();
+        let mut parent = Vec::new();
+        let colliding: Vec<_> = (1u64..)
+            .map(|k| k | (1u64 << 63))
+            .filter(|&k| (mix(k) >> LANES.trailing_zeros()) & 255 == 0)
+            .take(64)
+            .chain(
+                (1u64..)
+                    .filter(|&k| (mix(k) >> LANES.trailing_zeros()) & 255 == 0)
+                    .take(64),
+            )
+            .collect();
+        for (i, &key) in colliding.iter().enumerate() {
+            assert_eq!(local_id(key, &mut table, &mut keys, &mut parent), i as u32);
+        }
+        for (i, &key) in colliding.iter().rev().enumerate() {
+            assert_eq!(local_id(key, &mut table, &mut keys, &mut parent), (127 - i) as u32);
+        }
+        assert_eq!(keys, colliding);
     }
 }

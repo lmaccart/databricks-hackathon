@@ -446,6 +446,34 @@ class LinkedIds(unittest.TestCase):
         self.assertEqual(u[("a0", "2026-10-02")]["sessions"], 1)
         self.assertEqual(u[("a0", "2026-10-02")]["events"], 2)
 
+    def test_long_reordered_graph_with_unused_opaque_minimum(self):
+        # The minimum is a linked-only ID, not necessarily the union root.
+        names = [f"long opaque node {i:04d}" for i in range(500)]
+        names[237] = " A\0"
+        edges = [f"{a},{b}" for a, b in zip(names, names[1:])]
+        events = [ev("one", names[0], WS), ev("two", names[-1], WS),
+                  ev("solo", "standalone", WS)]
+        clicks = [f"click,{names[300]},c_1,{WS}"]
+        for lines in (edges, [",".join(reversed(e.split(","))) for e in reversed(edges)]):
+            users, campaigns = run_case(
+                events, clicks, lines[::2] + [f"{names[1]},{names[1]}", lines[0]],
+                extra={"links/part-1.csv": lines[1::2]})
+            self.assertEqual(set(users), {(" A\0", "2026-10-01"), ("standalone", "2026-10-01")})
+            self.assertEqual(users[(" A\0", "2026-10-01")]["events"], 2)
+            self.assertEqual(campaigns[("c_1", "2026-10-01")]["sessions"], 1)
+
+    def test_repeated_ids_across_many_chunks(self):
+        extras = {
+            f"links/part-{i:03}.csv": [
+                "z long alias,mid long alias", "mid long alias, A\0",
+                "z long alias,z long alias",
+            ]
+            for i in range(1, 33)
+        }
+        users, _ = run_case(events=[ev("event", "z long alias", WS)],
+                            links=["mid long alias,z long alias"], extra=extras)
+        self.assertEqual(set(users), {(" A\0", "2026-10-01")})
+
     def test_uppercase_sorts_first(self):
         u, _ = run_case(events=[ev("e1", "u5", "2026-10-02T10:00:00Z")], links=["u5,U5"])
         self.assertEqual(set(u), {("U5", "2026-10-02")})

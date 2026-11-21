@@ -1,5 +1,25 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Experimental chunk-local graph fold — 2026-11-21
+
+Against `dfbd330`, union links by size as each chunk is parsed, merge only
+IDs shared between chunks, then reduce exact byte-wise minima independently of
+structural roots. The eager `Slot` lookup interface is unchanged. This is an
+experiment, **not a recommended performance pick**: no 20M or 60M input was run
+locally by request. With final `/8` local-table sizing, 21 alternating pairs
+on the dev links alone (eight workers, otherwise empty input) had 0.003 →
+0.004 s median internal links time, and the candidate lost 19/21
+whole-process pairs. `/8` beat `/16` in 16/21 such pairs. An 11-pair
+full-dev run with `/16` was noisy: 0.093 → 0.089 s medians, links 0.012 →
+0.013 s; that does not establish a practice-scale improvement. An earlier
+lane-local endpoint-scatter prototype also lost 14/15 link-only pairs.
+
+The chunk fold matched all 41 Python and binary tests, all 36 official
+fixtures for both implementations, 10 dirty seeds, both official dev
+comparers, official-generator seeds 7 and 15 at 100k events, and an opaque-ID
+dev transformation with one and eight workers.
+The added Rust test forces open-addressing collisions through table growth.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).
