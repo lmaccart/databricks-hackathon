@@ -5,7 +5,7 @@ A single native binary (Rust) in a tiny Docker image that reads `/data`, applies
 
 Why Rust (not Spark / DuckDB / Polars):
 - The clock includes engine start-up. A JVM or Python interpreter costs 0.3 to 3 s before any work; a static binary starts in milliseconds.
-- The leaders sit at 0.75 to 1.0 s on 20M events. That is only reachable with a hand-written, parallel, allocation-light parser and hash-partitioned group-bys.
+- The latest reported practice record is **0.63 s**, against **1.57 s** for our last officially scored build. Compare candidate changes on the same machine; the current [two-seed and full-container results](docs/PERF_157.md) are separate from organizer scores.
 - The rules (byte-wise strings, exact quoting, dedup-before-validate, distinct-timestamp gaps) are easier to get exactly right in explicit code than in SQL with CSV readers that "helpfully" trim, cast or unquote.
 
 The original kit reported a 0.59 s native run on a 2M-event kit dataset. Current official fixture, dev-answer, scale and timing results are in [docs/NOTES.md](docs/NOTES.md).

@@ -22,6 +22,10 @@ On all physical event rows of seeds 7 and 15, the typed grammar hit **21,235,584
 
 After the typed grammar landed, [a second identical-source comparison and CPU profile](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876652111) gave 1.652 vs 1.655 s on Intel. The new event phase took 0.721 s; sessions still took 0.450 s. About 27% of on-CPU samples were in the compiler-inlined chunk worker, 9.9% in its event emission helper, 5.9% in F1 seconds, and 8.2% in the two event quicksort symbols combined. Sample percentages for an inlined worker cannot be attributed to tokenization alone.
 
+On that same CI host, even eliminating the **entire** 0.450 s session phase would leave about **1.20 s**; eliminating the entire 0.721 s event phase would leave about **0.93 s**. Those are bounds on a single-stage optimization, not predictions of the organizer's clock.
+
+The next useful calibration is an organizer practice run of the verified SHA. The Linux jobs here had four available workers; the competition specifies eight pinned hyperthreads. The M2 comparison has eight workers but a different ISA, memory system and launch path. No conversion factor between those clocks has been established.
+
 ## Two-seed comparisons
 
 Each comparison uses five alternating-order process start-to-exit pairs per seed on one native amd64 runner after a warmup. Seed 7 and leap-day seed 15 contain 20M events and 5M clicks each. A successful challenge also compares every row on both inputs, checks the official dev answer, and runs 36 fixtures and the x86 Rust tests. Hardware varies between jobs; compare the control and challenger **within a pair**, never times from separate runners.
@@ -93,6 +97,9 @@ Times below are seconds, **control → candidate**. The control is `9758471` unl
 | [Three-input shared-clock parser vs partition-local join with typed events](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877538589) | 1.648 → 1.717 | 1.608 → 1.694 |
 | [Add typed clicks/links to the event parser, direct Docker follow-up](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) | 1.722 → 1.688 | 1.712 → 1.667 |
 | [Typed clicks/links and shared clocks vs typed events plus the same partition-local join](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877863522) | 1.640 → 1.643 | 1.616 → 1.617 |
+| [Time-ordered joint sweep over events and clicks vs typed event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44878038865) | 1.665 → 1.766 | 1.608 → 1.708 |
+| [Partition-local join and paired clocks vs independent-clock three-input parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877860881) | 1.693 → 1.674 | 1.675 → 1.646 |
+| [Same partition-local join with independent clocks, vs the independent-clock three-input parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44878084470) | 2.078 → 2.085 | 2.053 → 2.034 |
 
 What the direct comparisons show:
 
