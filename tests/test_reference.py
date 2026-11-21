@@ -90,6 +90,49 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_paired_clocks_keep_signed_ingest_order_and_strict_lateness(self):
+        # Deliberately use fixed-width IDs and alternate quoting for the typed parser.
+        rows = [
+            ("1969-12-31T12:34:09Z", "1969-12-31T12:34:10Z", True),
+            ("1969-12-31T12:39:00Z", "1969-12-31T12:40:00Z", True),
+            ("1969-12-31T20:00:00Z", "1969-12-31T19:59:59Z", True),
+            ("1969-12-31T23:59:59Z", "1970-01-01T00:00:00Z", True),
+            ("2028-02-29T23:59:59Z", "2028-03-01T23:59:59Z", True),
+            ("2028-02-29T23:59:58Z", "2028-03-01T23:59:59Z", False),
+            ("2028-03-01T00:00:00+00:01", "2028-03-01T23:59:00Z", True),
+            ("2028-03-01T00:00:00+00:01", "2028-03-01T23:59:01Z", False),
+            (f'{ms("2028-02-29T23:59:59Z") + 1}', "2028-03-01T23:59:59Z", True),
+            (f'{ms("2028-02-29T23:59:59Z") - 1}', "2028-03-01T23:59:59Z", False),
+            ("2028-03-01T12:34:56Z", "2028-03-01T12:34:56z", False),
+            ("2028-03-01T12:34:56Z", "2028-03-01T12:34:60Z", False),
+            ("2028-03-01T12:34:56Z", "2028-03-01T12:60:00Z", False),
+            ("2028-03-01T12:34:56Z", "2028-03-01T24:34:56Z", False),
+        ]
+        events = [ev(f"event{i:04}", f"user{i:04}", f'"{ts}"' if i % 2 else ts,
+                     pid="item-07", ingest=ingest if i % 2 else f'"{ingest}"')
+                  for i, (ts, ingest, _) in enumerate(rows)]
+        ts = "1969-12-31T12:34:30Z"
+        events.extend([
+            ev("dupe00001", "survive01", ts, pid="item-07", ingest="1969-12-31T12:34:20Z"),
+            ev("dupe00001", "lose00001", ts, pid="item-07", ingest="1969-12-31T12:34:10z"),
+            ev("dupe00002", "lose00002", ts, pid="item-07", ingest="1969-12-31T12:34:20Z"),
+            ev("dupe00002", "survive02", ts, pid="item-07", ingest="1969-12-31T12:34:19Z"),
+            ev("dupe00003", "lose00003", ts, pid="item-07", ingest="1969-12-31T12:34:20Z"),
+            ev("dupe00003", "invalid03", "1969-12-31T12:34:60Z", pid="item-07", ingest="1969-12-31T12:34:19Z"),
+            ev("dupe00004", "lose00004", ts, pid="item-07", ingest="1969-12-31T12:34:20Z"),
+            ev("dupe00004", "later0004", ts, pid="item-07", ingest="1970-01-01T12:34:15Z"),
+            ev("dupe00005", "lose00005", ts, pid="item-07", ingest="1969-12-31T12:34:20Z"),
+            ev("dupe00005", "survive05", ts, pid="item-07", ingest="1969-12-31T12:34:19-00:00"),
+            ev("dupe00006", "lose00006", ts, pid="item-07", ingest="1969-12-31T12:34:20Z"),
+            ev("dupe00006", "invalid06", "1969-12-31T12:34:31Z", pid="", ingest="1969-12-31T12:34:19Z"),
+        ])
+        users, _ = run_case(events, products=("item-07,shoes",),
+                            window=("1969-12-31T00:00:00Z", "2028-03-03T00:00:00Z"))
+        self.assertEqual(set(users), {
+            (f"user{i:04}", dt.datetime.fromtimestamp(ms(ts) // 1000, dt.timezone.utc).date().isoformat())
+            for i, (ts, _, kept) in enumerate(rows) if kept
+        } | {(name, "1969-12-31") for name in ("survive01", "survive02", "lose00004", "survive05")})
+
     def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
         stamp = "2026-10-03T10:00:00Z"
         early = "2026-10-03T09:59:59Z"
@@ -505,6 +548,28 @@ class Clicks(unittest.TestCase):
 
 
 class ByteDistinctIds(unittest.TestCase):
+    def test_guarded_click_link_mixed_forms_and_equal_time_ties(self):
+        t = "2026-10-09T12:00:00Z"
+        k = ms(t) - HOUR
+        clicks = [
+            f"zclick007,user00007,c_1,{k}",
+            f'"aclick008","alias0008","c_2","2026-10-09T07:00:00-04:00"',
+            f"bclick009,user00007,c_3,2026-10-09T11:00:00Z",
+            f"0,alias0008,c_1,{k}",  # short ID takes the strict fallback
+            f'00,alias0008,c_3,"{k}"x',  # malformed, cannot win
+            f"000,alias0008,c_3,{k}\r",  # CR is part of the timestamp
+        ]
+        links = ['"user00007","alias0008"', "alias0008,short", "user00007,bad,extra"]
+        for order in (clicks, list(reversed(clicks))):
+            with self.subTest(reverse=order is not clicks):
+                users, campaigns = run_case(
+                    events=[ev("event0007", "user00007", t)], clicks=order, links=links)
+                day = "2026-10-09"
+                self.assertEqual(set(users), {("alias0008", day)})
+                self.assertEqual(campaigns[("c_1", day)]["sessions"], 1)
+                for name in ("c_1", "c_2", "c_3"):
+                    self.assertEqual(campaigns[(name, day)]["assisted_sessions"], 1)
+
     def test_dimension_spellings_and_pipelined_click_ties(self):
         s = ms("2026-10-09T12:00:00Z")
         products = ["p1,first", "p2,second", "p3,third", "p4,fourth", "p5,fifth", "p01,padded", "P1,upper",

@@ -2,64 +2,18 @@
 //! byte of the physical line; misses retry from the original line start.
 use super::*;
 
-const ONES: u64 = 0x0101_0101_0101_0101;
-const HIGH: u64 = ONES << 7;
-const FLOOR: u64 = ONES * b'-' as u64;
-
-#[inline(always)]
-fn quoted(s: &[u8]) -> (bool, &[u8]) {
-    match s.strip_prefix(b"\"") {
-        Some(body) => (true, body),
-        None => (false, s),
-    }
-}
-
-#[inline(always)]
-fn comma(s: &[u8], q: bool) -> Option<&[u8]> {
-    s.strip_prefix(if q { b"\"," as &[u8] } else { b"," })
-}
-
-/// The tight ID path uses the same load to prove ASCII and construct the
-/// inline token. `'-'..=127` excludes all three CSV structural bytes and NUL;
-/// IDs with any other spelling are still handled by the ordinary codec.
-#[inline(always)]
-fn id(s: &[u8]) -> Option<(u64, &[u8])> {
-    let (q, b) = quoted(s);
-    let b11 = b.first_chunk::<11>()?;
-    let w = u64::from_le_bytes(b11[..8].try_into().unwrap());
-    let end = if q { b'"' } else { b',' };
-    let tail = b11[8];
-    if b11[9] == end && (b'-'..=127).contains(&tail) {
-        if ((w.wrapping_sub(FLOOR) | w) & HIGH) != 0 || (q && b11[10] != b',') {
-            return None;
-        }
-        return Some((person::pack_inline(w.swap_bytes(), tail), &b[10 + usize::from(q)..]));
-    }
-    // Search the two shorter boundary positions. The subtract-based
-    // zero mask can have borrow artifacts after a match, never before it.
-    let v = u64::from(u16::from_le_bytes(b11[7..9].try_into().unwrap())) ^ (ONES * u64::from(end));
-    let hits = v.wrapping_sub(ONES) & !v & (HIGH & 0x0000_ffff);
-    let n = 7 + (hits.trailing_zeros() as usize / 8);
-    if n > 8 {
-        return None;
-    }
-    let more = n + usize::from(q) + 1;
-    if q && b11[n + 1] != b',' {
-        return None;
-    }
-    let active = if n == 7 { 0x00ff_ffff_ffff_ffff } else { u64::MAX };
-    // If any byte underflows, the first offending byte either raises its
-    // high bit on subtract or already had its high bit set.
-    if ((w.wrapping_sub(FLOOR) | w) & HIGH & active) != 0 {
-        return None;
-    }
-    Some((person::pack_inline((w & active).swap_bytes(), 0), &b[more..]))
-}
+use crate::word::{comma, id, quoted};
 
 #[inline(always)]
 fn fixed<const N: usize>(s: &[u8], q: bool) -> Option<(&[u8; N], &[u8])> {
     let body = s.first_chunk::<N>()?;
     Some((body, comma(&s[N..], q)?))
+}
+
+#[inline(always)]
+fn fixed_ingest(s: &[u8]) -> Option<(&[u8; 20], &[u8])> {
+    let (q, s) = quoted(s);
+    fixed::<20>(s, q)
 }
 
 #[inline(always)]
@@ -70,11 +24,11 @@ fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [
         (ManifestClock::event_f3(body), rest)
     } else if *b.get(19)? == b'Z' {
         let (body, rest) = fixed::<20>(b, q)?;
-        let sec = clock.event_f1_seconds(body);
-        if sec == BAD {
-            return None;
-        }
-        (sec * 1000, rest)
+        let (ingest, rest) = fixed_ingest(rest)?;
+        // Preserve the strict retry: neither an invalid event nor an unusual
+        // ingest may skip the ordinary decoder's duplicate claim.
+        let (sec, seconds) = clock.event_f1_pair(body, ingest)?;
+        return Some((sec * 1000, seconds, rest));
     } else {
         let (body, rest) = fixed::<25>(b, q)?;
         (ManifestClock::event_f2(body), rest)
@@ -82,8 +36,7 @@ fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [
     if ts == BAD {
         return None;
     }
-    let (q, rest) = quoted(rest);
-    let (body, rest) = fixed::<20>(rest, q)?;
+    let (body, rest) = fixed_ingest(rest)?;
     let seconds = clock.event_f1_seconds(body);
     (seconds != BAD).then_some((ts, seconds, rest))
 }
@@ -220,7 +173,7 @@ mod tests {
                             input.push(b'"');
                         }
                         input.extend_from_slice(b",following-field");
-                        let (key, rest) = id(&input).expect("ASCII ID must use the fast path");
+                        let (key, rest) = id::<b','>(&input).expect("ASCII ID must use the fast path");
                         assert_eq!(Some(key), person::inline(&value), "{value:?}");
                         assert_eq!(rest, b"following-field");
                     }
@@ -296,8 +249,8 @@ mod tests {
 
 #[inline(always)]
 fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestClock)) -> Option<(Pending, &'a [u8])> {
-    let (eid, s) = id(s)?;
-    let (uid, s) = id(s)?;
+    let (eid, s) = id::<b','>(s)?;
+    let (uid, s) = id::<b','>(s)?;
     let (ts, seconds, s) = timestamps(s, clock)?;
     let (purchase, s) = event_type(s)?;
     let (payload, rest) = suffix(s, purchase, sm)?;
@@ -319,22 +272,6 @@ fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestCloc
         e.cat = cat;
     }
     Some((e, rest))
-}
-
-#[cold]
-#[inline(never)]
-fn fallback<'a>(
-    s: &'a [u8],
-    sm: &Small,
-    codec: &Codec<'a>,
-    window: (i64, i64, &ManifestClock),
-    spill: &mut Vec<i64>,
-) -> (Option<Pending>, &'a [u8]) {
-    let end = memchr::memchr(b'\n', s).map_or(s.len(), |i| i + 1);
-    let (line, rest) = s.split_at(end);
-    let mut row = None;
-    csv::identity_row::<7>(line, &mut |r| row = decode_fields(r, sm, codec, window, spill));
-    (row, rest)
 }
 
 #[inline]
@@ -359,11 +296,11 @@ pub(super) fn for_events<'a>(
             emit(e);
             rest = tail;
         } else {
-            let (e, tail) = fallback(rest, sm, codec, window, spill);
-            if let Some(e) = e {
-                emit(e);
-            }
-            rest = tail;
+            rest = crate::word::fallback::<7>(rest, |r| {
+                if let Some(e) = decode_fields(r, sm, codec, window, spill) {
+                    emit(e);
+                }
+            });
         }
     }
 }
