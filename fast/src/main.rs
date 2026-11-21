@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU16, Ordering::Relaxed};
 use std::time::Instant;
 mod dims;
 mod events;
@@ -253,101 +254,187 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, window: (i64, i64, &ManifestClock
     b
 }
 
-// Each task probes just one raw-user partition of the exact link table.
-// A small direct-mapped cache resolves repeated hot IDs without another probe.
-struct JoinCache<'a, 'b> {
-    people: &'a People<'b>,
-    keys: Vec<u64>,
-    values: Vec<Identity>,
+struct JoinJob {
+    events: Vec<Payload>,
+    clicks: Vec<Clicks>,
+    packing: Option<Packing>,
+    local_names: Option<Vec<u64>>,
 }
 
-impl<'a, 'b> JoinCache<'a, 'b> {
-    fn new(people: &'a People<'b>) -> Self {
-        Self {
-            people,
-            keys: vec![0; 4096],
-            values: vec![Identity::Standalone(0); 4096],
-        }
-    }
-
-    #[inline]
-    fn resolve(&mut self, hash: u64) -> Identity {
-        let i = hash as usize & (self.keys.len() - 1);
-        if self.keys[i] != hash {
-            self.keys[i] = hash;
-            self.values[i] = self.people.lookup(links::unmix(hash), hash);
-        }
-        self.values[i]
-    }
+struct LocalIndex {
+    by_raw: Map<u64, u32>,
+    names: Vec<u64>,
+    linked: Vec<Option<u64>>,
 }
 
-type JoinJobs = Vec<(Vec<Payload>, Vec<Clicks>)>;
+// Unused link IDs still determine a component's name, but only active raw
+// partitions need to participate in the owner census (rules.md, Linked IDs).
+// 0 = unseen, 1..=NS = one active raw shard, NS+1 = shared.
+fn observe(owner: &AtomicU16, raw: usize) {
+    let value = raw as u16 + 1;
+    let old = owner.load(Relaxed);
+    if old != value && old != NS as u16 + 1 {
+        let _ = owner.compare_exchange(0, value, Relaxed, Relaxed);
+        if owner.load(Relaxed) != value {
+            owner.store(NS as u16 + 1, Relaxed);
+        }
+    }
+}
 
 fn join_raw(
     events: Vec<Vec<Payload>>,
     clicks: Vec<Vec<Clicks>>,
     people: &People,
     packing: Option<Packing>,
-) -> JoinJobs {
+    window: (i64, i64),
+) -> Vec<JoinJob> {
     let raw_events = by_destination(events, |p| !p.wide.times.is_empty() || !p.wide.purchases.is_empty());
     let raw_clicks = by_destination(clicks, |p| !p.wide.is_empty());
-    let joined: Vec<_> = raw_events
+    let owners: Vec<_> = (0..people.count).map(|_| AtomicU16::new(0)).collect();
+    let indexed: Vec<_> = raw_events
         .into_par_iter()
         .zip(raw_clicks.into_par_iter())
-        .map(|(mut evs, mut cls)| {
-            let mut cache = JoinCache::new(people);
-            let mut moved_e: Vec<Payload> = (0..NS).map(|_| Payload::default()).collect();
-            let mut moved_c: Vec<Clicks> = (0..NS).map(|_| Clicks::default()).collect();
-            for part in &mut evs {
-                part.wide.times.retain(|row| match cache.resolve(row.person) {
-                    Identity::Standalone(_) => true,
-                    id @ Identity::Linked(p) => {
-                        moved_e[shard(p)].push(id, row.ts, 0, 0, packing, people);
-                        false
-                    }
-                });
-                part.wide.purchases.retain(|row| match cache.resolve(row.key.person) {
-                    Identity::Standalone(_) => true,
-                    id @ Identity::Linked(p) => {
-                        moved_e[shard(p)].push(id, row.key.ts, row.price, row.cat, packing, people);
-                        false
-                    }
-                });
-            }
-            for part in &mut cls {
-                part.wide.retain(|row| match cache.resolve(row.person) {
-                    Identity::Standalone(_) => true,
-                    Identity::Linked(p) => {
-                        let dest = &mut moved_c[shard(p)];
-                        let mut row = *row;
-                        if packing.is_some() {
-                            row.person = u64::from(p as u32);
-                            dest.packed.push(row);
-                        } else {
-                            row.person = people.original(p as u32);
-                            dest.wide.push(row);
+        .enumerate()
+        .map(|(raw, (evs, cls))| {
+            let mut by_raw = Map::with_hasher(rs());
+            let mut by_name = Map::with_hasher(rs());
+            let mut names = Vec::new();
+            let mut linked = Vec::new();
+            let mut recent = vec![0u64; 4096];
+            let mut add = |hash: u64| {
+                let slot = hash as usize & 4095;
+                if recent[slot] == hash {
+                    return;
+                }
+                recent[slot] = hash;
+                by_raw.entry(hash).or_insert_with(|| {
+                    let id = people.lookup(links::unmix(hash), hash);
+                    let (name, route) = match id {
+                        Identity::Standalone(name) => (name, None),
+                        Identity::Linked(route) => (people.original(route as u32), Some(route)),
+                    };
+                    *by_name.entry(name).or_insert_with(|| {
+                        let rank = u32::try_from(names.len()).expect("too many local people");
+                        names.push(name);
+                        linked.push(route);
+                        if let Some(route) = route {
+                            observe(&owners[route as u32 as usize], raw);
                         }
-                        false
-                    }
+                        rank
+                    })
                 });
+            };
+            for p in &evs {
+                for e in &p.wide.times {
+                    add(e.person);
+                }
+                for e in &p.wide.purchases {
+                    add(e.key.person);
+                }
             }
-            (evs, cls, moved_e, moved_c)
+            for p in &cls {
+                for c in &p.wide {
+                    add(c.person);
+                }
+            }
+            (raw, evs, cls, LocalIndex { by_raw, names, linked })
         })
         .collect();
-    let mut jobs: JoinJobs = (0..NS).map(|_| (Vec::new(), Vec::new())).collect();
-    for (raw, (evs, cls, moved_e, moved_c)) in joined.into_iter().enumerate() {
-        jobs[raw].0.extend(evs);
-        jobs[raw].1.extend(cls);
+    let joined: Vec<_> = indexed
+        .into_par_iter()
+        .map(|(raw, evs, cls, index)| {
+            let local_pack = Packing::new(window.0, window.1, index.names.len());
+            let shared: Vec<_> = index
+                .linked
+                .iter()
+                .map(|route| route.filter(|&r| owners[r as u32 as usize].load(Relaxed) == NS as u16 + 1))
+                .collect();
+            let mut local_e = Payload::default();
+            let mut local_c = Clicks::default();
+            let mut moved_e: Vec<Payload> = (0..NS).map(|_| Payload::default()).collect();
+            let mut moved_c: Vec<Clicks> = (0..NS).map(|_| Clicks::default()).collect();
+            let mut cache_keys = vec![0u64; 4096];
+            let mut cache_ranks = vec![0u32; 4096];
+            let mut resolve = |hash: u64| {
+                let slot = hash as usize & 4095;
+                if cache_keys[slot] != hash {
+                    cache_keys[slot] = hash;
+                    cache_ranks[slot] = index.by_raw[&hash];
+                }
+                cache_ranks[slot]
+            };
+            let mut push_event = |person: u64, ts: i64, price: u32, cat: u32| {
+                let rank = resolve(person);
+                if let Some(route) = shared[rank as usize] {
+                    moved_e[shard(route)].push(Identity::Linked(route), ts, price, cat, packing, people);
+                } else {
+                    local_e.push_local(rank, index.names[rank as usize], ts, price, cat, local_pack);
+                }
+            };
+            for part in evs {
+                for row in part.wide.times {
+                    push_event(row.person, row.ts, 0, 0);
+                }
+                for row in part.wide.purchases {
+                    push_event(row.key.person, row.key.ts, row.price, row.cat);
+                }
+            }
+            for part in cls {
+                for mut row in part.wide {
+                    let rank = resolve(row.person);
+                    if let Some(route) = shared[rank as usize] {
+                        let dest = &mut moved_c[shard(route)];
+                        if packing.is_some() {
+                            row.person = u64::from(route as u32);
+                            dest.packed.push(row);
+                        } else {
+                            row.person = people.original(route as u32);
+                            dest.wide.push(row);
+                        }
+                    } else if local_pack.is_some() {
+                        row.person = u64::from(rank);
+                        local_c.packed.push(row);
+                    } else {
+                        row.person = index.names[rank as usize];
+                        local_c.wide.push(row);
+                    }
+                }
+            }
+            (raw, local_e, local_c, local_pack, index.names, moved_e, moved_c)
+        })
+        .collect();
+    let mut jobs: Vec<JoinJob> = Vec::with_capacity(NS + joined.len());
+    jobs.extend((0..NS).map(|_| JoinJob {
+        events: Vec::new(),
+        clicks: Vec::new(),
+        packing,
+        local_names: None,
+    }));
+    for (_raw, local_e, local_c, local_pack, names, moved_e, moved_c) in joined {
+        if !local_e.packed.times.is_empty()
+            || !local_e.packed.purchases.is_empty()
+            || !local_e.wide.times.is_empty()
+            || !local_e.wide.purchases.is_empty()
+            || !local_c.packed.is_empty()
+            || !local_c.wide.is_empty()
+        {
+            jobs.push(JoinJob {
+                events: vec![local_e],
+                clicks: vec![local_c],
+                packing: local_pack,
+                local_names: Some(names),
+            });
+        }
         for (dest, (e, c)) in moved_e.into_iter().zip(moved_c).enumerate() {
             if !e.packed.times.is_empty()
                 || !e.packed.purchases.is_empty()
                 || !e.wide.times.is_empty()
                 || !e.wide.purchases.is_empty()
             {
-                jobs[dest].0.push(e);
+                jobs[dest].events.push(e);
             }
             if !c.packed.is_empty() || !c.wide.is_empty() {
-                jobs[dest].1.push(c);
+                jobs[dest].clicks.push(c);
             }
         }
     }
@@ -396,6 +483,7 @@ fn process_stream<T: Temporal>(
     sm: &Small,
     people: &People,
     layout: T::Layout,
+    local_names: Option<&[u64]>,
     ShardOut { users, camps }: &mut ShardOut,
 ) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
@@ -403,13 +491,19 @@ fn process_stream<T: Temporal>(
     if ne == 0 {
         return;
     }
-    let mut evs = Vec::with_capacity(ne);
-    let mut purchases = Vec::with_capacity(np);
-    for s in pieces {
-        evs.extend_from_slice(&s.times);
-        evs.extend(s.purchases.iter().map(|p| p.key));
-        purchases.extend_from_slice(&s.purchases);
-    }
+    let (mut evs, mut purchases) = if pieces.len() == 1 {
+        let s = pieces.into_iter().next().unwrap();
+        (s.times, s.purchases)
+    } else {
+        let mut evs = Vec::with_capacity(ne);
+        let mut purchases = Vec::with_capacity(np);
+        for s in pieces {
+            evs.extend_from_slice(&s.times);
+            purchases.extend_from_slice(&s.purchases);
+        }
+        (evs, purchases)
+    };
+    evs.extend(purchases.iter().map(|p| p.key));
     evs.sort_unstable();
     purchases.sort_unstable_by_key(|p| p.key);
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
@@ -424,7 +518,7 @@ fn process_stream<T: Temporal>(
     let mut pi = 0usize;
     while i < evs.len() {
         let rank = evs[i].person(layout);
-        let person = T::name(rank, people);
+        let person = T::name(rank, people, local_names);
         let mut j = i;
         while j < evs.len() && evs[j].person(layout) == rank {
             j += 1;
@@ -551,6 +645,7 @@ fn process_shard(
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
+    local_names: Option<&[u64]>,
 ) -> ShardOut {
     let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
     let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
@@ -559,9 +654,9 @@ fn process_shard(
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        process_stream(packed, gather(pc), sm, people, pack, local_names, &mut out);
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
+    process_stream(wide, gather(wc), sm, people, (), None, &mut out);
     out
 }
 
@@ -631,16 +726,26 @@ fn main() {
 
     let len =
         |e: &Payload| e.packed.times.len() + e.packed.purchases.len() + e.wide.times.len() + e.wide.purchases.len();
-    let mut jobs = join_raw(ev_by_person, cl_by_person, &names, packing);
+    let mut jobs = join_raw(ev_by_person, cl_by_person, &names, packing, (ws, we));
     log("identity join");
-    jobs.sort_unstable_by_key(|(e, c)| {
+    jobs.sort_unstable_by_key(|job| {
         std::cmp::Reverse(
-            e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
+            job.events.iter().map(len).sum::<usize>()
+                + job.clicks.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
         )
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|job| {
+            process_shard(
+                job.events,
+                job.clicks,
+                &sm,
+                &names,
+                job.packing,
+                job.local_names.as_deref(),
+            )
+        })
         .collect();
     log("sessions done");
 
@@ -692,4 +797,54 @@ fn main() {
     log("written");
     // Everything is on disk; skip tearing down the shard tables and mmaps.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+
+    #[test]
+    fn active_shards_not_unused_graph_aliases_determine_ownership() {
+        let ids: Vec<String> = (0..2000).map(|n| format!("u{n}")).collect();
+        let raw_shard = |s: &str| shard(links::mix(person::inline(s.as_bytes()).unwrap()));
+        let a = &ids[0];
+        let b = ids.iter().find(|s| *s != a && raw_shard(s) == raw_shard(a)).unwrap();
+        let c = ids.iter().find(|s| raw_shard(s) != raw_shard(a)).unwrap();
+        let d = ids
+            .iter()
+            .find(|s| *s != a && *s != b && raw_shard(s) != raw_shard(c))
+            .unwrap();
+        // The unused spill name may hash to any shard but still names the local component.
+        let data = format!("user_id_a,user_id_b\n!unused-local-name,{a}\n{a},{b}\n!unused-shared-name,{c}\n{c},{d}\n");
+        let chunks = chunks_of(data.as_bytes(), &["user_id_a", "user_id_b"], Path::new("links.csv"));
+        let people = person_names(&chunks);
+        let ws = 1_000_000;
+        let we = ws + DAY;
+        let mut batch: Vec<Payload> = (0..NS).map(|_| Payload::default()).collect();
+        for id in [a, b, c, d] {
+            let h = links::mix(people.codec.key(id.as_bytes()));
+            batch[shard(h)].push(Identity::Standalone(h), ws, 0, 0, None, &people);
+        }
+        let jobs = join_raw(
+            vec![batch],
+            vec![],
+            &people,
+            Packing::new(ws, we, people.count),
+            (ws, we),
+        );
+        let local: Vec<_> = jobs.iter().filter(|j| j.local_names.is_some()).collect();
+        let named = links::mix(people.codec.key(b"!unused-local-name"));
+        let local_job = local
+            .iter()
+            .find(|j| j.local_names.as_ref().unwrap().contains(&named))
+            .unwrap();
+        assert_eq!(local_job.events[0].packed.times.len(), 2);
+        let shared: usize = jobs
+            .iter()
+            .filter(|j| j.local_names.is_none())
+            .flat_map(|j| &j.events)
+            .map(|p| p.packed.times.len())
+            .sum();
+        assert_eq!(shared, 2);
+    }
 }

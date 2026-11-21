@@ -43,7 +43,7 @@ pub(super) trait Temporal: Copy + Ord {
     fn ts(self, layout: Self::Layout) -> i64;
     // Only compared within one person's ordered keys.
     fn gap(self, prev: Self) -> u64;
-    fn name(person: u64, people: &People) -> u64;
+    fn name(person: u64, people: &People, local_names: Option<&[u64]>) -> u64;
 }
 
 impl Temporal for Wide {
@@ -65,7 +65,7 @@ impl Temporal for Wide {
     }
 
     #[inline]
-    fn name(person: u64, _: &People) -> u64 {
+    fn name(person: u64, _: &People, _: Option<&[u64]>) -> u64 {
         person
     }
 }
@@ -89,8 +89,8 @@ impl Temporal for u64 {
     }
 
     #[inline]
-    fn name(rank: u64, people: &People) -> u64 {
-        people.original(rank as u32)
+    fn name(rank: u64, people: &People, local_names: Option<&[u64]>) -> u64 {
+        local_names.map_or_else(|| people.original(rank as u32), |names| names[rank as usize])
     }
 }
 
@@ -137,6 +137,15 @@ pub(super) struct Payload {
 }
 
 impl Payload {
+    #[inline]
+    pub fn push_local(&mut self, rank: u32, person: u64, ts: i64, price: u32, cat: u32, packing: Option<Packing>) {
+        if let Some(p) = packing {
+            self.packed.push(p.encode(rank, ts), price, cat);
+        } else {
+            self.wide.push(Wide { person, ts }, price, cat);
+        }
+    }
+
     #[inline]
     pub fn push(
         &mut self,

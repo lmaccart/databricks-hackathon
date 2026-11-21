@@ -90,6 +90,50 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_local_and_shared_linked_people_with_unused_spill_names(self):
+        t = "2026-10-02T10:00:00Z"
+        later = "2026-10-02T10:20:00Z"
+        events = [
+            ev("l1", "local-alias-long", t, "purchase", price="11"),
+            ev("l2", "local-alias-long", later),
+            ev("s1", "shared-A-long", t, "purchase", price="17"),
+            ev("s2", "shared-B-long", later),
+            ev("solo", "standalone-long", t),
+            ev("loser", "shared-B-long", t, "purchase", price="999"),
+        ]
+        links = ["!unused-local-name,local-alias-long",
+                 "!unused-shared-name,shared-A-long",
+                 "shared-A-long,shared-B-long"]
+        clicks = [f"c1,local-alias-long,c_1,{t}",
+                  f"c2,shared-B-long,c_2,{t}"]
+        users, campaigns = run_case(events, clicks, links, extra={
+            "events/part-1.csv": [ev("loser", "standalone-long", "bad",
+                                     ingest="2026-10-02T09:00:00Z")]
+        })
+        day = "2026-10-02"
+        self.assertEqual(set(users), {("!unused-local-name", day),
+                                     ("!unused-shared-name", day),
+                                     ("standalone-long", day)})
+        self.assertEqual((users[("!unused-local-name", day)]["events"],
+                          users[("!unused-local-name", day)]["revenue_cents"]), (2, 11))
+        self.assertEqual((users[("!unused-shared-name", day)]["events"],
+                          users[("!unused-shared-name", day)]["revenue_cents"]), (2, 17))
+        self.assertEqual(campaigns[("c_2", day)]["sessions"], 1)
+
+    def test_linked_owners_with_wide_window_and_click_only_alias(self):
+        t = "1969-12-31T23:50:00Z"
+        later = "1970-01-01T00:10:00Z"
+        users, camps = run_case(
+            events=[ev("w1", "é-device-long", t, "purchase", price="23"),
+                    ev("w2", "é-device-long", later)],
+            clicks=[f"click,other-long-alias,c_1,{t}"],
+            links=["!unused-long-name,é-device-long", "é-device-long,other-long-alias"],
+            window=("0001-01-01T00:00:00Z", "9999-12-31T23:59:59Z"),
+        )
+        row = users[("!unused-long-name", "1969-12-31")]
+        self.assertEqual((row["sessions"], row["events"], row["revenue_cents"]), (1, 2, 23))
+        self.assertEqual(camps[("c_1", "1969-12-31")]["sessions"], 1)
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"

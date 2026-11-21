@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Local owner ranks after raw-user partitioning — 2026-11-21
+
+Completed the in-progress follow-up to `b136db4`: resolve each raw ID once into a per-raw-shard dense rank, census active raw-shard ownership for linked canonical people, and leave singleton / one-shard data in local streams. Only linked people with active data in multiple raw shards move to their canonical-owner stream. The complete union-find graph still controls transitive membership and byte-wise canonical names; aliases without events or clicks can therefore bridge components or name them, but do not falsely make an otherwise local owner shared.
+
+The owner unit test selects IDs by their actual raw-shard hash and checks a same-shard linked pair, a transitive cross-shard linked pair, and unused canonical aliases. The binary edge case checks the resulting names and campaign attribution with an additional standalone singleton and earliest-copy conflict.
+
+Validation in this worktree: `make test` (42), release Rust tests (20), `make test-bin` (42), both sides of all 36 official fixtures, `make diff SEEDS=10 EVENTS=30000` (10/10), public dev answer in both comparers (117,038 user rows and 27,400 campaign rows, zero differences), and `compare_outputs.py --check` passed. `b136db4`'s 3.0–3.8% result is the supplied baseline; this local-owner follow-up has **no new large-run timing claim** because the run was explicitly out of scope. The raw-user partition join must still pass the parent-side 20M/60M performance and memory gate before being treated as a speedup.
+
 ## Raw-user partitioned identity join experiment — 2026-11-21
 
 Parse typed event and click payloads by raw-user shard, dedup events against those raw slot locations, and join each shard against its own exact link-table lane. A direct-mapped exact-token cache avoids repeated probes for hot IDs. Standalone events/clicks stay in their original buffers; linked rows move to canonical-owner shards. Link graph construction remains complete and precedes parsing. This increases interim event width and linked-row copying, so performance and 60M peak RSS need parent-side measurement; no 20M/60M benchmark was run here.
