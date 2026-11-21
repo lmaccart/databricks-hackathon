@@ -63,14 +63,14 @@ fn fixed<const N: usize>(s: &[u8], q: bool) -> Option<(&[u8; N], &[u8])> {
 }
 
 #[inline(always)]
-fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [u8])> {
+fn timestamps<'a, const SIMD: bool>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [u8])> {
     let (q, b) = quoted(s);
     let (ts, rest) = if *b.get(4)? != b'-' {
         let (body, rest) = fixed::<13>(b, q)?;
         (ManifestClock::event_f3(body), rest)
     } else if *b.get(19)? == b'Z' {
         let (body, rest) = fixed::<20>(b, q)?;
-        let sec = clock.event_f1_seconds(body);
+        let sec = f1_seconds::<SIMD>(clock, body);
         if sec == BAD {
             return None;
         }
@@ -84,8 +84,18 @@ fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [
     }
     let (q, rest) = quoted(rest);
     let (body, rest) = fixed::<20>(rest, q)?;
-    let seconds = clock.event_f1_seconds(body);
+    let seconds = f1_seconds::<SIMD>(clock, body);
     (seconds != BAD).then_some((ts, seconds, rest))
+}
+
+#[inline(always)]
+fn f1_seconds<const SIMD: bool>(clock: &ManifestClock, body: &[u8; 20]) -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    if SIMD {
+        // SAFETY: the chunk dispatcher has checked SSSE3 support.
+        return unsafe { clock.f1_seconds_simd(body) };
+    }
+    clock.event_f1_seconds(body)
 }
 
 #[inline(always)]
@@ -200,10 +210,14 @@ fn suffix<'a>(s: &'a [u8], purchase: bool, sm: &Small) -> Option<(Option<PriceCa
 }
 
 #[inline(always)]
-fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestClock)) -> Option<(Pending, &'a [u8])> {
+fn decode<'a, const SIMD: bool>(
+    s: &'a [u8],
+    sm: &Small,
+    (ws, we, clock): (i64, i64, &ManifestClock),
+) -> Option<(Pending, &'a [u8])> {
     let (eid, s) = id(s)?;
     let (uid, s) = id(s)?;
-    let (ts, seconds, s) = timestamps(s, clock)?;
+    let (ts, seconds, s) = timestamps::<SIMD>(s, clock)?;
     let (purchase, s) = event_type(s)?;
     let (payload, rest) = suffix(s, purchase, sm)?;
     let mut e = Pending {
@@ -258,9 +272,25 @@ pub(super) fn for_events<'a>(
             }
         });
     }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("ssse3") {
+        return for_events_inner::<true>(c, sm, codec, window, spill, emit);
+    }
+    for_events_inner::<false>(c, sm, codec, window, spill, emit);
+}
+
+#[inline]
+fn for_events_inner<'a, const SIMD: bool>(
+    c: &Chunk<'a>,
+    sm: &Small,
+    codec: &Codec<'a>,
+    window: (i64, i64, &ManifestClock),
+    spill: &mut Vec<i64>,
+    mut emit: impl FnMut(Pending),
+) {
     let mut rest = c.data;
     while !rest.is_empty() {
-        if let Some((e, tail)) = decode(rest, sm, window) {
+        if let Some((e, tail)) = decode::<SIMD>(rest, sm, window) {
             emit(e);
             rest = tail;
         } else {
@@ -348,7 +378,7 @@ mod tests {
             b"opaque009,\"USER_07\",\"2026-10-03T10:30:00+00:30\",\"2026-10-03T10:00:00Z\",\"purchase\",\"item-7\",\"0123\"",
         ] {
             let file = [row, &followed].concat();
-            let (event, rest) = decode(&file, &sm, window).unwrap_or_else(|| panic!("must exercise the word path: {row:?}"));
+            let (event, rest) = decode::<false>(&file, &sm, window).unwrap_or_else(|| panic!("must exercise the word path: {row:?}"));
             assert_ne!(event.uid, 0);
             assert_eq!(rest, following);
             check(row, b"");

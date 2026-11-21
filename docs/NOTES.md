@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## SSSE3 month-clock candidate — 2026-11-21
+
+Experimental typed-event F1 path: bounded 16+4-byte loads, SSSE3 digit shuffles and multiply-add conversion, exact manifest-derived year/month prefixes and Gregorian month lengths. Month misses use the complete parser; F2/F3 remain unchanged. Dispatch is once per event chunk. No 20M timing was run as requested; performance versus `dfbd330` is **not yet measured**, and Linux/amd64 CI is required before selection.
+
+On x86-64 macOS Rosetta with SSSE3 enabled, release-mode Rust tests passed 22/22, including SIMD byte mutations and calendar/range sweeps; the cross-built binary passed 40 edge tests, 36/36 official fixtures, 10 dirty seeds and the 1M dev answer. The local cross build used a source-built standard library, unwind and LTO disabled for the binary after the host compiler failed its cross-build fat-LTO link. ARM64 native tests, fixtures, dirty seeds and dev answer also passed.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).

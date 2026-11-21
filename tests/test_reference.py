@@ -90,6 +90,23 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_quoted_month_boundaries_and_competing_copies(self):
+        events = [
+            ev("event001", "user0001", '"2028-02-29T23:59:59Z"', ingest='"2028-03-01T00:00:00Z"'),
+            ev("event002", "user0002", "2028-03-01T00:00:00Z", ingest="2028-03-01T00:00:00Z"),
+            ev("event003", "user0003", "2028-02-29T12:34:56Z", ingest="2028-02-29T12:35:00Z"),
+            ev("event004", "user0004", "2028-02-29T12:34:56Z", ingest="2028-02-29T12:35:00Z"),
+        ]
+        copies = [
+            ev("event003", "user0003", '"2028-02-30T12:34:56Z"', ingest="2028-02-29T12:34:59Z"),
+            ev("event004", "user0004", '2028-02-29T12:34:56"Z', ingest="2028-02-29T12:34:59Z"),
+        ]
+        users, _ = run_case(events, extra={"events/part-1.csv": copies},
+                            window=("2028-02-28T00:00:00Z", "2028-03-03T00:00:00Z"))
+        self.assertEqual(set(users), {("user0001", "2028-02-29"),
+                                      ("user0002", "2028-03-01"),
+                                      ("user0004", "2028-02-29")})
+
     def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
         stamp = "2026-10-03T10:00:00Z"
         early = "2026-10-03T09:59:59Z"

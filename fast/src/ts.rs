@@ -205,10 +205,19 @@ struct CivilDay {
     midnight_seconds: i64,
 }
 
+#[cfg(target_arch = "x86_64")]
+struct CivilMonth {
+    prefix: u64,
+    first_seconds: i64,
+    length: u16,
+}
+
 /// Immutable exact date lookup derived from the manifest. A miss always
 /// falls back to the complete Gregorian parser, including for ingest claims.
 pub struct ManifestClock {
     days: [Vec<CivilDay>; 32],
+    #[cfg(target_arch = "x86_64")]
+    months: [Vec<CivilMonth>; 13],
 }
 
 impl ManifestClock {
@@ -227,6 +236,8 @@ impl ManifestClock {
             .clamp(first_valid, last_valid);
         let mut clock = Self {
             days: std::array::from_fn(|_| Vec::new()),
+            #[cfg(target_arch = "x86_64")]
+            months: std::array::from_fn(|_| Vec::new()),
         };
         // Very wide windows get both ends, with all other dates using fallback.
         if hi - lo >= LIMIT {
@@ -258,11 +269,89 @@ impl ManifestClock {
         let y = y + i64::from(m <= 2);
         let date = format!("{y:04}-{m:02}-{d:02}");
         let bytes = date.as_bytes();
+        #[cfg(target_arch = "x86_64")]
+        {
+            let prefix = load8(bytes, 0);
+            let entries = &mut self.months[m as usize];
+            if !entries.iter().any(|entry| entry.prefix == prefix) {
+                const MD: [u16; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+                let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+                entries.push(CivilMonth {
+                    prefix,
+                    first_seconds: (day - d + 1) * 86_400,
+                    length: MD[m as usize] + u16::from(m == 2 && leap),
+                });
+            }
+        }
         self.days[d as usize].push(CivilDay {
             first: load8(bytes, 0),
             last: u16::from_le_bytes([bytes[8], bytes[9]]),
             midnight_seconds: day * 86_400,
         });
+    }
+
+    /// The caller dispatches on SSSE3 once per chunk; all loads remain within
+    /// the complete fixed-width field, including at a physical line boundary.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "ssse3")]
+    pub unsafe fn f1_seconds_simd(&self, s: &[u8; 20]) -> i64 {
+        use std::arch::x86_64::*;
+        unsafe {
+            let head = _mm_loadu_si128(s.as_ptr().cast());
+            let tail = _mm_cvtsi32_si128(u32::from_le_bytes(s[16..20].try_into().unwrap()) as i32);
+            // HH MM SS DD, with each pair in adjacent byte lanes.
+            let digits = _mm_or_si128(
+                _mm_shuffle_epi8(
+                    head,
+                    _mm_setr_epi8(11, 12, 14, 15, -1, -1, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1),
+                ),
+                _mm_shuffle_epi8(
+                    tail,
+                    _mm_setr_epi8(-1, -1, -1, -1, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),
+                ),
+            );
+            let digits = _mm_xor_si128(digits, _mm_set1_epi8(b'0' as i8));
+            let invalid = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+            if _mm_movemask_epi8(_mm_cmpeq_epi8(invalid, _mm_setzero_si128())) & 0xff != 0xff
+                || s[10] != b'T'
+                || s[13] != b':'
+                || s[16] != b':'
+                || s[19] != b'Z'
+            {
+                return BAD;
+            }
+            let pairs = _mm_maddubs_epi16(
+                digits,
+                _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+            );
+            let limits = _mm_setr_epi16(23, 59, 59, 31, 0, 0, 0, 0);
+            if _mm_movemask_epi8(_mm_cmpgt_epi16(pairs, limits)) & 0xff != 0 {
+                return BAD;
+            }
+            let day = _mm_extract_epi16::<3>(pairs) as u16;
+            if day == 0 {
+                return BAD;
+            }
+            let m1 = s[5].wrapping_sub(b'0');
+            let m2 = s[6].wrapping_sub(b'0');
+            if m1 <= 1 && m2 <= 9 {
+                let month = usize::from(m1) * 10 + usize::from(m2);
+                if let Some(entries) = self.months.get(month) {
+                    let prefix = load8(s, 0);
+                    for entry in entries {
+                        if entry.prefix == prefix {
+                            if day > entry.length {
+                                return BAD;
+                            }
+                            let sums = _mm_madd_epi16(pairs, _mm_setr_epi16(3600, 60, 1, 0, 0, 0, 0, 0));
+                            let clock = _mm_cvtsi128_si32(sums) + _mm_cvtsi128_si32(_mm_shuffle_epi32::<0x55>(sums));
+                            return entry.first_seconds + i64::from(day - 1) * 86_400 + i64::from(clock);
+                        }
+                    }
+                }
+            }
+            iso::<false, true>(s)
+        }
     }
 
     /// `s` has the F1 length and a date separator at byte 4.
@@ -534,6 +623,46 @@ mod tests {
                 "9223372036854775807",
             ] {
                 check_clock(&clock, s.as_bytes());
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn simd_month_clock_matches_complete_parser() {
+        if !std::is_x86_feature_detected!("ssse3") {
+            return;
+        }
+        for (start, end) in [
+            ("0000-02-27T00:00:00Z", "0000-03-03T00:00:00Z"),
+            ("1900-02-27T00:00:00Z", "1900-03-03T00:00:00Z"),
+            ("2028-02-27T00:00:00Z", "2028-03-03T00:00:00Z"),
+            ("2026-07-29T00:00:00Z", "2026-08-03T00:00:00Z"),
+            ("9999-12-28T00:00:00Z", "9999-12-31T23:59:59Z"),
+        ] {
+            let clock = ManifestClock::new(parse_ts(start.as_bytes()), parse_ts(end.as_bytes()));
+            for base in [start.as_bytes(), end.as_bytes(), b"2028-02-29T12:34:56Z"] {
+                let mut s: [u8; 20] = base.try_into().unwrap();
+                for pos in 0..20 {
+                    let old = s[pos];
+                    for byte in 0..=255 {
+                        s[pos] = byte;
+                        // SAFETY: feature detection above.
+                        assert_eq!(unsafe { clock.f1_seconds_simd(&s) }, iso::<false, true>(&s), "{s:?}");
+                    }
+                    s[pos] = old;
+                }
+            }
+            for day in 0..=32 {
+                for hour in 0..=25 {
+                    for minute in [0, 1, 58, 59, 60, 99] {
+                        for second in [0, 1, 58, 59, 60, 99] {
+                            let s = format!("{}-{day:02}T{hour:02}:{minute:02}:{second:02}Z", &start[..7]);
+                            let s: &[u8; 20] = s.as_bytes().try_into().unwrap();
+                            assert_eq!(unsafe { clock.f1_seconds_simd(s) }, iso::<false, true>(s), "{s:?}");
+                        }
+                    }
+                }
             }
         }
     }
