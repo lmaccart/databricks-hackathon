@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Practice candidate: exact singleton ranks and direct Parquet columns — 2026-11-21
+
+[`4ad0e5d` won 18/18 release pairs](https://github.com/lmaccart/databricks-hackathon/actions/runs/44934668743) against the 1.54 s control. Under restricted Docker, medians fell **1.816 → 1.722 s** at 20M and **5.532 → 5.199 s** at 60M. It matched both 60M inputs (seeds 13 and 948307), all 60 Linux Python comparisons, dev, fixtures and opaque/malformed inputs. [Full evidence](PERF_154.md#verified-release-checkpoint). The latest organizer score is still 1.54 s.
+
 ## 1.54 s control: measure launch and test output/identity changes — 2026-11-21
 
 On a four-worker hosted Intel, the complete header-only Docker run took 0.0847 s; full practice took 1.8042 s on the same clock. The in-container `written` medians were 0.0010 s and 1.6370 s. [Clocks, two-seed timings and rejected rewrites](PERF_154.md). The column writer won 10/10 native pairs (2.6% / 3.7% less time); exact singleton ranks won 9/10 (2.8% / 2.5%). Synthetic LLVM PGO lost all 18 practice and final-scale pairs. These are local-to-runner comparisons, not organizer scores.

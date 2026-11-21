@@ -4,6 +4,21 @@ Leif reported **1.54 s** for the latest repository build and a **0.30 s** practi
 
 Seed 7 has 1.921 GB of event, click and link CSVs before the dimension files and output. Completing those inputs in 0.30 s requires processing at least **6.40 GB/s** while also resolving identities, deduplicating, sessionizing and writing the two tables. This is a throughput requirement, not a measured hardware limit.
 
+## Verified release checkpoint
+
+[`4ad0e5d`](https://github.com/lmaccart/databricks-hackathon/commit/4ad0e5d) combines the singleton slots and column writer. It won all **18/18** alternating pairs on a four-worker Xeon 6975P-C in the [packaged comparison against `7fd1b76`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44934668743).
+
+| Input and timing scope | Pairs | Control | Candidate | Less time |
+|---|---:|---:|---:|---:|
+| 20M seed 7, native process | 5 | 1.692 s | 1.590 s | 6.0% |
+| 20M seed 15, native process | 5 | 1.633 s | 1.555 s | 4.8% |
+| 20M seed 7, full restricted Docker | 5 | 1.816 s | **1.722 s** | **5.2%** |
+| 60M seed 13, full restricted Docker | 3 | 5.532 s | **5.199 s** | **6.0%** |
+
+Both 20M outputs and every one of the 6,615,971 60M rows matched. The same job passed 60 comparisons to Python, the mixed grammar corpus, opaque-ID and header-order checks with one/eight workers, the dev answer and 36 official fixtures. The final-scale container was limited to 14 GiB without swap.
+
+A second 60M input, seed **948307** with 15M clicks, matched the scored control on all **6,601,416 user-days + 28,014 campaign-days** on ARM64. The candidate used 9.29 GiB peak RSS and wrote no stdout. On an eight-worker M2 Pro the two 20M process medians against `7fd1b76` were 0.670 → 0.627 s and 0.621 → 0.617 s, with nine of ten pairs faster. These process-only numbers and the hosted Docker numbers are not practice scores.
+
 ## What the clocks measure
 
 On a [four-worker Intel Xeon 6975P-C](https://github.com/lmaccart/databricks-hackathon/actions/runs/44933674959), two builds with identical production sources differed by 0.3% or less on both practice seeds. The host CLI includes Docker creation and removal; the Engine interval is `StartedAt` to `FinishedAt`; `written` is the pipeline's internal timer through closing its Parquet files. Five-run medians:
