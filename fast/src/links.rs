@@ -61,6 +61,7 @@ pub(super) struct People<'a> {
     lanes: Vec<Lane>,
     roots: Vec<u64>,
     pub(super) count: usize,
+    chooser: Option<Vec<u8>>,
 }
 
 // This bit is disjoint from the packed routing shard and the canonical node
@@ -77,7 +78,7 @@ pub(super) enum Identity {
 impl<'a> People<'a> {
     #[inline]
     pub(super) fn lookup(&self, key: u64, h: u64) -> Identity {
-        let lane = &self.lanes[shard(h)];
+        let lane = &self.lanes[self.route(h)];
         let s = lane.slots[lane.find(key, h)];
         if s.value & LINKED != 0 {
             Identity::Linked(s.value ^ LINKED)
@@ -87,9 +88,91 @@ impl<'a> People<'a> {
     }
 
     #[inline]
+    pub(super) fn route(&self, hash: u64) -> usize {
+        match &self.chooser {
+            Some(table) => table[hash as usize & (table.len() - 1)] as usize,
+            None => shard(hash),
+        }
+    }
+
+    pub(super) fn coarse(&self) -> bool {
+        self.chooser.is_some()
+    }
+
+    #[inline]
     pub(super) fn original(&self, rank: u32) -> u64 {
         self.roots[rank as usize]
     }
+}
+
+fn local_root(parent: &mut [u32], mut x: u32) -> u32 {
+    while parent[x as usize] != x {
+        let next = parent[x as usize];
+        parent[x as usize] = parent[next as usize];
+        x = next;
+    }
+    x
+}
+
+// Each canonical owner is a node. Shared slots union owners, while each
+// owner's aliases already point at that same node. Never infer identity from
+// this graph: it is only a conservative routing constraint.
+fn chooser(lanes: &[Lane], roots: &[u64], count: usize) -> Option<Vec<u8>> {
+    let size = count.saturating_mul(32).clamp(1 << 16, 1 << 26).next_power_of_two();
+    let mask = size - 1;
+    let mut occupied = Vec::with_capacity(count);
+    for lane in lanes {
+        for s in &lane.slots {
+            if s.key != 0 {
+                occupied.push(((mix(s.key) as usize & mask) as u32, s.value as u32));
+            }
+        }
+    }
+    occupied.sort_unstable_by_key(|x| x.0);
+    let mut parent: Vec<u32> = (0..count as u32).collect();
+    let mut weights = vec![1u32; count];
+    for group in occupied.chunk_by(|a, b| a.0 == b.0) {
+        let first = group[0].1;
+        for &(_, rank) in &group[1..] {
+            let mut a = local_root(&mut parent, first);
+            let mut b = local_root(&mut parent, rank);
+            if a != b {
+                if weights[a as usize] < weights[b as usize] {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                parent[b as usize] = a;
+                weights[a as usize] += weights[b as usize];
+            }
+        }
+    }
+    weights.fill(0);
+    for &(_, rank) in &occupied {
+        let r = local_root(&mut parent, rank);
+        weights[r as usize] += 1;
+    }
+    // Alias counts are an observable lower-cost skew proxy; refuse a
+    // percolated routing graph rather than serializing a large shard.
+    let limit = (count / 16).max(4096);
+    let largest = weights.iter().copied().max().unwrap_or(0) as usize;
+    if largest > limit {
+        eprintln!("coarse routing fallback: cluster {largest} aliases, limit {limit}");
+        return None;
+    }
+    let mut table: Vec<u8> = (0..size).map(|i| shard(mix(i as u64)) as u8).collect();
+    let mut loads = [0usize; NS];
+    for group in occupied.chunk_by(|a, b| a.0 == b.0) {
+        let rank = local_root(&mut parent, group[0].1);
+        let dest = shard(mix(roots[rank as usize]));
+        table[group[0].0 as usize] = dest as u8;
+        loads[dest] += group.len();
+    }
+    let max_load = loads.into_iter().max().unwrap_or(0);
+    if max_load > limit {
+        eprintln!("coarse routing fallback: shard {max_load} aliases, limit {limit}");
+        return None;
+    }
+    eprintln!("coarse routing: {size} slots, {count} aliases, largest cluster {largest}, largest shard {max_load}");
+    Some(table)
 }
 
 #[inline]
@@ -218,10 +301,95 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
             }
         }
     });
+    let chooser = chooser(&lanes, &roots, count);
+    if let Some(table) = &chooser {
+        let mut sizes = [0usize; NS];
+        for lane in &lanes {
+            for slot in &lane.slots {
+                if slot.key != 0 {
+                    sizes[table[mix(slot.key) as usize & (table.len() - 1)] as usize] += 1;
+                }
+            }
+        }
+        let mut local: Vec<_> = sizes
+            .into_iter()
+            .map(|n| {
+                let cap = (n * 2 + 1).next_power_of_two();
+                Lane {
+                    slots: vec![Slot::default(); cap],
+                    mask: cap - 1,
+                }
+            })
+            .collect();
+        for lane in lanes {
+            for slot in lane.slots {
+                if slot.key != 0 {
+                    let hash = mix(slot.key);
+                    let dest = &mut local[table[hash as usize & (table.len() - 1)] as usize];
+                    let i = dest.find(slot.key, hash);
+                    dest.slots[i] = slot;
+                }
+            }
+        }
+        lanes = local;
+    }
     People {
         codec,
         lanes,
         roots,
         count,
+        chooser,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lane(entries: &[(u64, u32)]) -> Lane {
+        let cap = (entries.len() * 2 + 1).next_power_of_two();
+        let mut lane = Lane {
+            slots: vec![Slot::default(); cap],
+            mask: cap - 1,
+        };
+        for &(key, rank) in entries {
+            let i = lane.find(key, mix(key));
+            lane.slots[i] = Slot {
+                key,
+                value: LINKED | u64::from(rank),
+            };
+        }
+        lane
+    }
+
+    #[test]
+    fn occupied_slot_collision_glues_routes_not_names() {
+        let mut seen = vec![0u64; 1 << 16];
+        let mut pair = None;
+        for key in 1..1_000_000 {
+            let i = mix(key) as usize & 65535;
+            if seen[i] != 0 {
+                pair = Some((seen[i], key));
+                break;
+            }
+            seen[i] = key;
+        }
+        let (a, b) = pair.unwrap();
+        let alias = 1_000_001;
+        let lanes = vec![lane(&[(a, 0), (alias, 0), (b, 1)])];
+        let table = chooser(&lanes, &[mix(a), mix(b), mix(alias)], 3).unwrap();
+        assert_eq!(table[mix(a) as usize & 65535], table[mix(alias) as usize & 65535]);
+        assert_eq!(table[mix(a) as usize & 65535], table[mix(b) as usize & 65535]);
+        assert_ne!(
+            lanes[0].slots[lanes[0].find(a, mix(a))].value as u32,
+            lanes[0].slots[lanes[0].find(b, mix(b))].value as u32
+        );
+    }
+
+    #[test]
+    fn pathological_component_falls_back() {
+        let entries: Vec<_> = (1..=4097).map(|key| (key, 0)).collect();
+        let lanes = vec![lane(&entries)];
+        assert!(chooser(&lanes, &vec![0; entries.len()], entries.len()).is_none());
     }
 }

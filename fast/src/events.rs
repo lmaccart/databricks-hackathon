@@ -1,5 +1,5 @@
-//! Partition payloads by raw identity before the exact, cache-local join.
-//! Claims target raw slots; invalid copies still participate in dedup.
+//! Partition payloads before the exact, cache-local identity join.
+//! Claims target payload slots; invalid copies still participate in dedup.
 use super::*;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -165,7 +165,7 @@ fn parse<'a>(
     let emit = |e: Pending| {
         let mut target = NONE;
         if e.uid != 0 {
-            let p = shard(e.hash);
+            let p = people.route(e.hash);
             let slot = payload[p].push(Identity::Standalone(e.hash), e.ts, e.price, e.cat, None, people);
             target = (slot * NS + p) as u32;
         }

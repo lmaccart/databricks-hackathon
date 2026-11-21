@@ -90,6 +90,63 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_large_link_component_uses_exact_fallback(self):
+        stamp = "2026-10-03T10:00:00Z"
+        links = [f"a{i:04},a{i + 1:04}" for i in range(4100)]
+        users, campaigns = run_case(
+            [ev("e1", "a4100", stamp), ev("e2", "solo", stamp),
+             ev("e3", "solo", stamp, ingest="2026-10-03T10:01:00Z")],
+            [f"c1,a0001,c_1,{stamp}", f"c2,solo,c_2,{stamp}"],
+            links, extra={"events/part-1.csv": [ev("e3", "a0000", stamp)]})
+        day = "2026-10-03"
+        self.assertEqual(users[("a0000", day)]["events"], 2)
+        self.assertEqual(users[("solo", day)]["events"], 1)
+        self.assertEqual(campaigns[("c_1", day)]["sessions"], 1)
+        self.assertEqual(campaigns[("c_2", day)]["sessions"], 1)
+
+    def test_coarse_routing_collisions_are_not_identity(self):
+        # Find distinct inline IDs with the same low 16 routing bits. The
+        # small graph uses a 2**16 address domain, so even the unlinked ID
+        # shares a slot with both linked people.
+        def slot(s):
+            key = 0
+            for b in s.encode().ljust(9, b"\0"):
+                key = (key << 7) | b
+            x = ((key ^ (key >> 27)) * 0xa24baed4963ee407) & ((1 << 64) - 1)
+            return (x ^ (x >> 33)) & 65535
+
+        groups = {}
+        for n in range(200000):
+            name = f"u{n:06}"
+            group = groups.setdefault(slot(name), [])
+            group.append(name)
+            if len(group) == 3:
+                a, b, singleton = group
+                break
+        else:
+            self.fail("failed to find a triple collision")
+        stamp = "2026-10-03T10:00:00Z"
+        events = [
+            ev("a1", a, stamp), ev("a2", "a_unused2", stamp, "purchase", price="11"),
+            ev("b1", b, stamp, "purchase", price="22"),
+            ev("single", singleton, stamp),
+            ev("dup", singleton, stamp, ingest="2026-10-03T10:01:00Z"),
+        ]
+        clicks = [
+            f"ca,{a},c_1,{stamp}", f"cb,{b},c_2,{stamp}",
+            f"cs,{singleton},c_3,{stamp}",
+        ]
+        links = [f"{a},a_unused", "a_unused,a_unused2", "a_unused2,a_unused2",
+                 f"{b},b_unused", f"{b},b_unused"]
+        users, campaigns = run_case(events, clicks, links, extra={"events/part-1.csv": [
+            ev("dup", b, stamp, ingest=stamp),
+        ]})
+        day = "2026-10-03"
+        self.assertEqual({k[0]: (v["events"], v["revenue_cents"]) for k, v in users.items()},
+                         {"a_unused": (2, 11), "b_unused": (2, 22), singleton: (1, 0)})
+        self.assertEqual({c: campaigns[(c, day)]["sessions"] for c in ("c_1", "c_2", "c_3")},
+                         {"c_1": 1, "c_2": 1, "c_3": 1})
+
     def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
         stamp = "2026-10-03T10:00:00Z"
         early = "2026-10-03T09:59:59Z"

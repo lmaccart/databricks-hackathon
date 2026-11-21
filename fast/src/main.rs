@@ -5,10 +5,10 @@
 //! Phases (see ARCHITECTURE.md):
 //!   0. small tables (manifest, products, campaigns)
 //!   1. links  -> union-find -> id -> person name
-//!   2. events -> raw-user payload partitions, claims by event ID
+//!   2. events -> conservative final payload partitions, claims by event ID
 //!   3. reject losing payloads after exact minimum-ingest selection on suspect IDs
-//!   4. clicks -> raw-user partitions (identical copies are idempotent)
-//!   5. cache-local identity join, then per-owner sort, sessionize and aggregate
+//!   4. clicks -> conservative final partitions (identical copies are idempotent)
+//!   5. exact local identity join, then per-person sort, sessionize and aggregate
 //!   6. write Parquet in parallel
 
 use ahash::RandomState;
@@ -243,7 +243,7 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, window: (i64, i64, &ManifestClock
         }
         let key = names.codec.key(uid);
         let hash = links::mix(key);
-        b[shard(hash)].wide.push(PCl {
+        b[names.route(hash)].wide.push(PCl {
             person: hash,
             ts,
             cid: names.codec.key(cid),
@@ -282,6 +282,63 @@ impl<'a, 'b> JoinCache<'a, 'b> {
 }
 
 type JoinJobs = Vec<(Vec<Payload>, Vec<Clicks>)>;
+
+// In coarse mode every alias and every colliding singleton is already on
+// its final shard. Resolve exact IDs locally; a routing collision is not a
+// person match, and no record is sent to another shard.
+fn join_local(
+    events: Vec<Vec<Payload>>,
+    clicks: Vec<Vec<Clicks>>,
+    people: &People,
+    packing: Option<Packing>,
+) -> JoinJobs {
+    let raw_events = by_destination(events, |p| !p.wide.times.is_empty() || !p.wide.purchases.is_empty());
+    let raw_clicks = by_destination(clicks, |p| !p.wide.is_empty());
+    raw_events
+        .into_par_iter()
+        .zip(raw_clicks.into_par_iter())
+        .map(|(mut evs, mut cls)| {
+            let mut cache = JoinCache::new(people);
+            let mut linked_e = Payload::default();
+            let mut linked_c = Clicks::default();
+            for part in &mut evs {
+                part.wide.times.retain(|row| match cache.resolve(row.person) {
+                    Identity::Standalone(_) => true,
+                    id @ Identity::Linked(_) => {
+                        linked_e.push(id, row.ts, 0, 0, packing, people);
+                        false
+                    }
+                });
+                part.wide.purchases.retain(|row| match cache.resolve(row.key.person) {
+                    Identity::Standalone(_) => true,
+                    id @ Identity::Linked(_) => {
+                        linked_e.push(id, row.key.ts, row.price, row.cat, packing, people);
+                        false
+                    }
+                });
+            }
+            for part in &mut cls {
+                part.wide.retain(|row| match cache.resolve(row.person) {
+                    Identity::Standalone(_) => true,
+                    Identity::Linked(p) => {
+                        let mut row = *row;
+                        if packing.is_some() {
+                            row.person = u64::from(p as u32);
+                            linked_c.packed.push(row);
+                        } else {
+                            row.person = people.original(p as u32);
+                            linked_c.wide.push(row);
+                        }
+                        false
+                    }
+                });
+            }
+            evs.push(linked_e);
+            cls.push(linked_c);
+            (evs, cls)
+        })
+        .collect()
+}
 
 fn join_raw(
     events: Vec<Vec<Payload>>,
@@ -631,7 +688,13 @@ fn main() {
 
     let len =
         |e: &Payload| e.packed.times.len() + e.packed.purchases.len() + e.wide.times.len() + e.wide.purchases.len();
-    let mut jobs = join_raw(ev_by_person, cl_by_person, &names, packing);
+    let mut jobs = if names.coarse() {
+        log("coarse routing");
+        join_local(ev_by_person, cl_by_person, &names, packing)
+    } else {
+        log("raw routing fallback");
+        join_raw(ev_by_person, cl_by_person, &names, packing)
+    };
     log("identity join");
     jobs.sort_unstable_by_key(|(e, c)| {
         std::cmp::Reverse(

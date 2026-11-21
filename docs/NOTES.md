@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## No-escape coarse routing experiment — 2026-11-21
+
+On top of `7444732`, union canonical owners whose raw IDs share a slot in a power-of-two address domain. A byte chooser routes every row directly to its final shard; an exact, shard-local alias table still distinguishes unrelated people. Event-ID claims remain globally partitioned and select the earliest ingest even across destination shards. The domain scales with the observed linked-ID count, capped at 64 MiB; occupied-slot construction is sparse. A cluster or shard above `max(4096, linked IDs / 16)` falls back to the original exact two-stage join. Alias counts are only a skew proxy: activity skew and 60M memory/time remain unmeasured.
+
+On public dev: 60,395 aliases, 2,097,152 slots, largest cluster 292 aliases, largest shard 604. Both dev comparators matched; 43 Python cases against each implementation, 23 Rust tests, 36 fixtures, 10 mini dirty seeds and 10 official-generator/oracle cases (10k/100k, including leap-day seed 15) passed. Five alternating 1M dev pairs on this Mac, eight workers: baseline 0.087 s, candidate 0.089 s (2.0% slower). An earlier loaded run favored the candidate; these small, noisy tests are not 20M or 60M performance/RSS results. No big local runs or Docker.
+
 ## Raw-user partitioned identity join experiment — 2026-11-21
 
 Parse typed event and click payloads by raw-user shard, dedup events against those raw slot locations, and join each shard against its own exact link-table lane. A direct-mapped exact-token cache avoids repeated probes for hot IDs. Standalone events/clicks stay in their original buffers; linked rows move to canonical-owner shards. Link graph construction remains complete and precedes parsing. This increases interim event width and linked-row copying, so performance and 60M peak RSS need parent-side measurement; no 20M/60M benchmark was run here.

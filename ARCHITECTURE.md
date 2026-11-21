@@ -1,25 +1,25 @@
 # Where one input row goes
 
-This experiment parses events and clicks into raw-user hash partitions before resolving identities. A much smaller, independent stream of claims identifies event payloads to discard before the partition-local identity join.
+This experiment routes raw IDs directly to conservative final shards using a byte chooser. Colliding slots and linked aliases are colocated, but an exact local join still distinguishes people. A much smaller, independent stream of claims identifies event payloads to discard globally before the identity join. Large routing clusters fall back to raw-user partitioning followed by linked-row redistribution.
 
 ```text
 manifest, products, campaigns ────────────────► windows and dimension lookups
 links ─► exact ID keys ─► parallel union-find ─► immutable ID → canonical person
-events ─► strict CSV ┬─ valid payload ─────────────────► raw-user bucket
+events ─► strict CSV ┬─ valid payload ─────────────────► coarse bucket
                     └─ claim, including invalid copies ► event-ID bucket
                                                             │
                                           duplicate filter + exact earliest copy
                                                             │
-                                      remove losing payloads from raw-user buckets
-clicks ─► validate ────────────────────────────────────► raw-user buckets
-                 └─ cache-local exact alias join ──────► person buckets
+                                      remove losing payloads from coarse buckets
+clicks ─► validate ────────────────────────────────────► coarse buckets
+                 └─ cache-local exact alias join ──────► local people
                  │
         gather by person partition ─► time ordering ─► sessions, credit, assists
                  │
         user/day rows and campaign/day counters ─► Parquet
 ```
 
-- **Identity (`person.rs`, `links.rs`).** Up to nine nonempty ASCII bytes fit losslessly in 63 bits if the final byte is nonzero. Other spellings are interned using the **entire** ID as key. Leading zeroes, NULs, Unicode, spaces and case remain significant. Parallel link unions always attach the larger root name to the smaller using atomic compare-and-exchange. Unknown IDs map to themselves. A reversible permutation spreads person keys across shards, so a sort key also serves as the routing key. Reversing it recovers the exact ID for output. Link-table lanes use the raw-user partition bits; each partition join uses an exact-key direct-mapped cache. Standalone rows remain in their original buffers, and linked rows move to their canonical-owner shards.
+- **Identity (`person.rs`, `links.rs`).** Up to nine nonempty ASCII bytes fit losslessly in 63 bits if the final byte is nonzero. Other spellings are interned using the **entire** ID as key. Leading zeroes, NULs, Unicode, spaces and case remain significant. Parallel link unions always attach the larger root name to the smaller using atomic compare-and-exchange. Unknown IDs map to themselves. A reversible permutation recovers exact IDs for output. Coarse slot unions only establish colocation; each final shard has an exact link-table lane and a direct-mapped exact-key cache. When observed alias counts indicate a pathological routing cluster or shard, the baseline raw-user lanes and linked-row redistribution are retained.
 - **Timestamps (`ts.rs`).** The manifest supplies a bounded set of likely UTC dates. A fast F1 lookup checks all ten date bytes, every clock separator and digit, and the valid hour/minute/second ranges. Other dates use the full Gregorian calculation; offsets, raw epoch milliseconds and invalid values retain their regular parser.
 - **Events (`events.rs`).** Even a well-formed but invalid event can suppress a later valid copy. It emits an ingest claim and no payload. Malformed lines and empty event IDs emit neither. A 16-byte claim stores a reversible event-ID token (top eight bits implicit in the shard), raw-partition payload location, and exact ingest order. Four-digit F1 years fit as signed whole seconds; exceptional timestamps use full milliseconds in a per-chunk side table. A per-shard Bloom filter identifies IDs that *might* repeat. False positives send extra claims to the exact table; they never suppress a row. Actual duplicates mark their repeated bits on the second occurrence, so the exact pass includes the first occurrence too. A winning invalid copy has no payload; all losing valid copies are removed before joining. Category lookup only runs for valid purchases.
 - **Sessions (`stream.rs`, `main.rs`).** Linked people can sort as 8-byte (canonical node rank, manifest-relative timestamp) keys. Unlinked people and over-wide windows use full (exact person key, timestamp) pairs. Only purchases carry price and category; after dedup, each contributes one key to the temporal sort and one record to the sorted purchase stream. The scan consumes all purchases through each session's inclusive end key. A gap strictly greater than 1,800,000 ms starts a new session. All counters, including purchases after midnight, use its start day. There is no click-ID shuffle: the rules guarantee identical copies, all of which enter and expire together. Multiplicity changes neither the minimum click ID at the latest timestamp nor the set of active campaigns. Resolve byte-wise ties only while advancing the window.
