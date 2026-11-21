@@ -13,6 +13,7 @@ pub(super) struct Packing {
     origin: i64,
     bits: u32,
     mask: u64,
+    span: u64,
 }
 
 impl Packing {
@@ -28,6 +29,7 @@ impl Packing {
             origin: ws,
             bits,
             mask: (1 << bits) - 1,
+            span,
         })
     }
 
@@ -44,6 +46,9 @@ pub(super) trait Temporal: Copy + Ord {
     // Only compared within one person's ordered keys.
     fn gap(self, prev: Self) -> u64;
     fn name(person: u64, people: &People) -> u64;
+    fn compress(_keys: &mut Vec<Self>, _layout: Self::Layout) -> Option<super::dense::Bins<Self>> {
+        None
+    }
 }
 
 impl Temporal for Wide {
@@ -91,6 +96,10 @@ impl Temporal for u64 {
     #[inline]
     fn name(rank: u64, people: &People) -> u64 {
         people.original(rank as u32)
+    }
+
+    fn compress(keys: &mut Vec<Self>, pack: Packing) -> Option<super::dense::Bins<Self>> {
+        super::dense::compress(keys, pack, pack.origin, pack.span)
     }
 }
 

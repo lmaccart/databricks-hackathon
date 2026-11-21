@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+mod dense;
 mod dims;
 mod events;
 mod links;
@@ -348,6 +349,7 @@ fn process_stream<T: Temporal>(
         evs.extend(s.purchases.iter().map(|p| p.key));
         purchases.extend_from_slice(&s.purchases);
     }
+    let dense = T::compress(&mut evs, layout);
     evs.sort_unstable();
     purchases.sort_unstable_by_key(|p| p.key);
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
@@ -420,7 +422,11 @@ fn process_stream<T: Temporal>(
                 pi += 1;
             }
             d_sess += 1;
-            d_ev += (m - k) as i64;
+            d_ev += if let Some(bins) = dense.as_ref().filter(|bins| bins.rank == rank) {
+                evs[k..m].iter().map(|&key| bins.weight(key, layout) as i64).sum()
+            } else {
+                (m - k) as i64
+            };
             d_rev += rev;
 
             // slide the click window to [start - 7d, start]

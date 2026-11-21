@@ -90,6 +90,32 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_dense_person_bins_bridges_and_duplicate_purchases(self):
+        # A hot linked person, with shuffled same-minute events, a bridge at
+        # exactly the gap, a 1ms-too-long gap, and tied purchase timestamps.
+        base = WS_MS + HOUR
+        events = [ev(f"fill{i}", "hot", str(base + (59_999 if i == 0 else (i * 13) % 60_000)))
+                  for i in range(5000)]
+        events += [
+            ev("bridge", "other", str(base + 59_999 + 1_800_000)),
+            ev("split", "hot", str(base + 59_999 + 3_600_001)),
+            ev("buy1", "hot", str(base + 100), "purchase", "p1", "100"),
+            ev("buy2", "other", str(base + 100), "purchase", "p2", "200"),
+            ev("loser", "hot", str(base + 100), "purchase", "p3", "999",
+               ingest="2026-10-01T02:00:00Z"),
+        ]
+        users, camps = run_case(
+            reversed(events), links=["hot,other"],
+            extra={"events/part-1.csv": [
+                ev("loser", "", str(base + 100), ingest="2026-10-01T01:00:00Z"),
+            ]},
+        )
+        row = users[("hot", "2026-10-01")]
+        self.assertEqual((row["sessions"], row["events"], row["revenue_cents"], row["top_category"]),
+                         (2, 5004, 300, "hats"))
+        self.assertEqual((camps[("organic", "2026-10-01")]["sessions"],
+                          camps[("organic", "2026-10-01")]["revenue_cents"]), (2, 300))
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"

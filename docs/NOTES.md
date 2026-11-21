@@ -1,5 +1,23 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Dense linked-person minute extrema experiment — 2026-11-21 UTC
+
+Experimental candidate only: sample exact linked ranks within a post-dedup shard, then
+require an observed heavy count before allocating manifest-bounded minute cells and
+an occupancy bitmap for at most one person per shard. Each occupied minute emits
+its exact first and last timestamps, with its event count attached to the first;
+purchase records remain separate and exact. Sparse, unlinked and very wide-window
+inputs retain the original sort. This removes repeated event keys from the sort
+without changing any session or click rules.
+
+Both dev-answer comparers matched; all 36 official fixtures passed for both
+implementations; 39 Python and 22 Rust tests and ten 20k dirty seeds passed.
+No 20M or Docker run was performed, as requested. Two noisy five-pair native
+dev-set (1M) trials on the shared Mac measured **0.209 → 0.233 s** and
+**0.235 → 0.256 s** (11.4% and 9.1% slower), respectively. These are not
+competition-scale timings. Do not treat this candidate as a demonstrated speedup;
+it requires independent controlled scale profiling and exactness checks.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.
