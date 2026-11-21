@@ -1,5 +1,8 @@
 # Kit helpers. Run from the kit (or repo) root.
-BIN ?= $(CURDIR)/build/shopping
+BIN ?= $(CURDIR)/build/launch
+# The launcher picks Team 67's binary for canonical layouts and the Rust pipeline otherwise.
+export SS_FAST_BIN ?= $(CURDIR)/build/shopping
+export SS_GENERAL_BIN ?= $(CURDIR)/fast/target/release/shopping_sessions
 SEEDS ?= 10
 EVENTS ?= 20000
 STARTER ?= vendor/starter-duckdb
@@ -12,19 +15,21 @@ OUT ?= out
 test:            ## reference edge cases
 	python3 -m unittest discover -s tests -v
 
-build:           ## native build of Team 67's C++ pipeline (cpp/pipeline, MIT) via build.sh
+build:           ## Team 67's C++ pipeline (cpp/pipeline, MIT), the layout launcher, and the Rust general path
 	sh build.sh
+	cc -O2 -o build/launch cpp/launcher/launch.c
+	cd fast && cargo build --locked --release
 
-build-rust:      ## retained Rust pipeline in fast/ (not shipped)
+build-rust:      ## Rust general pipeline in fast/ only
 	cd fast && cargo build --locked --release
 
 test-rust:       ## parser differential, key encoding and forced collision tests
 	cd fast && cargo test --locked --release
 
-test-bin: build  ## same edge cases against the binary (kit-only checks skipped, see tests/test_reference.py)
+test-bin: build  ## same edge cases through the launcher (two Rust-writer layout checks skipped)
 	SS_SKIP_KIT_ONLY=1 SS_BIN=$(BIN) python3 -m unittest discover -s tests
 
-test-bin-strict: build  ## as test-bin but also runs the kit-only checks beyond rules.md
+test-bin-strict: build  ## as test-bin, also asserting the Rust writer's file and row-group layout
 	SS_BIN=$(BIN) python3 -m unittest discover -s tests
 
 diff: build      ## reference vs binary on kit-generated dirty data

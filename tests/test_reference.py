@@ -82,10 +82,10 @@ def _run_case_at(tmp, events, clicks, links, products, campaigns, extra=None, wi
 
 
 def kit_only(reason):
-    """Skip a kit-specific check when SS_SKIP_KIT_ONLY=1 (the Makefile sets it for the shipped C++ binary).
+    """Skip a check of the Rust writer's own Parquet layout when SS_SKIP_KIT_ONLY=1.
 
-    These cases go beyond rules.md (permuted headers, non-ISO manifest values, Rust part layout);
-    `make test-bin-strict` runs them against the binary without skipping."""
+    rules.md accepts any file count and row grouping, and canonical inputs are
+    written by Team 67's pipeline; `make test-bin-strict` runs these anyway."""
     return unittest.skipIf(os.environ.get("SS_SKIP_KIT_ONLY") == "1", "kit-only: " + reason)
 
 
@@ -243,7 +243,6 @@ class Timestamps(unittest.TestCase):
 
 
 class CsvDialect(unittest.TestCase):
-    @kit_only("error exit when events is a file; rules.md is silent on invalid layouts")
     def test_unreadable_part_listing_fails(self):
         # ENOTDIR is deterministic even under root; a glob used to swallow it.
         with tempfile.TemporaryDirectory() as tmp:
@@ -296,7 +295,6 @@ class CsvDialect(unittest.TestCase):
                          (1, 3, 750, "shoes"))
         self.assertEqual(u[(" u1", "2026-10-02")]["revenue_cents"], 700)
 
-    @kit_only("permuted CSV headers; rules.md fixes the column order")
     def test_wide_shuffled_header_validates_ignored_quotes_before_dedup(self):
         # Malformed copies are dropped before dedup, even when their only
         # stray quotes are in columns that the event consumer never reads.
@@ -373,7 +371,6 @@ class EventsOrder(unittest.TestCase):
         self.assertEqual(c[("c_1", "2026-10-01")]["revenue_cents"], 31)
         self.assertEqual(c[("c_2", "2026-10-02")]["revenue_cents"], 20)
 
-    @kit_only("manifest window_end given as an int64 string, not ISO (rules.md shows ISO manifests)")
     def test_sparse_wide_window_with_large_timestamp_spans(self):
         lo = "0001-01-01T00:00:00Z"
         late = "9998-12-31T00:00:00Z"
@@ -669,7 +666,6 @@ class Clicks(unittest.TestCase):
 
 
 class ByteDistinctIds(unittest.TestCase):
-    @kit_only("manifest window_end given as an int64 string, not ISO (rules.md shows ISO manifests)")
     def test_dimension_spellings_and_pipelined_click_ties(self):
         s = ms("2026-10-09T12:00:00Z")
         products = ["p1,first", "p2,second", "p3,third", "p4,fourth", "p5,fifth", "p01,padded", "P1,upper",

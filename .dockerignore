@@ -2,4 +2,11 @@
 !cpp/
 !cpp/pipeline/
 !cpp/pipeline/**
+!cpp/launcher/
+!cpp/launcher/**
 !build.sh
+!fast/
+!fast/Cargo.toml
+!fast/Cargo.lock
+!fast/src/
+!fast/src/**
