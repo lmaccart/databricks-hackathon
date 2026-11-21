@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Interval-session experiment — 2026-11-21
+
+Detached candidate based on `5fd0d05`: group surviving timestamps by exact person, merge bounded online intervals, use exact 30-minute bins for dense groups, and fall back to sorting for fragmented groups or unsupported widths. Sparse purchases and existing click attribution are retained. Rust interval stress checks compare with a literal sorted scan; a shuffled end-to-end case compares linked and standalone dense users and fragmented users with the Python oracle.
+
+Local checks: 21 Rust tests, 40 reference and 40 binary tests, 10 kit-generated dirty seeds at 20k events, 36/36 official fixtures for each implementation, and both 1M dev comparers passed; binary stdout was empty. Build used `CARGO_BUILD_JOBS=2`. No large runs or Docker were performed for this experiment. **No timing delta or scale/memory validation is available:** benchmark against the baseline before considering this candidate for use.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

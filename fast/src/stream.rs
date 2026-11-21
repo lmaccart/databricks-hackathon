@@ -33,7 +33,22 @@ impl Packing {
 
     #[inline]
     pub fn encode(self, rank: u32, ts: i64) -> u64 {
-        (u64::from(rank) << self.bits) | (ts as u64).wrapping_sub(self.origin as u64)
+        self.with_offset(rank, (ts as u64).wrapping_sub(self.origin as u64))
+    }
+
+    #[inline]
+    pub fn with_offset(self, rank: u32, offset: u64) -> u64 {
+        (u64::from(rank) << self.bits) | offset
+    }
+
+    #[inline]
+    pub fn rank(self, key: u64) -> u32 {
+        (key >> self.bits) as u32
+    }
+
+    #[inline]
+    pub fn offset(self, key: u64) -> u64 {
+        key & self.mask
     }
 }
 
@@ -99,6 +114,46 @@ pub(super) struct Purchase<T> {
     pub key: T,
     pub price: u32,
     pub cat: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Session<T> {
+    pub first: T,
+    pub last: T,
+    pub count: usize,
+}
+
+pub(super) fn sorted_sessions<T: Temporal>(
+    pieces: Vec<Stream<T>>,
+    layout: T::Layout,
+    n: usize,
+    np: usize,
+) -> (impl Iterator<Item = Session<T>>, Vec<Purchase<T>>) {
+    let mut evs = Vec::with_capacity(n);
+    let mut purchases = Vec::with_capacity(np);
+    for s in pieces {
+        evs.extend_from_slice(&s.times);
+        evs.extend(s.purchases.iter().map(|p| p.key));
+        purchases.extend_from_slice(&s.purchases);
+    }
+    evs.sort_unstable();
+    let mut i = 0;
+    let sessions = std::iter::from_fn(move || {
+        let first = *evs.get(i)?;
+        let rank = first.person(layout);
+        let mut j = i + 1;
+        while j < evs.len() && evs[j].person(layout) == rank && evs[j].gap(evs[j - 1]) <= crate::GAP as u64 {
+            j += 1;
+        }
+        let count = j - i;
+        i = j;
+        Some(Session {
+            first,
+            last: evs[j - 1],
+            count,
+        })
+    });
+    (sessions, purchases)
 }
 
 pub(super) struct Stream<T> {

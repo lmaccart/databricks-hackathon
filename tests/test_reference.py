@@ -11,9 +11,11 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import random
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "reference"))
@@ -230,6 +232,63 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_shuffled_interval_stress_matches_literal_reference(self):
+        rng = random.Random(1781)
+        events, clicks = [], []
+        base = ms("2026-10-02T23:45:00Z")
+        gap = 30 * MIN
+        for person, count in (("alias", 600), ("solo", 600), ("sparse", 100)):
+            # The sparse person exceeds the inline component limit; the other
+            # two exercise dense bins for both linked and standalone identities.
+            times = ([base + i * (gap + 1) for i in range(count)]
+                     if person == "sparse" else
+                     [base + rng.randrange(0, 8 * DAY) for _ in range(count)])
+            times += [base, base + gap, base + 2 * gap, base + gap]
+            for i, t in enumerate(times):
+                purchase = i % 7 == 0
+                events.append(ev(f"{person}-{i}", person, str(t),
+                                 "purchase" if purchase else "view",
+                                 "p2" if i % 2 else "p1", str(i + 1) if purchase else ""))
+            clicks.extend([
+                f"{person}-z,{person},c_1,{base}",
+                f"{person}-a,{person},c_2,{base}",
+                f"{person}-later,{person},c_3,{base + 1}",
+            ])
+        rng.shuffle(events)
+        args = dict(events=events, clicks=clicks, links=["a,alias"])
+        actual = run_case(**args)
+        with patch.dict(os.environ, {"SS_BIN": ""}):
+            expected = run_case(**args)
+        self.assertEqual(actual, expected)
+
+    def test_unsorted_bridge_and_losing_bridge(self):
+        midnight = ms("2026-10-02T00:00:00Z")
+        first, last = midnight - 30 * MIN, midnight + 30 * MIN
+        events = [
+            ev("later", "alias", str(last)),
+            ev("earlier", "a", str(first)),
+            ev("bridge", "alias", str(midnight), "purchase", "p1", "10"),
+            ev("equal", "a", str(midnight), "purchase", "p2", "10"),
+            ev("next", "alias", str(last + 30 * MIN + 1)),
+            ev("b-later", "b", str(last)),
+            ev("b-earlier", "b", str(first)),
+            ev("loser", "b", str(midnight), "purchase", "p1", "999"),
+        ]
+        u, c = run_case(
+            events, links=["a,alias", "b,b"],
+            clicks=[f"before,alias,c_1,{first}", f"after,a,c_2,{first + 1}"],
+            extra={"events/part-1.csv": [ev("loser", "", "bad", ingest=WS)]},
+        )
+        day0, day1 = "2026-10-01", "2026-10-02"
+        row = u[("a", day0)]
+        self.assertEqual((row["sessions"], row["events"], row["revenue_cents"],
+                          row["top_category"]), (1, 4, 20, "hats"))
+        for key in [("a", day1), ("b", day0), ("b", day1)]:
+            self.assertEqual((u[key]["sessions"], u[key]["events"]), (1, 1))
+        self.assertEqual(c[("c_1", day0)]["revenue_cents"], 20)
+        self.assertNotIn(("c_2", day0), c)
+        self.assertEqual(c[("c_2", day1)]["sessions"], 1)
+
     def test_line_wider_than_a_parse_chunk_does_not_shift_duplicate_targets(self):
         t = "2026-10-02T12:00:00Z"
         early = "2026-10-02T11:59:59Z"

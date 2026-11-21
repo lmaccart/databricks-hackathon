@@ -1,6 +1,6 @@
 //! Build the canonical-name lookup in parallel, including transitive paths
 //! that span input files. Canonical node indexes also serve as exact sort ranks.
-use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows};
+use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows, shard};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -59,6 +59,7 @@ pub(super) struct People<'a> {
     pub(super) codec: Codec<'a>,
     lanes: Vec<Lane>,
     roots: Vec<u64>,
+    offsets: [usize; NS + 1],
     pub(super) count: usize,
 }
 
@@ -88,6 +89,10 @@ impl<'a> People<'a> {
     #[inline]
     pub(super) fn original(&self, rank: u32) -> u64 {
         self.roots[rank as usize]
+    }
+
+    pub(super) fn ranks(&self, shard: usize) -> std::ops::Range<usize> {
+        self.offsets[shard]..self.offsets[shard + 1]
     }
 
     #[inline]
@@ -227,12 +232,33 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
                 }
             }
         });
-    let mut roots = keys;
-    roots.par_iter_mut().for_each(|k| *k = mix(*k));
+    // Give each shard a contiguous domain of canonical ranks, with no holes
+    // for aliases. Session workers can then count and scatter by direct index.
+    let mut ends = [0usize; NS + 1];
+    for (i, (&k, p)) in keys.iter().zip(&parent).enumerate() {
+        if p.load(Relaxed) as usize == i {
+            ends[shard(mix(k)) + 1] += 1;
+        }
+    }
+    for s in 0..NS {
+        ends[s + 1] += ends[s];
+    }
+    let mut cursors = ends;
+    let mut roots = vec![0; ends[NS]];
+    let mut ranks = vec![0u32; count];
+    for (i, (&key, p)) in keys.iter().zip(&parent).enumerate() {
+        if p.load(Relaxed) as usize == i {
+            let mixed = mix(key);
+            let cursor = &mut cursors[shard(mixed)];
+            roots[*cursor] = mixed;
+            ranks[i] = *cursor as u32;
+            *cursor += 1;
+        }
+    }
     lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
         for slot in &mut lane.slots {
             if slot.key != 0 {
-                let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
+                let rank = ranks[root(&parent, (offsets[s] + slot.value as usize) as u32) as usize];
                 let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
                 slot.value = LINKED | routing | u64::from(rank);
             }
@@ -241,7 +267,8 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
     People {
         codec,
         lanes,
+        count: roots.len(),
         roots,
-        count,
+        offsets: ends,
     }
 }
