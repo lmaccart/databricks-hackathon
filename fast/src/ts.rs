@@ -44,7 +44,7 @@ fn b(v: u64, i: u32) -> i64 {
 
 /// Days since 1970-01-01, proleptic Gregorian (Hinnant), for years 0..=9999.
 #[inline(always)]
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = y + 400 - (m <= 2) as i64; // one era later keeps every year positive
     let era = y / 400;
     let yoe = y - era * 400;
@@ -53,39 +53,90 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     (era - 1) * 146_097 + doe - 719_468
 }
 
+// Once the full ASCII templates pass, two low nibbles uniquely identify each
+// decimal pair. Invalid clock values carry a flag, independently of syntax.
+const INVALID: u32 = 1 << 31;
+const fn clock_table(scale: u32, limit: u32) -> [u32; 256] {
+    let mut table = [INVALID; 256];
+    let mut i = 0;
+    while i < 256 {
+        let v = ((i >> 4) * 10 + (i & 15)) as u32;
+        if i >> 4 < 10 && i & 15 < 10 && v < limit {
+            table[i] = v * scale;
+        }
+        i += 1;
+    }
+    table
+}
+const HOURS: [u32; 256] = clock_table(3600, 24);
+const MINUTES: [u32; 256] = clock_table(60, 60);
+const SECONDS: [u32; 256] = clock_table(1, 60);
+
+const fn year_table() -> [i32; 10000] {
+    let mut years = [0; 10000];
+    let mut y = 0;
+    while y < 10000 {
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        // Arithmetic shift recovers negative days correctly, even for year 0.
+        years[y] = (days_from_civil(y as i64, 1, 1) as i32) * 2 + leap as i32;
+        y += 1;
+    }
+    years
+}
+static YEARS: [i32; 10000] = year_table();
+const MONTH_START: [i64; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
+#[inline(always)]
+fn pair_index(v: u64, i: u32) -> usize {
+    let x = v >> (8 * i);
+    (((x & 15) << 4) | ((x >> 8) & 15)) as usize
+}
+
 /// F1 (`F2 == false`, 20 bytes) or F2 (25 bytes), or BAD.
 #[inline(always)]
 fn iso<const F2: bool>(s: &[u8]) -> i64 {
     let a = load8(s, 0) ^ T_DATE;
     let t = load8(s, 8) ^ T_TIME;
-    let (z, ok, off_min) = if F2 {
+    let (z, ok) = if F2 {
         let sign = s[19];
         let z = load8(s, 16) ^ (T_F2 | (sign as u64) << 24);
         let last = s[24].wrapping_sub(b'0') as i64;
-        let (oh, om) = (b(z, 4) * 10 + b(z, 5), b(z, 7) * 10 + last);
-        let ok = fits(z, A_F2) & (last <= 9) & (sign == b'+' || sign == b'-') & (oh <= 23) & (om <= 59);
-        (z, ok, if sign == b'-' { -(oh * 60 + om) } else { oh * 60 + om })
+        (z, fits(z, A_F2) & (last <= 9) & (sign == b'+' || sign == b'-'))
     } else {
         let z = u32::from_le_bytes(s[16..20].try_into().unwrap()) as u64 ^ T_F1;
-        (z, fits(z, A_F1), 0)
+        (z, fits(z, A_F1))
     };
     if !(fits(a, A_DATE) & fits(t, A_TIME) & ok) {
         return BAD;
     }
     let y = b(a, 0) * 1000 + b(a, 1) * 100 + b(a, 2) * 10 + b(a, 3);
     let (mo, d) = (b(a, 5) * 10 + b(a, 6), b(t, 0) * 10 + b(t, 1));
-    let (h, mi, se) = (b(t, 3) * 10 + b(t, 4), b(t, 6) * 10 + b(t, 7), b(z, 1) * 10 + b(z, 2));
-    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 {
+    let h = HOURS[pair_index(t, 3)];
+    let mi = MINUTES[pair_index(t, 6)];
+    let se = SECONDS[pair_index(z, 1)];
+    if !(1..=12).contains(&mo) || (h | mi | se) & INVALID != 0 {
         return BAD;
     }
+    let off = if F2 {
+        let oh = HOURS[pair_index(z, 4)];
+        let om = MINUTES[((b(z, 7) as usize) << 4) | ((s[24] - b'0') as usize)];
+        if (oh | om) & INVALID != 0 {
+            return BAD;
+        }
+        let seconds = (oh + om) as i64;
+        if s[19] == b'-' { -seconds } else { seconds }
+    } else {
+        0
+    };
     const MD: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let year = YEARS[y as usize];
+    let leap = year & 1 != 0;
     let mdays = if mo == 2 && leap { 29 } else { MD[mo as usize] };
     if d < 1 || d > mdays {
         return BAD;
     }
-    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se;
-    (secs - off_min * 60) * 1000 // subtract the offset to get UTC
+    let days = (year >> 1) as i64 + MONTH_START[mo as usize] + d - 1 + (leap && mo > 2) as i64;
+    (days * 86_400 + (h + mi + se) as i64 - off) * 1000
 }
 
 /// Eight ASCII digits (first byte most significant) as a number, or None.
@@ -133,6 +184,11 @@ fn epoch_ms(s: &[u8]) -> i64 {
     let n = s.len();
     let v = match n {
         0..=8 => short(s),
+        // The two validated words overlap by three digits; modulo discards
+        // exactly those digits from the second word.
+        13 => eight(load8(s, 0))
+            .zip(eight(load8(s, 5)))
+            .map(|(h, l)| h * 100_000 + l % 100_000),
         9..=16 => {
             // the first n-8 digits, left-padded with '0' to a full word
             let k = n - 8;
@@ -331,6 +387,46 @@ mod tests {
         }
         for s in BASES {
             check(s.as_bytes());
+        }
+    }
+
+    #[test]
+    fn exhaustive_digit_pairs_and_years() {
+        // Every byte pair at every two-digit position, including non-ASCII.
+        for base in ["2000-02-29T12:34:56Z", "2000-02-29T12:34:56-12:34"] {
+            let positions: &[usize] = if base.len() == 20 {
+                &[0, 2, 5, 8, 11, 14, 17]
+            } else {
+                &[0, 2, 5, 8, 11, 14, 17, 20, 23]
+            };
+            let mut s = base.as_bytes().to_vec();
+            for &i in positions {
+                for pair in 0..=u16::MAX {
+                    s[i] = (pair >> 8) as u8;
+                    s[i + 1] = pair as u8;
+                    check(&s);
+                }
+                s[i..i + 2].copy_from_slice(&base.as_bytes()[i..i + 2]);
+            }
+        }
+        for year in 0..=9999 {
+            for date in ["01-01", "02-28", "02-29", "03-01", "12-31"] {
+                check(format!("{year:04}-{date}T23:59:59Z").as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn every_clock_second_and_offset() {
+        for hour in 0..24 {
+            for minute in 0..60 {
+                for second in 0..60 {
+                    check(format!("0000-12-31T{hour:02}:{minute:02}:{second:02}Z").as_bytes());
+                }
+                for sign in ['+', '-'] {
+                    check(format!("9999-01-01T00:00:00{sign}{hour:02}:{minute:02}").as_bytes());
+                }
+            }
         }
     }
 

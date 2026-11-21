@@ -1,5 +1,45 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Hex-clock timestamp experiment — 2026-11-20
+
+Candidate vs `bcdc149`: validate the existing whole ISO templates first, then use
+two-nibble indexes for weighted hour/minute/second tables. A 40 KB table covers
+*all* four-digit Gregorian years, not a dataset-specific window. The 13-digit
+epoch path decodes two overlapping eight-byte words; other F3 lengths still use
+the general path.
+
+Standalone `tools/ts_microbench.rs`, M2 Pro, `rustc -O -C target-cpu=generic`:
+two alternated baseline/candidate pairs, each cell the median of five 2,097,152
+value loops, in ns/value:
+
+| Shape | Baseline | Candidate |
+|---|---|---|
+| F1 | 8.50, 8.07 | 6.30, 6.42 |
+| F2 | 10.10, 9.56 | 8.07, 8.18 |
+| F3 (13 digits) | 3.77, 3.82 | 3.82, 3.68 |
+| Mixed (58% F1, 10% F2, 32% F3) | 7.29, 6.87 | 5.66, 5.66 |
+
+This is a synthetic, warm-cache microbenchmark, not an end-to-end or amd64
+result; no 20M timing was run per this experiment's constraints. Test on real
+Intel/AMD with the parent CI before considering the candidate. Reproduce from
+this worktree (the `tail` removes `//!` comments incompatible with `include!`):
+
+```sh
+mkdir -p fast/target/tsbench
+git show bcdc149:fast/src/ts.rs | tail -n +8 > fast/target/tsbench/baseline.rs
+tail -n +8 fast/src/ts.rs > fast/target/tsbench/candidate.rs
+TS_SOURCE="$PWD/fast/target/tsbench/baseline.rs" rustc --edition=2024 -O -C target-cpu=generic -A dead_code tools/ts_microbench.rs -o fast/target/tsbench/baseline
+TS_SOURCE="$PWD/fast/target/tsbench/candidate.rs" rustc --edition=2024 -O -C target-cpu=generic -A dead_code tools/ts_microbench.rs -o fast/target/tsbench/candidate
+fast/target/tsbench/baseline
+fast/target/tsbench/candidate
+```
+
+Correctness: exhaustive byte pairs at every ISO pair position, all 10,000 years
+at leap/date boundaries, every legal clock second and offset, existing million
+ISO mutations and F3 overflow/length tests; 31 Python and 15 Rust tests, 36/36
+fixtures for each implementation, 10 kit seeds at 20k events and both dev
+comparers passed. No behavior change intended. Real amd64 tests pending.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.
