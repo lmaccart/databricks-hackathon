@@ -13,6 +13,7 @@ pub(super) struct Packing {
     origin: i64,
     bits: u32,
     mask: u64,
+    owner: usize,
 }
 
 impl Packing {
@@ -28,7 +29,12 @@ impl Packing {
             origin: ws,
             bits,
             mask: (1 << bits) - 1,
+            owner: 0,
         })
+    }
+
+    pub fn for_owner(self, owner: usize) -> Self {
+        Self { owner, ..self }
     }
 
     #[inline]
@@ -43,7 +49,10 @@ pub(super) trait Temporal: Copy + Ord {
     fn ts(self, layout: Self::Layout) -> i64;
     // Only compared within one person's ordered keys.
     fn gap(self, prev: Self) -> u64;
-    fn name(person: u64, people: &People) -> u64;
+    fn name(person: u64, layout: Self::Layout, people: &People) -> u64;
+    fn dense_names<'a>(_: Self::Layout, _: &'a People<'_>) -> Option<&'a [u64]> {
+        None
+    }
 }
 
 impl Temporal for Wide {
@@ -65,7 +74,7 @@ impl Temporal for Wide {
     }
 
     #[inline]
-    fn name(person: u64, _: &People) -> u64 {
+    fn name(person: u64, (): (), _: &People) -> u64 {
         person
     }
 }
@@ -89,8 +98,13 @@ impl Temporal for u64 {
     }
 
     #[inline]
-    fn name(rank: u64, people: &People) -> u64 {
-        people.original(rank as u32)
+    fn name(rank: u64, pack: Packing, people: &People) -> u64 {
+        people.owner_names(pack.owner)[rank as usize]
+    }
+
+    #[inline]
+    fn dense_names<'a>(pack: Packing, people: &'a People<'_>) -> Option<&'a [u64]> {
+        Some(people.owner_names(pack.owner))
     }
 }
 
@@ -154,7 +168,7 @@ impl Payload {
                 if let Some(p) = packing {
                     return self.packed.push(p.encode(rank, ts), price, cat) * 4 + purchase;
                 }
-                people.original(rank)
+                people.original(routed)
             }
             Identity::Standalone(person) => person,
         };

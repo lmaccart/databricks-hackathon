@@ -1,6 +1,6 @@
 //! Build the canonical-name lookup in parallel, including transitive paths
-//! that span input files. Canonical node indexes also serve as exact sort ranks.
-use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows};
+//! that span input files. Assign exact canonical ranks inside each owner shard.
+use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows, shard};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -58,7 +58,7 @@ impl Lane {
 pub(super) struct People<'a> {
     pub(super) codec: Codec<'a>,
     lanes: Vec<Lane>,
-    roots: Vec<u64>,
+    roots: Vec<Vec<u64>>,
     pub(super) count: usize,
 }
 
@@ -69,7 +69,7 @@ const _: () = assert!(SHARD_SHIFT >= 32 && ((NS as u64 - 1) << SHARD_SHIFT) & LI
 
 #[derive(Clone, Copy)]
 pub(super) enum Identity {
-    Linked(u64), // shard bits at their normal position, root node index in low bits
+    Linked(u64), // shard bits at their normal position, owner-local rank in low bits
     Standalone(u64),
 }
 
@@ -86,8 +86,12 @@ impl<'a> People<'a> {
     }
 
     #[inline]
-    pub(super) fn original(&self, rank: u32) -> u64 {
-        self.roots[rank as usize]
+    pub(super) fn original(&self, routed: u64) -> u64 {
+        self.roots[shard(routed)][routed as u32 as usize]
+    }
+
+    pub(super) fn owner_names(&self, owner: usize) -> &[u64] {
+        &self.roots[owner]
     }
 
     #[inline]
@@ -227,14 +231,21 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
                 }
             }
         });
-    let mut roots = keys;
-    roots.par_iter_mut().for_each(|k| *k = mix(*k));
+    let mut roots: Vec<Vec<u64>> = (0..NS).map(|_| Vec::with_capacity(count / NS / 2)).collect();
+    let mut routed = keys;
+    for (i, k) in routed.iter_mut().enumerate() {
+        if parent[i].load(Relaxed) as usize == i {
+            let name = mix(*k);
+            let owner = &mut roots[shard(name)];
+            *k = (name & ((NS as u64 - 1) << SHARD_SHIFT)) | owner.len() as u64;
+            owner.push(name);
+        }
+    }
     lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
         for slot in &mut lane.slots {
             if slot.key != 0 {
                 let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
-                let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
-                slot.value = LINKED | routing | u64::from(rank);
+                slot.value = LINKED | routed[rank as usize];
             }
         }
     });

@@ -8,7 +8,7 @@
 //!   2. events -> payloads by person, claims by event ID
 //!   3. reject losing payloads after exact minimum-ingest selection on suspect IDs
 //!   4. clicks -> parse, validate and bucket directly by person (identical copies are idempotent)
-//!   5. per person shard: sort, sessionize, credit, assists, aggregate
+//!   5. per person shard: chronological bins, sessions and click windows
 //!   6. write Parquet in parallel
 
 use ahash::RandomState;
@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+mod chrono;
 mod dims;
 mod events;
 mod links;
@@ -247,7 +248,7 @@ fn parse_clicks<'a>(
     let mut emit = |row: PendingClick| {
         let (dest, person) = match names.lookup(row.uid, row.hash) {
             Identity::Linked(p) if packed => (&mut b[shard(p)].packed, u64::from(p as u32)),
-            Identity::Linked(p) => (&mut b[shard(p)].wide, names.original(p as u32)),
+            Identity::Linked(p) => (&mut b[shard(p)].wide, names.original(p)),
             Identity::Standalone(p) => (&mut b[shard(p)].wide, p),
         };
         dest.push(PCl {
@@ -362,7 +363,7 @@ fn process_stream<T: Temporal>(
     let mut pi = 0usize;
     while i < evs.len() {
         let rank = evs[i].person(layout);
-        let person = T::name(rank, people);
+        let person = T::name(rank, layout, people);
         let mut j = i;
         while j < evs.len() && evs[j].person(layout) == rank {
             j += 1;
@@ -489,6 +490,7 @@ fn process_shard(
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
+    window: (i64, i64),
 ) -> ShardOut {
     let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
     let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
@@ -497,9 +499,13 @@ fn process_shard(
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        if !chrono::process(&packed, &pc, sm, people, pack, window, &mut out) {
+            process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        }
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
+    if !chrono::process(&wide, &wc, sm, people, (), window, &mut out) {
+        process_stream(wide, gather(wc), sm, people, (), &mut out);
+    }
     out
 }
 
@@ -574,15 +580,16 @@ fn main() {
         .zip(by_destination(cl_by_person, |c| {
             !c.packed.is_empty() || !c.wide.is_empty()
         }))
+        .enumerate()
         .collect();
-    jobs.sort_unstable_by_key(|(e, c)| {
+    jobs.sort_unstable_by_key(|(_, (e, c))| {
         std::cmp::Reverse(
             e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
         )
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(owner, (e, c))| process_shard(e, c, &sm, &names, packing.map(|p| p.for_owner(owner)), (ws, we)))
         .collect();
     log("sessions done");
 

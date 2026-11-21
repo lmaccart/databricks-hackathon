@@ -1,5 +1,50 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Experimental owner-local time sweep — 2026-11-21
+
+Starting from `f4ac682`, use the same chronological bins for events and
+clicks. A person's events in one bin can have no internal session gap:
+hold only their exact min/max/count and apply sparse purchases to the
+resulting session. Split the bin's clicks at each actual session start,
+with the inclusive boundary applied before credit and assists. Credit is
+the latest applied timestamp, then least original click-ID bytes. A sparse
+latest-per-campaign list is equivalent to FIFO counts for the assist
+existence query; expire entries strictly older than the seven-day lower
+bound. Promote longer lists to indexed lookup and recycle expired nodes.
+Linked ranks are dense per owner; dominant linked people accumulate
+view/cart summaries during routing instead of writing each event to a bin.
+Bound temporary storage by window span, shard rows, people, and dimension
+sizes; the sorted path remains the exact fallback.
+
+The admission limits are per owner stream, before any output is produced:
+4 Mi combined event/click rows, 128 Ki resident people, 128 Ki
+campaign/day output cells, at most 256 categories, and a `u32` millisecond
+span including the lookback. Campaign membership is bounded by the number
+of observed clicks and not the Cartesian product of IDs and campaigns.
+
+Native ARM64, eight workers, same warmed official seed-13 60M/15M input
+within each five-pair comparison:
+
+| Experiment | Control wall | Candidate wall | Control session | Candidate session |
+|---|---:|---:|---:|---:|
+| Dense linked ranks | 2.179 s | 2.285 s | 0.599 s | 0.653 s |
+| 30-minute bins, dominant-person summaries | 1.721 s | 1.746 s | 0.461 s | 0.477 s |
+| Inline window for single-campaign people | 3.660 s | 3.674 s | 1.063 s | 1.013 s |
+| Split event, click, and category state (final) | 9.909 s | 9.884 s | 2.891 s | 2.269 s |
+
+Systems load varied across series; compare within a row, not across rows.
+The final candidate won only two of five wall-clock pairs, with a 0.25%
+wall median gain under heavy load. This does not clear the 3% gate;
+retain `f4ac682` rather than promoting the experiment.
+The first implementation was also slower on the 1M dev data (0.050 →
+0.056 s total, 0.009 → 0.016 s sessions). The final dev series was too
+noisy to establish a wall-time gain (won three of seven pairs, sessions
+0.042 → 0.047 s). No 20M, Docker, or scorer run.
+
+Full final-scale output matched `f4ac682`: 6,587,957 user-days and 28,014
+campaign-days, no differing rows or duplicate keys. The candidate used
+8.90 GiB peak RSS on that run, with zero swaps and zero stdout bytes.
+
 ## Experimental word-offset event parser — 2026-11-21 UTC
 
 For the seven-column canonical header, validate and pack 7–9 byte ASCII IDs
