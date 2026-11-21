@@ -90,6 +90,29 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_skewed_packed_stream_losers_across_tiles_and_files(self):
+        early = "2026-09-30T23:59:59Z"
+        moved_ts = "2026-10-01T01:00:00Z"
+        count = 2300
+        events = [ev(f"e{i}", "alias", WS) for i in range(count)]
+        events[100] = ev("e100", "alias", WS, "purchase", price="31")
+        events[128] = ev("e128", "alias", WS, "purchase", price="42")
+        events.append(ev("long-event-identifier", "alias", WS, price="x" * ((8 << 20) + 10)))
+        copies = [
+            ev(f'"e{i}"', "", WS, ingest=early)
+            for i in (0, 63, 64, 100, 127, 2047, 2048, count - 1)
+        ]
+        copies += [
+            ev("e65", "alias", WS, price='bad"quote', ingest=early),
+            ev("e129", "é-standalone-user", moved_ts, ingest=early),
+            "",  # an empty physical line is malformed
+        ]
+        users, _ = run_case(events, links=["alias,a"], extra={"events/part-1.csv": copies})
+        self.assertEqual(set(users), {("a", "2026-10-01"), ("é-standalone-user", "2026-10-01")})
+        self.assertEqual(users[("a", "2026-10-01")]["events"], count - 8)
+        self.assertEqual(users[("a", "2026-10-01")]["revenue_cents"], 42)
+        self.assertEqual(users[("é-standalone-user", "2026-10-01")]["events"], 1)
+
     def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
         stamp = "2026-10-03T10:00:00Z"
         early = "2026-10-03T09:59:59Z"

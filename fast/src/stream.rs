@@ -1,6 +1,6 @@
 //! Most events carry only a temporal key. Purchases carry their own full
 //! payload until dedup, then contribute a key to the temporal stream as well.
-use super::{Identity, People};
+use super::People;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Wide {
@@ -117,7 +117,7 @@ impl<T> Default for Stream<T> {
 
 impl<T: Copy> Stream<T> {
     #[inline]
-    fn push(&mut self, key: T, price: u32, cat: u32) -> usize {
+    pub fn push(&mut self, key: T, price: u32, cat: u32) -> usize {
         if price == 0 {
             let i = self.times.len();
             self.times.push(key);
@@ -132,34 +132,8 @@ impl<T: Copy> Stream<T> {
 
 #[derive(Default)]
 pub(super) struct Payload {
-    pub packed: Stream<u64>,
+    pub packed_purchases: Vec<Purchase<u64>>,
     pub wide: Stream<Wide>,
-}
-
-impl Payload {
-    #[inline]
-    pub fn push(
-        &mut self,
-        identity: Identity,
-        ts: i64,
-        price: u32,
-        cat: u32,
-        packing: Option<Packing>,
-        people: &People,
-    ) -> usize {
-        let purchase = usize::from(price != 0);
-        let person = match identity {
-            Identity::Linked(routed) => {
-                let rank = routed as u32;
-                if let Some(p) = packing {
-                    return self.packed.push(p.encode(rank, ts), price, cat) * 4 + purchase;
-                }
-                people.original(rank)
-            }
-            Identity::Standalone(person) => person,
-        };
-        self.wide.push(Wide { person, ts }, price, cat) * 4 + 2 + purchase
-    }
 }
 
 #[cfg(test)]

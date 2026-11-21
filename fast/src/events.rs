@@ -2,9 +2,12 @@
 //! stream of claims (ID, ingest time, payload location) decides which payloads
 //! must be removed. In particular, an invalid copy has a claim but no payload.
 use super::*;
+use crate::stream::{Purchase, Wide};
 use std::hash::{BuildHasherDefault, Hasher};
 
+mod tiles;
 mod word;
+use tiles::Tiles;
 
 #[derive(Clone, Copy)]
 struct Claim {
@@ -13,8 +16,9 @@ struct Claim {
 }
 
 // An emitted event has at least six commas. At most one row extends past
-// CHUNK, so the stream kind, per-stream ordinal and shard fit in the claim.
-const _: () = assert!(NS == 256 && (CHUNK / 6 + 1) * 4 * NS < u32::MAX as usize);
+// CHUNK. Packed slots include all first extents and at most one partial
+// overflow tile per shard. The slot, stream kind and shard still fit.
+const _: () = assert!(NS == 256 && (CHUNK / 6 + 1 + NS * (tiles::FIRST + tiles::TILE)) * 4 * NS < u32::MAX as usize);
 const NONE: u32 = u32::MAX;
 const KEY_BITS: u32 = u64::BITS - NS.trailing_zeros();
 const KEY_MASK: u64 = (1 << KEY_BITS) - 1;
@@ -147,41 +151,118 @@ fn decode_fields<'a>(
     Some(next)
 }
 
+pub(super) struct PackedTimes(Tiles<u64>);
+
+impl PackedTimes {
+    pub fn len(&self, shard: usize) -> usize {
+        self.0.len(shard)
+    }
+
+    pub fn append_to(&self, shard: usize, times: &mut Vec<u64>) {
+        if self.0.has_dead(shard) {
+            for tile in self.0.slices(shard) {
+                times.extend(tile.iter().copied().filter(|&k| k != u64::MAX));
+            }
+        } else {
+            for tile in self.0.slices(shard) {
+                times.extend_from_slice(tile);
+            }
+        }
+    }
+}
+
+struct Batch {
+    packed: PackedTimes,
+    payload: Vec<Payload>,
+}
+
+impl Batch {
+    #[inline]
+    fn route(&mut self, identity: Identity, e: Pending, packing: Option<Packing>, people: &People) -> u32 {
+        let (p, person) = match identity {
+            Identity::Linked(routed) => {
+                let p = shard(routed);
+                let rank = routed as u32;
+                if let Some(pack) = packing {
+                    let key = pack.encode(rank, e.ts);
+                    let slot = if e.price == 0 {
+                        self.packed.0.push(p, key) * 4
+                    } else {
+                        let purchases = &mut self.payload[p].packed_purchases;
+                        let i = purchases.len();
+                        purchases.push(Purchase {
+                            key,
+                            price: e.price,
+                            cat: e.cat,
+                        });
+                        i * 4 + 1
+                    };
+                    return (slot * NS + p) as u32;
+                }
+                (p, people.original(rank))
+            }
+            Identity::Standalone(person) => (shard(person), person),
+        };
+        let key = Wide { person, ts: e.ts };
+        let slot = self.payload[p].wide.push(key, e.price, e.cat) * 4 + 2 + usize::from(e.price != 0);
+        (slot * NS + p) as u32
+    }
+
+    fn prune(&mut self, locations: Vec<u32>) {
+        let mut prune_payload = false;
+        for target in locations {
+            let x = target as usize;
+            let p = x % NS;
+            let slot = x / NS;
+            let index = slot / 4;
+            match slot % 4 {
+                0 => self.packed.0.mark_dead(p, index, u64::MAX),
+                kind => {
+                    prune_payload = true;
+                    let bucket = &mut self.payload[p];
+                    match kind {
+                        1 => bucket.packed_purchases[index].price = 0,
+                        2 => bucket.wide.times[index].ts = BAD,
+                        _ => bucket.wide.purchases[index].price = 0,
+                    }
+                }
+            }
+        }
+        if prune_payload {
+            for dest in &mut self.payload {
+                dest.packed_purchases.retain(|p| p.price != 0);
+                dest.wide.times.retain(|key| key.ts != BAD);
+                dest.wide.purchases.retain(|p| p.price != 0);
+            }
+        }
+    }
+}
+
 fn parse<'a>(
     c: &Chunk<'a>,
     sm: &Small,
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
-) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
-    let reserve = reserve_per_shard(c.data);
-    let mut payload: Vec<Payload> = (0..NS)
-        .map(|_| {
-            let mut p = Payload::default();
-            p.wide
-                .times
-                .reserve(if packing.is_some() { reserve / 2 } else { reserve });
-            if packing.is_some() {
-                p.packed.times.reserve(reserve / 2);
-            }
-            p
-        })
-        .collect();
-    let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
+) -> (Batch, Tiles<Claim>, Vec<i64>) {
+    let mut batch = Batch {
+        packed: PackedTimes(Tiles::new()),
+        payload: (0..NS).map(|_| Payload::default()).collect(),
+    };
+    let mut claims = Tiles::new();
     let mut spill = Vec::new();
     let mut emit = |e: Pending| {
         let mut target = NONE;
         if e.uid != 0 {
             let person = people.lookup(e.uid, e.hash);
-            let p = shard(match person {
-                Identity::Linked(routed) | Identity::Standalone(routed) => routed,
-            });
-            let slot = payload[p].push(person, e.ts, e.price, e.cat, packing, people);
-            target = (slot * NS + p) as u32;
+            target = batch.route(person, e, packing, people);
         }
         // This shard supplies the omitted high bits; within it equality of
         // the stored low bits is equality of the full byte-exact ID token.
-        claims[(e.claim_key >> KEY_BITS) as usize].push(Claim::new(e.claim_key, target, e.claim_order));
+        claims.push(
+            (e.claim_key >> KEY_BITS) as usize,
+            Claim::new(e.claim_key, target, e.claim_order),
+        );
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
@@ -199,7 +280,7 @@ fn parse<'a>(
     for i in n.saturating_sub(ring.len())..n {
         emit(ring[i % ring.len()]);
     }
-    (payload, claims, spill)
+    (batch, claims, spill)
 }
 
 #[inline]
@@ -232,8 +313,14 @@ fn prefetch(bloom: &[(u64, u64)], c: Claim, mask: usize) {
     let _ = ptr;
 }
 
-fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location> {
-    let n: usize = parts.iter().map(|(_, v)| v.len()).sum();
+fn losers<'a, I: Iterator<Item = (usize, &'a [Claim])>>(
+    parts: impl Fn() -> I,
+    n: usize,
+    spills: &[Vec<i64>],
+) -> Vec<Location> {
+    if n < 2 {
+        return Vec::new();
+    }
     // Local blocked Bloom: the second occurrence of any ID necessarily finds
     // both bits already set and marks it suspect. False positives go to an
     // EXACT key table. The second pass therefore includes the *first* claim of
@@ -242,7 +329,7 @@ fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location>
     let mut bloom = vec![(0u64, 0u64); words];
     let mask = (words - 1) & KEY_MASK as usize;
     let mut suspects = 0usize;
-    for (_, claims) in &parts {
+    for (_, claims) in parts() {
         for (j, &c) in claims.iter().enumerate() {
             if let Some(&next) = claims.get(j + 6) {
                 prefetch(&bloom, next, mask);
@@ -261,7 +348,7 @@ fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location>
         return remove;
     }
     let mut best = HashMap::with_capacity_and_hasher(suspects, BuildHasherDefault::<ClaimHasher>::default());
-    for (batch, claims) in parts {
+    for (batch, claims) in parts() {
         for (j, &c) in claims.iter().enumerate() {
             if let Some(&next) = claims.get(j + 6) {
                 prefetch(&bloom, next, mask);
@@ -303,7 +390,7 @@ pub(super) fn by_person<'a>(
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
     log: &impl Fn(&str),
-) -> Vec<Vec<Payload>> {
+) -> (Vec<PackedTimes>, Vec<Vec<Payload>>) {
     let parsed: Vec<_> = chunks
         .par_iter()
         .map(|c| parse(c, sm, people, window, packing))
@@ -311,47 +398,37 @@ pub(super) fn by_person<'a>(
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
     let mut spills = Vec::with_capacity(parsed.len());
-    let mut claims: Vec<Vec<_>> = (0..NS).map(|_| Vec::new()).collect();
-    for (batch, (payload, cs, spill)) in parsed.into_iter().enumerate() {
+    let mut claims = Vec::with_capacity(parsed.len());
+    for (payload, cs, spill) in parsed {
         payloads.push(payload);
         spills.push(spill);
-        for (bucket, c) in claims.iter_mut().zip(cs) {
-            if !c.is_empty() {
-                bucket.push((batch, c));
-            }
-        }
+        claims.push(cs);
     }
-    let removals: Vec<_> = claims.into_par_iter().map(|parts| losers(parts, &spills)).collect();
+    let removals: Vec<_> = (0..NS)
+        .into_par_iter()
+        .map(|shard| {
+            let n = claims.iter().map(|c| c.len(shard)).sum();
+            let parts = || {
+                claims
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(batch, c)| c.slices(shard).map(move |s| (batch, s)))
+            };
+            losers(parts, n, &spills)
+        })
+        .collect();
+    drop(claims);
     let mut by_batch: Vec<Vec<u32>> = (0..payloads.len()).map(|_| Vec::new()).collect();
     for locations in removals {
         for loc in locations {
             by_batch[loc.batch].push(loc.target);
         }
     }
-    payloads.par_iter_mut().zip(by_batch).for_each(|(payload, locations)| {
-        if locations.is_empty() {
-            return;
-        }
-        for target in locations {
-            let x = target as usize;
-            let bucket = &mut payload[x % NS];
-            let slot = x / NS;
-            let index = slot / 4;
-            match slot % 4 {
-                0 => bucket.packed.times[index] = u64::MAX,
-                1 => bucket.packed.purchases[index].price = 0,
-                2 => bucket.wide.times[index].ts = BAD,
-                _ => bucket.wide.purchases[index].price = 0,
-            }
-        }
-        for dest in payload {
-            dest.packed.times.retain(|&key| key != u64::MAX);
-            dest.packed.purchases.retain(|p| p.price != 0);
-            dest.wide.times.retain(|key| key.ts != BAD);
-            dest.wide.purchases.retain(|p| p.price != 0);
-        }
-    });
     payloads
+        .par_iter_mut()
+        .zip(by_batch)
+        .for_each(|(batch, locations)| batch.prune(locations));
+    payloads.into_iter().map(|b| (b.packed, b.payload)).unzip()
 }
 
 #[cfg(test)]
@@ -368,7 +445,10 @@ mod tests {
         assert_eq!(probe(later, 1023), probe(distinct, 1023));
         let mut spill = Vec::new();
         let invalid = Claim::new(id, NONE, Claim::order(1234, BAD, &mut spill));
-        let lost = losers(vec![(0, vec![later, distinct]), (1, vec![invalid])], &[vec![], spill]);
+        let first = [later, distinct];
+        let second = [invalid];
+        let parts = || [(0, first.as_slice()), (1, second.as_slice())].into_iter();
+        let lost = losers(parts, 3, &[vec![], spill]);
         assert_eq!(lost.len(), 1);
         assert_eq!((lost[0].batch, lost[0].target), (0, 0));
     }
