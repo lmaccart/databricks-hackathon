@@ -9,7 +9,7 @@ test:            ## reference edge cases
 	python3 -m unittest discover -s tests -v
 
 build:           ## release build of the fast pipeline
-	cd fast && cargo build --release
+	cd fast && cargo build --locked --release
 
 test-bin: build  ## same edge cases against the binary
 	SS_BIN=$(BIN) python3 -m unittest discover -s tests

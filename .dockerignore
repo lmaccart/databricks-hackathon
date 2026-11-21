@@ -1,0 +1,6 @@
+**
+!fast/
+!fast/Cargo.toml
+!fast/Cargo.lock
+!fast/src/
+!fast/src/**
