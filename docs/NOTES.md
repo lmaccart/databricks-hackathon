@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Semantic minute/residue clock trial — 2026-11-21
+
+The `branchclock` experiment replaces event, ingest-claim, session, purchase and click comparisons with one exact semantic instant: UTC minute plus the monotone residue `second * 1024 + millisecond`. F1/F2 take the UTC minute directly from guarded ASCII digit pairs and an exact manifest-derived day rank; offsets subtract minutes with date wrap. F3 first passes the exact digit/overflow parser, then maps to minute and residue. Packed linked-person keys carry a manifest-relative ladder code; wide keys retain the same `Moment`.
+
+Lateness and click-window checks compare minute deltas and inspect residue only at the exact 24-hour or seven-day boundary. Session components accept same-minute events without comparing their residues, reject minute deltas over 30 immediately, and compare residues only at exactly 30 minutes. The session start's day comes from its UTC minute. Wide time ranges remain on the exact uncompressed path; subsecond and otherwise non-inline ingest order remains exact in the claim spill.
+
+Correctness-only validation: 21 Rust tests, 40 reference and binary edge tests, all 36 official fixtures, dev answer (117,038 user rows and 27,400 campaign rows; zero differences), and 10 dirty generator seeds at 30k events all matched. Per the experiment request, no 20M timing or heavy local benchmark was run. This is not a speed claim or a final-pick recommendation until an isolated paired timing exists.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

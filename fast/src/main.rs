@@ -27,10 +27,9 @@ mod stream;
 use links::{Identity, People, person_names};
 use person::Codec;
 use stream::{Packing, Payload, Stream, Temporal};
+use ts::Moment;
 
-const DAY: i64 = 86_400_000;
-const GAP: i64 = 1_800_000;
-const WEEK: i64 = 7 * DAY;
+const WEEK_MINUTES: i64 = 7 * 24 * 60;
 const BAD: i64 = i64::MIN;
 const MAX_PRICE: i64 = 10_000_000;
 const NS: usize = 256; // shards for every hash partition
@@ -170,7 +169,7 @@ fn read_small<'a>(prod: &'a [u8], camp: &'a [u8], pp: &Path, cp: &Path) -> Small
 #[derive(Clone, Copy)]
 struct PCl {
     person: u64,
-    ts: i64,
+    ts: Moment,
     cid: u64,
     camp: u32,
 }
@@ -224,7 +223,7 @@ struct Clicks {
 fn parse_clicks<'a>(
     c: &Chunk<'a>,
     sm: &Small,
-    window: (i64, i64, &ManifestClock),
+    window: (Moment, Moment, &ManifestClock),
     names: &People<'a>,
     packed: bool,
 ) -> Vec<Clicks> {
@@ -241,7 +240,7 @@ fn parse_clicks<'a>(
         uid: u64,
         hash: u64,
         cid: u64,
-        ts: i64,
+        ts: Moment,
         camp: u32,
     }
     let mut emit = |row: PendingClick| {
@@ -266,8 +265,10 @@ fn parse_clicks<'a>(
             return;
         }
         let Some(ci) = sm.camp_idx.get(camp) else { return };
-        let ts = clock.parse_ts(r[3]);
-        if ts == BAD || ts < lo || ts >= we {
+        let Some(ts) = clock.parse_time(r[3]) else {
+            return;
+        };
+        if ts < lo || ts >= we {
             return;
         }
         let key = names.codec.key(uid);
@@ -386,10 +387,10 @@ fn process_stream<T: Temporal>(
             // one session is evs[k..m]
             let start = evs[k].ts(layout);
             let mut m = k + 1;
-            while m < j && evs[m].gap(evs[m - 1]) <= GAP as u64 {
+            while m < j && evs[m].joins_after(evs[m - 1], layout) {
                 m += 1;
             }
-            let day = start.div_euclid(DAY) as i32;
+            let day = start.utc_day() as i32;
             if day != cur_day {
                 if cur_day != i32::MIN {
                     let top = top_category(&catsum, &sm.cat_rank);
@@ -439,7 +440,7 @@ fn process_stream<T: Temporal>(
                 cnt[c] += 1;
                 hi += 1;
             }
-            while lo < hi && clicks[lo].ts < start.saturating_sub(WEEK) {
+            while lo < hi && clicks[lo].ts < start.minus_minutes(WEEK_MINUTES) {
                 let c = clicks[lo].camp as usize;
                 cnt[c] -= 1;
                 if cnt[c] == 0 {
@@ -526,10 +527,12 @@ fn main() {
 
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(data.join("manifest.json")).expect("manifest")).expect("json");
-    let ws = parse_ts(manifest["window_start"].as_str().unwrap().as_bytes());
-    let we = parse_ts(manifest["window_end"].as_str().unwrap().as_bytes());
-    assert!(ws != BAD && we != BAD);
-    let clock = ManifestClock::new(ws, we);
+    let ws_ms = parse_ts(manifest["window_start"].as_str().unwrap().as_bytes());
+    let we_ms = parse_ts(manifest["window_end"].as_str().unwrap().as_bytes());
+    assert!(ws_ms != BAD && we_ms != BAD);
+    let ws = Moment::from_epoch_ms(ws_ms);
+    let we = Moment::from_epoch_ms(we_ms);
+    let clock = ManifestClock::new(ws_ms, we_ms);
 
     let pf = File::open(data.join("products.csv")).expect("products.csv");
     let cf = File::open(data.join("campaigns.csv")).expect("campaigns.csv");
@@ -563,7 +566,15 @@ fn main() {
 
     let cl_by_person = cl_chunks
         .par_iter()
-        .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names, packing.is_some()))
+        .map(|c| {
+            parse_clicks(
+                c,
+                &sm,
+                (ws.minus_minutes(WEEK_MINUTES), we, &clock),
+                &names,
+                packing.is_some(),
+            )
+        })
         .collect();
     log("clicks routed");
 

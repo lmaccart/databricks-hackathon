@@ -160,5 +160,35 @@ class CategoryCounts(unittest.TestCase):
                 })
 
 
+class SemanticTimeBoundaries(unittest.TestCase):
+    def test_gap_ladder_across_epoch_with_f1_f2_and_f3(self):
+        events = [
+            ev("a", "u", "1969-12-31T23:40:00Z"),
+            ev("b", "u", "1970-01-01T00:10:00+00:00"),
+            ev("c", "u", "2400001"),  # 00:40:00.001Z, one millisecond over the gap
+        ]
+        users, _ = run_case(
+            events=events,
+            window=("1969-12-31T00:00:00Z", "1970-01-02T00:00:00Z"),
+        )
+        self.assertEqual(
+            {k: (r["sessions"], r["events"]) for k, r in users.items()},
+            {("u", "1969-12-31"): (1, 2), ("u", "1970-01-01"): (1, 1)},
+        )
+
+    def test_click_window_keeps_exact_seven_day_edge_but_not_plus_one_ms(self):
+        start = ms("2026-10-10T00:00:00Z")
+        events = [ev("a", "exact", stamp(start)), ev("b", "late", stamp(start))]
+        clicks = [
+            f"exact-click,exact,c_1,{stamp(start - 7 * DAY)}",
+            f"late-click,late,c_2,{stamp(start - 7 * DAY - 1)}",
+        ]
+        _, campaigns = run_case(events=events, clicks=clicks)
+        self.assertEqual(campaigns[("c_1", "2026-10-10")]["sessions"], 1)
+        self.assertEqual(campaigns[("c_1", "2026-10-10")]["assisted_sessions"], 1)
+        self.assertEqual(campaigns[("organic", "2026-10-10")]["sessions"], 1)
+        self.assertNotIn(("c_2", "2026-10-10"), campaigns)
+
+
 if __name__ == "__main__":
     unittest.main()

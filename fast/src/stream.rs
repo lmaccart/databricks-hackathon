@@ -1,23 +1,24 @@
 //! Most events carry only a temporal key. Purchases carry their own full
 //! payload until dedup, then contribute a key to the temporal stream as well.
 use super::{Identity, People};
+use crate::ts::Moment;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Wide {
     pub person: u64,
-    pub ts: i64,
+    pub ts: Moment,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct Packing {
-    origin: i64,
+    origin: Moment,
     bits: u32,
     mask: u64,
 }
 
 impl Packing {
-    pub fn new(ws: i64, we: i64, ranks: usize) -> Option<Self> {
-        let span = (we as i128 - ws as i128 - 1).try_into().ok()?;
+    pub fn new(ws: Moment, we: Moment, ranks: usize) -> Option<Self> {
+        let span = (we.code() - ws.code() - 1).try_into().ok()?;
         let bits = u64::BITS - u64::leading_zeros(span);
         let rank_bits = usize::BITS - ranks.checked_sub(1)?.leading_zeros();
         // The top bit stays clear, leaving u64::MAX as a tombstone.
@@ -32,17 +33,17 @@ impl Packing {
     }
 
     #[inline]
-    pub fn encode(self, rank: u32, ts: i64) -> u64 {
-        (u64::from(rank) << self.bits) | (ts as u64).wrapping_sub(self.origin as u64)
+    pub fn encode(self, rank: u32, ts: Moment) -> u64 {
+        (u64::from(rank) << self.bits) | (ts.code() - self.origin.code()) as u64
     }
 }
 
 pub(super) trait Temporal: Copy + Ord {
     type Layout: Copy;
     fn person(self, layout: Self::Layout) -> u64;
-    fn ts(self, layout: Self::Layout) -> i64;
+    fn ts(self, layout: Self::Layout) -> Moment;
     // Only compared within one person's ordered keys.
-    fn gap(self, prev: Self) -> u64;
+    fn joins_after(self, prev: Self, layout: Self::Layout) -> bool;
     fn name(person: u64, people: &People) -> u64;
 }
 
@@ -55,13 +56,13 @@ impl Temporal for Wide {
     }
 
     #[inline]
-    fn ts(self, (): ()) -> i64 {
+    fn ts(self, (): ()) -> Moment {
         self.ts
     }
 
     #[inline]
-    fn gap(self, prev: Self) -> u64 {
-        self.ts.abs_diff(prev.ts)
+    fn joins_after(self, prev: Self, (): ()) -> bool {
+        self.ts.joins_after(prev.ts)
     }
 
     #[inline]
@@ -79,13 +80,16 @@ impl Temporal for u64 {
     }
 
     #[inline]
-    fn ts(self, pack: Packing) -> i64 {
-        (self & pack.mask).wrapping_add(pack.origin as u64) as i64
+    fn ts(self, pack: Packing) -> Moment {
+        Moment::from_code(pack.origin.code() + i128::from(self & pack.mask))
     }
 
     #[inline]
-    fn gap(self, prev: Self) -> u64 {
-        self - prev
+    fn joins_after(self, prev: Self, pack: Packing) -> bool {
+        let a = pack.origin.code() + i128::from(self & pack.mask);
+        let b = pack.origin.code() + i128::from(prev & pack.mask);
+        let minutes = a.div_euclid(65_536) - b.div_euclid(65_536);
+        minutes < 30 || (minutes == 30 && a.rem_euclid(65_536) <= b.rem_euclid(65_536))
     }
 
     #[inline]
@@ -141,7 +145,7 @@ impl Payload {
     pub fn push(
         &mut self,
         identity: Identity,
-        ts: i64,
+        ts: Moment,
         price: u32,
         cat: u32,
         packing: Option<Packing>,
@@ -168,18 +172,36 @@ mod tests {
 
     #[test]
     fn packing_checks_total_width_and_preserves_signed_millisecond_order() {
-        let p = Packing::new(-5000, 5000, 4).unwrap();
-        assert!(p.encode(1, -5000) > p.encode(0, 4999));
-        assert!(p.encode(1, -1) < p.encode(1, 0));
-        assert_eq!(p.encode(3, -5000).ts(p), -5000);
-        assert_eq!(p.encode(3, 4999).ts(p), 4999);
-        assert_eq!(p.encode(3, 4999).person(p), 3);
-        assert!(Packing::new(i64::MIN + 1, i64::MAX, 4).is_none());
-        assert!(Packing::new(0, 1i64 << 48, 1 << 17).is_none());
-        let p = Packing::new(0, 1i64 << 31, u32::MAX as usize).unwrap();
+        let p = Packing::new(Moment::from_epoch_ms(-5000), Moment::from_epoch_ms(5000), 4).unwrap();
+        assert!(p.encode(1, Moment::from_epoch_ms(-5000)) > p.encode(0, Moment::from_epoch_ms(4999)));
+        assert!(p.encode(1, Moment::from_epoch_ms(-1)) < p.encode(1, Moment::from_epoch_ms(0)));
+        assert_eq!(p.encode(3, Moment::from_epoch_ms(-5000)).ts(p).epoch_ms(), -5000);
+        assert_eq!(p.encode(3, Moment::from_epoch_ms(4999)).ts(p).epoch_ms(), 4999);
+        assert_eq!(p.encode(3, Moment::from_epoch_ms(4999)).person(p), 3);
+        assert!(Packing::new(Moment::from_epoch_ms(i64::MIN + 1), Moment::from_epoch_ms(i64::MAX), 4,).is_none());
+        assert!(Packing::new(Moment::from_epoch_ms(0), Moment::from_epoch_ms(1i64 << 48), 1 << 17,).is_none());
+        let p = Packing::new(
+            Moment::from_epoch_ms(0),
+            Moment::from_epoch_ms(1i64 << 30),
+            u32::MAX as usize,
+        )
+        .unwrap();
         assert_eq!(
-            p.encode(u32::MAX - 1, (1i64 << 31) - 1).person(p),
+            p.encode(u32::MAX - 1, Moment::from_epoch_ms((1i64 << 30) - 1))
+                .person(p),
             (u32::MAX - 1) as u64
         );
+    }
+
+    #[test]
+    fn packed_components_resolve_only_the_exact_minute_boundary() {
+        let p = Packing::new(Moment::from_epoch_ms(-3_600_000), Moment::from_epoch_ms(3_600_000), 2).unwrap();
+        let start = p.encode(1, Moment::from_epoch_ms(-1_800_000));
+        let exact = p.encode(1, Moment::from_epoch_ms(0));
+        let over = p.encode(1, Moment::from_epoch_ms(1));
+        let same_minute = p.encode(1, Moment::from_epoch_ms(59_999));
+        assert!(exact.joins_after(start, p));
+        assert!(!over.joins_after(start, p));
+        assert!(same_minute.joins_after(exact, p));
     }
 }

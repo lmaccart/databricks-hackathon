@@ -2,6 +2,7 @@
 //! stream of claims (ID, ingest time, payload location) decides which payloads
 //! must be removed. In particular, an invalid copy has a claim but no payload.
 use super::*;
+use crate::ts::Moment;
 use std::hash::{BuildHasherDefault, Hasher};
 
 #[derive(Clone, Copy)]
@@ -25,13 +26,20 @@ const _: () = assert!(std::mem::size_of::<Claim>() == 16 && ((CHUNK / 6 + 1) as 
 
 impl Claim {
     #[inline]
-    fn order(ingest: i64, seconds: i64, spill: &mut Vec<i64>) -> u64 {
-        if seconds != BAD {
-            debug_assert!((-(SPILL_TAG as i64)..SPILL_TAG as i64).contains(&seconds));
-            seconds as u64
+    fn order(ingest: Option<Moment>, spill: &mut Vec<i64>) -> u64 {
+        if let Some(ingest) = ingest {
+            if let Some(seconds) = ingest
+                .epoch_seconds()
+                .filter(|s| (-(SPILL_TAG as i64)..SPILL_TAG as i64).contains(s))
+            {
+                return seconds as u64;
+            }
+            let i = spill.len() as u64;
+            spill.push(ingest.epoch_ms());
+            SPILL_TAG | i
         } else {
             let i = spill.len() as u64;
-            spill.push(ingest);
+            spill.push(i64::MAX);
             SPILL_TAG | i
         }
     }
@@ -98,7 +106,7 @@ struct Pending {
     claim_key: u64,
     uid: u64, // zero is never the key of a nonempty ID
     hash: u64,
-    ts: i64,
+    ts: Moment,
     claim_order: u64,
     price: u32,
     cat: u32,
@@ -108,7 +116,7 @@ fn parse<'a>(
     c: &Chunk<'a>,
     sm: &Small,
     people: &People<'a>,
-    window: (i64, i64, &ManifestClock),
+    window: (Moment, Moment, &ManifestClock),
     packing: Option<Packing>,
 ) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
     let (ws, we, clock) = window;
@@ -148,15 +156,19 @@ fn parse<'a>(
             return;
         }
         let claim_key = links::mix(people.codec.key(r[0]));
-        let (ingest, seconds) = clock.ingest_for_claim(r[3]);
-        let ts = clock.parse_ts(r[2]);
+        let ingest = clock.parse_time(r[3]);
+        let ts = clock.parse_time(r[2]);
         let mut next = Pending {
             claim_key,
-            ts,
-            claim_order: Claim::order(ingest, seconds, &mut spill),
+            ts: ts.unwrap_or_default(),
+            claim_order: Claim::order(ingest, &mut spill),
             ..Default::default()
         };
-        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
+        if !r[1].is_empty()
+            && !r[5].is_empty()
+            && ts.is_some_and(|ts| (ws..we).contains(&ts))
+            && ts.zip(ingest).is_some_and(|(ts, ingest)| !ingest.is_late_after(ts))
+        {
             let purchase = match r[4] {
                 b"purchase" => parse_price(r[6]),
                 b"view" | b"cart" => Some(0),
@@ -286,7 +298,7 @@ pub(super) fn by_person<'a>(
     chunks: &[Chunk<'a>],
     sm: &Small,
     people: &People<'a>,
-    window: (i64, i64, &ManifestClock),
+    window: (Moment, Moment, &ManifestClock),
     packing: Option<Packing>,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Payload>> {
@@ -326,14 +338,14 @@ pub(super) fn by_person<'a>(
             match slot % 4 {
                 0 => bucket.packed.times[index] = u64::MAX,
                 1 => bucket.packed.purchases[index].price = 0,
-                2 => bucket.wide.times[index].ts = BAD,
+                2 => bucket.wide.times[index].ts = ts::BAD_MOMENT,
                 _ => bucket.wide.purchases[index].price = 0,
             }
         }
         for dest in payload {
             dest.packed.times.retain(|&key| key != u64::MAX);
             dest.packed.purchases.retain(|p| p.price != 0);
-            dest.wide.times.retain(|key| key.ts != BAD);
+            dest.wide.times.retain(|key| key.ts != ts::BAD_MOMENT);
             dest.wide.purchases.retain(|p| p.price != 0);
         }
     });
@@ -353,7 +365,7 @@ mod tests {
         let distinct = Claim::new(alias, 1, 4);
         assert_eq!(probe(later, 1023), probe(distinct, 1023));
         let mut spill = Vec::new();
-        let invalid = Claim::new(id, NONE, Claim::order(1234, BAD, &mut spill));
+        let invalid = Claim::new(id, NONE, Claim::order(Some(Moment::from_epoch_ms(1234)), &mut spill));
         let lost = losers(vec![(0, vec![later, distinct]), (1, vec![invalid])], &[vec![], spill]);
         assert_eq!(lost.len(), 1);
         assert_eq!((lost[0].batch, lost[0].target), (0, 0));
@@ -377,8 +389,8 @@ mod tests {
                     b"9999-12-31T23:59:60Z",
                     b"not a timestamp",
                 ] {
-                    let (ms, secs) = clock.ingest_for_claim(s);
-                    let claim = Claim::new(mixed, target, Claim::order(ms, secs, &mut spill));
+                    let ingest = clock.parse_time(s);
+                    let claim = Claim::new(mixed, target, Claim::order(ingest, &mut spill));
                     assert_eq!(claim.ingest(&spill), ts::parse_ingest(s));
                     assert_eq!(claim.target(), target);
                     let reconstructed = claim.key() | ((mixed >> KEY_BITS) << KEY_BITS);

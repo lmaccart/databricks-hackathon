@@ -13,6 +13,99 @@ const HI: u64 = 0x8080_8080_8080_8080;
 const D: u8 = 0x7F - 9;
 const L: u8 = 0x7F;
 
+/// An exact UTC instant arranged as a civil minute and a monotone subminute
+/// ladder: 64 slots per minute, each with 1024 millisecond ticks per second.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Moment {
+    minute: i64,
+    subminute: u16,
+}
+
+pub const BAD_MOMENT: Moment = Moment {
+    minute: i64::MIN,
+    subminute: 0,
+};
+
+impl Moment {
+    #[inline]
+    pub fn from_epoch_ms(ms: i64) -> Self {
+        let minute = ms.div_euclid(60_000);
+        let in_minute = ms.rem_euclid(60_000) as u16;
+        let second = in_minute / 1000;
+        let millis = in_minute % 1000;
+        Self {
+            minute,
+            subminute: second * 1024 + millis,
+        }
+    }
+
+    #[inline]
+    fn from_minute_second(minute: i64, second: i64) -> Self {
+        Self {
+            minute,
+            subminute: (second as u16) * 1024,
+        }
+    }
+
+    #[inline]
+    pub fn epoch_ms(self) -> i64 {
+        self.minute * 60_000 + i64::from(self.subminute / 1024) * 1000 + i64::from(self.subminute % 1024)
+    }
+
+    #[inline]
+    pub fn code(self) -> i128 {
+        i128::from(self.minute) * 65_536 + i128::from(self.subminute)
+    }
+
+    #[inline]
+    pub fn from_code(code: i128) -> Self {
+        Self {
+            minute: code.div_euclid(65_536) as i64,
+            subminute: code.rem_euclid(65_536) as u16,
+        }
+    }
+
+    #[inline]
+    pub fn utc_day(self) -> i64 {
+        self.minute.div_euclid(1440)
+    }
+
+    #[inline]
+    pub fn minus_minutes(self, minutes: i64) -> Self {
+        Self {
+            minute: self.minute.saturating_sub(minutes),
+            subminute: self.subminute,
+        }
+    }
+
+    /// True when `self` follows `previous` by at most exactly 30 minutes.
+    #[inline]
+    pub fn joins_after(self, previous: Self) -> bool {
+        let minutes = self.minute - previous.minute;
+        minutes >= 0 && (minutes < 30 || (minutes == 30 && self.subminute <= previous.subminute))
+    }
+
+    /// True when `self - earlier` is strictly greater than one exact day.
+    #[inline]
+    pub fn is_late_after(self, earlier: Self) -> bool {
+        if self <= earlier {
+            return false;
+        }
+        let minutes = self.minute - earlier.minute;
+        minutes > 1440 || (minutes == 1440 && self.subminute > earlier.subminute)
+    }
+
+    #[inline]
+    pub fn epoch_seconds(self) -> Option<i64> {
+        if !self.subminute.is_multiple_of(1024) {
+            return None;
+        }
+        self.minute
+            .checked_mul(60)?
+            .checked_add(i64::from(self.subminute / 1024))
+    }
+}
+
 const fn word(b: &[u8; 8]) -> u64 {
     u64::from_le_bytes(*b)
 }
@@ -172,6 +265,7 @@ pub fn parse_ts(s: &[u8]) -> i64 {
 /// `ingest_ts`, which rules.md guarantees is valid F1. A bad one sorts last
 /// (i64::MAX), so such a copy can only lose the dedup or be late.
 #[inline]
+#[cfg(test)]
 pub fn parse_ingest(s: &[u8]) -> i64 {
     match parse_ts(s) {
         BAD => i64::MAX,
@@ -199,10 +293,11 @@ const fn minute_table() -> [i32; 65536] {
 
 static MINUTES: [i32; 65536] = minute_table();
 
+#[derive(Clone, Copy)]
 struct CivilDay {
     first: u64,
     last: u16,
-    midnight_seconds: i64,
+    midnight_minute: i64,
 }
 
 /// Immutable exact date lookup derived from the manifest. A miss always
@@ -261,65 +356,106 @@ impl ManifestClock {
         self.days[d as usize].push(CivilDay {
             first: load8(bytes, 0),
             last: u16::from_le_bytes([bytes[8], bytes[9]]),
-            midnight_seconds: day * 86_400,
+            midnight_minute: day * 1440,
         });
     }
 
-    /// `s` has the F1 length and a date separator at byte 4.
+    /// Find a manifest-derived exact civil-day rank for F1 or F2.
     #[inline]
-    fn f1_seconds(&self, s: &[u8]) -> i64 {
+    fn civil_day(&self, s: &[u8]) -> Option<CivilDay> {
         let tens = s[8].wrapping_sub(b'0');
         let ones = s[9].wrapping_sub(b'0');
-        if tens <= 3 && ones <= 9 {
-            let day = usize::from(tens) * 10 + usize::from(ones);
-            if let Some(entries) = self.days.get(day) {
-                let first = load8(s, 0);
-                let last = u16::from_le_bytes([s[8], s[9]]);
-                for entry in entries {
-                    if entry.first == first && entry.last == last {
-                        let t = load8(s, 10) ^ CLOCK_TEMPLATE;
-                        let last_second = s[18].wrapping_sub(b'0');
-                        if !fits(t, CLOCK_ADD) || last_second > 9 || s[19] != b'Z' {
-                            return BAD;
-                        }
-                        let index = ((b(t, 1) as usize) << 12)
-                            | ((b(t, 2) as usize) << 8)
-                            | ((b(t, 4) as usize) << 4)
-                            | b(t, 5) as usize;
-                        let minute_seconds = MINUTES[index];
-                        let seconds = b(t, 7) * 10 + i64::from(last_second);
-                        if minute_seconds < 0 || seconds > 59 {
-                            return BAD;
-                        }
-                        return entry.midnight_seconds + i64::from(minute_seconds) + seconds;
-                    }
-                }
-            }
+        if tens > 3 || ones > 9 {
+            return None;
         }
-        iso::<false, true>(s)
+        let entries = self.days.get(usize::from(tens) * 10 + usize::from(ones))?;
+        let first = load8(s, 0);
+        let last = u16::from_le_bytes([s[8], s[9]]);
+        entries.iter().copied().find(|e| e.first == first && e.last == last)
     }
 
     #[inline]
-    pub fn parse_ts(&self, s: &[u8]) -> i64 {
-        if s.len() == 20 && s[4] == b'-' {
-            let seconds = self.f1_seconds(s);
-            return if seconds == BAD { BAD } else { seconds * 1000 };
+    fn clock_minute(s: &[u8]) -> Option<(i64, i64)> {
+        let t = load8(s, 10) ^ CLOCK_TEMPLATE;
+        let last_second = s[18].wrapping_sub(b'0');
+        if !fits(t, CLOCK_ADD) || last_second > 9 {
+            return None;
         }
+        let index =
+            ((b(t, 1) as usize) << 12) | ((b(t, 2) as usize) << 8) | ((b(t, 4) as usize) << 4) | b(t, 5) as usize;
+        let minute_seconds = MINUTES[index];
+        let second = b(t, 7) * 10 + i64::from(last_second);
+        (minute_seconds >= 0 && second <= 59).then_some((i64::from(minute_seconds / 60), second))
+    }
+
+    /// `s` has F1 shape; the cached date match validates its complete calendar date.
+    #[inline]
+    fn f1_time(&self, s: &[u8]) -> Option<Moment> {
+        let day = self.civil_day(s)?;
+        if s[19] != b'Z' {
+            return None;
+        }
+        let (minute, second) = Self::clock_minute(s)?;
+        Some(Moment::from_minute_second(day.midnight_minute + minute, second))
+    }
+
+    /// `s` has F2 shape; subtract the signed offset in minutes, including day wrap.
+    #[inline]
+    fn f2_time(&self, s: &[u8]) -> Option<Moment> {
+        let day = self.civil_day(s)?;
+        let (minute, second) = Self::clock_minute(s)?;
+        let sign = s[19];
+        if sign != b'+' && sign != b'-' {
+            return None;
+        }
+        let z = load8(s, 16) ^ (T_F2 | (sign as u64) << 24);
+        let last = s[24].wrapping_sub(b'0');
+        let (oh, om) = (b(z, 4) * 10 + b(z, 5), b(z, 7) * 10 + i64::from(last));
+        if !fits(z, A_F2) || last > 9 || oh > 23 || om > 59 {
+            return None;
+        }
+        let offset = (oh * 60 + om) * if sign == b'-' { -1 } else { 1 };
+        Some(Moment::from_minute_second(
+            day.midnight_minute + minute - offset,
+            second,
+        ))
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub fn parse_ts(&self, s: &[u8]) -> i64 {
         parse_ts(s)
     }
 
-    /// The F1 path supplies both exact milliseconds for the late check
-    /// and seconds for the compact claim. Non-F1 input still uses the sidecar.
+    /// Exact semantic time. Common F1/F2 dates map from raw clock digits;
+    /// cache misses and F3 pass through the exact millisecond parser.
     #[inline]
+    pub fn parse_time(&self, s: &[u8]) -> Option<Moment> {
+        let fast = match s.len() {
+            20 if s[4] == b'-' => self.f1_time(s),
+            25 if s[4] == b'-' => self.f2_time(s),
+            _ => None,
+        };
+        fast.or_else(|| {
+            let ms = parse_ts(s);
+            (ms != BAD).then(|| Moment::from_epoch_ms(ms))
+        })
+    }
+
+    /// Compatibility check for the old seconds/sidecar claim representation.
+    #[inline]
+    #[cfg(test)]
     pub fn ingest_for_claim(&self, s: &[u8]) -> (i64, i64) {
-        if s.len() == 20 && s[4] == b'-' {
-            let seconds = self.f1_seconds(s);
-            if seconds != BAD {
-                return (seconds * 1000, seconds);
+        if let Some(time) = self.parse_time(s) {
+            if s.len() == 20
+                && s[4] == b'-'
+                && let Some(seconds) = time.epoch_seconds()
+            {
+                return (time.epoch_ms(), seconds);
             }
-            return (i64::MAX, BAD);
+            return (time.epoch_ms(), BAD);
         }
-        (parse_ingest(s), BAD)
+        (i64::MAX, BAD)
     }
 }
 
@@ -445,6 +581,11 @@ mod tests {
         };
         assert_eq!(clock.parse_ts(s), ms, "{s:?}");
         assert_eq!(
+            clock.parse_time(s).map(Moment::epoch_ms),
+            (ms != BAD).then_some(ms),
+            "{s:?}"
+        );
+        assert_eq!(
             clock.ingest_for_claim(s),
             (if ms == BAD { i64::MAX } else { ms }, seconds),
             "{s:?}"
@@ -463,6 +604,8 @@ mod tests {
             "2028-04-01T05:06:07Z",
             "2028-05-01T05:06:07Z",
             "2028-05-01T05:60:07Z",
+            "2028-02-29T00:00:00+23:59",
+            "2028-03-01T23:59:59-23:59",
             "00000001791071890001",
             "2028-02-29T23:59:59-23:59",
         ] {
@@ -502,7 +645,7 @@ mod tests {
                     let mut s = *b"0000-00-00T00:00:00Z";
                     s[..8].copy_from_slice(&entry.first.to_le_bytes());
                     s[8..10].copy_from_slice(&entry.last.to_le_bytes());
-                    assert_eq!(entry.midnight_seconds * 1000, want(&s), "{s:?}");
+                    assert_eq!(entry.midnight_minute * 60_000, want(&s), "{s:?}");
                     check_clock(&clock, &s);
                 }
             }
@@ -662,5 +805,25 @@ mod tests {
             }
             check(&s);
         }
+    }
+
+    #[test]
+    fn semantic_time_ladder_is_exact_across_negative_epoch_and_boundaries() {
+        let before = Moment::from_epoch_ms(-1);
+        let midnight = Moment::from_epoch_ms(0);
+        let plus_one = Moment::from_epoch_ms(1);
+        assert_eq!(before.epoch_ms(), -1);
+        assert_eq!(midnight.epoch_ms(), 0);
+        assert_eq!(plus_one.epoch_ms(), 1);
+        assert!(before < midnight && midnight < plus_one);
+
+        let start = Moment::from_epoch_ms(-1_800_000);
+        let exact_gap = Moment::from_epoch_ms(0);
+        let over_gap = Moment::from_epoch_ms(1);
+        assert!(exact_gap.joins_after(start));
+        assert!(!over_gap.joins_after(start));
+        assert!(Moment::from_epoch_ms(86_400_002).is_late_after(Moment::from_epoch_ms(1)));
+        assert!(!Moment::from_epoch_ms(86_400_000).is_late_after(Moment::from_epoch_ms(0)));
+        assert_eq!(midnight.minus_minutes(10_080).epoch_ms(), -604_800_000);
     }
 }
