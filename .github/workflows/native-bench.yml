@@ -78,6 +78,13 @@ jobs:
               echo "image build: $exe $((SECONDS - t0)) s"
               cid=$(docker create "$image")
               docker cp "$cid:/usr/local/bin/shopping_sessions" "$RUNNER_TEMP/$exe"
+              if readelf -d "$RUNNER_TEMP/$exe" | grep 'NEEDED.*libhwy' >/dev/null; then
+                mkdir -p "$RUNNER_TEMP/ss-libs"
+                for so in libhwy.so.1 libhwy_contrib.so.1; do
+                  docker cp -L "$cid:/usr/lib/x86_64-linux-gnu/$so" "$RUNNER_TEMP/ss-libs/$so"
+                done
+                echo "LD_LIBRARY_PATH=$RUNNER_TEMP/ss-libs" >>"$GITHUB_ENV"
+              fi
               docker rm "$cid" >/dev/null
             done
             exit 0
