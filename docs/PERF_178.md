@@ -42,6 +42,10 @@ A [native sampling profile](https://github.com/lmaccart/databricks-hackathon/act
 | [Contiguous identity lanes with direct-address prefetch](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870935655) | 2.093 → 2.096 | 2.073 → 2.054 |
 | [Reuse partition buffers across CSV chunks](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871004196) | 2.094 → 2.126 | 2.124 → 2.065 |
 | [Chronological sweep of compact keys, vs the combined build](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871013465) | 2.435 → 2.482 | 2.436 → 2.477 |
+| [Integrated compact source in the full scale job](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871127261) | 2.098 → **1.896** | 2.107 → **1.872** |
+| [Rank-routed counting sort by linked person, vs combined](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871389196) | 1.870 → 1.879 | 1.855 → 1.872 |
+| [16-byte claims sharing one exact hash permutation, vs combined](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871422064) | 1.933 → 1.869 | 1.920 → 1.873 |
+| [Compile manifest dates into an immutable F1 lookup, vs combined](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871432637) | 1.851 → 1.815 | 1.816 → 1.771 |
 
 The duplicate census roughly halved the time spent resolving claims, but the extra full-input scan cost more than it saved. The deferred-ingest variant had a similar tradeoff: reading the original input again on suspect IDs made duplicate resolution more expensive. The dimension/click change worked on both seeds: the median click phase fell from 0.218 to 0.154 s and from 0.221 to 0.156 s. Its direct table accepts only canonical, unpadded decimal suffixes after an exact learned prefix; all other spellings still use the original byte map.
 

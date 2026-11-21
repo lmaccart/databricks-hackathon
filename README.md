@@ -2,7 +2,7 @@
 
 A native Rust entry for the [Databricks Shopping Sessions buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). It reads the mounted CSVs, resolves linked identities, deduplicates events, sessionizes, attributes clicks and assists, and writes `user_daily/` and `campaign_daily/` as Parquet. [Official rules](docs/rules.md) · [architecture](ARCHITECTURE.md) · [review, measurements and open checks](docs/NOTES.md).
 
-**Official practice:** **1.78 s**, down from **5.03 s** on `cc9f33e` (2.83× faster). The newer compact-event build is not yet officially scored. In [paired Intel runs](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870672021) it cut a further **10.1% and 10.4%** from the 1.78 s build's control on two 20M seeds. Both dev checkers, all 36 official fixtures, 60 independent Python comparisons and every output row on a [60M restricted Docker run](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870718540) matched. [Full timing ledger](docs/PERF_178.md).
+**Official practice:** **1.78 s**, down from **5.03 s** on `cc9f33e` (2.83× faster). In [paired full-container CI](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871127261), the newer compact-event build cut time from **2.163 to 1.962 s at 20M** and **6.725 to 6.116 s at 60M**, against the 1.78 s build's control. All 6,615,971 rows at 60M matched under a 14 GiB no-swap cap. Both dev checkers, 36 official fixtures, and 60 Python-oracle comparisons also passed. [Two-seed trials and results](docs/PERF_178.md).
 
 ## Build and run
 

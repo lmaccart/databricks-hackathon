@@ -1,5 +1,18 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Same-machine, full-container finalist comparison — 2026-11-21 05:36 UTC
+
+[`18d1d8c`](https://github.com/lmaccart/databricks-hackathon/commit/18d1d8ccec2559a5ca0e2fa97690bcc6eeeeb9dd) has exactly the production source and Dockerfile of `91892b1`, tested in [run 44871127261](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871127261). Each row compares it to `4f75f52` on the **same four-worker Intel Xeon 6975P-C**, alternating order after one warmup per build. All runs include process startup and exit; Docker runs also include container creation and removal.
+
+| Input and timing | Pairs | 1.78 s build control | Compact event build | Less time |
+|---|---:|---:|---:|---:|
+| 20M events, 5M clicks, seed 7, native | 5 | 2.098 s | 1.896 s | 9.6% |
+| 20M events, 5M clicks, seed 15, native | 5 | 2.107 s | 1.872 s | 11.2% |
+| 20M events, 5M clicks, seed 7, full Docker | 5 | 2.163 s | **1.962 s** | **9.3%** |
+| 60M events, 15M clicks, seed 13, full Docker | 3 | 6.725 s | **6.116 s** | **9.0%** |
+
+Final-scale Docker used a **14 GiB memory limit with swap disabled**. The three raw 60M pairs were 6.549 → 5.935, 6.851 → 6.172 and 6.725 → 6.116 s. A separate first candidate run on the newly generated data took **11.338 s**; its complete result matched the control: 6,587,957 user-day and 28,014 campaign-day rows, zero differing rows and no duplicate keys. Stdout was empty. This is CI evidence; the confirmed organizer time is still **1.78 s**.
+
 ## Compact event streams and direct click routing — 2026-11-21 UTC
 
 The first combined candidate, `012174f`, uses the canonical link-node rank and a checked timestamp offset as one 64-bit sort key. It puts price and category in a separate purchase stream, and retains the full-width time and person key when packing is impossible. Catalog lookups and click-owner prefetch are included. [Four-worker Intel, five paired process runs per seed](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870672021): **2.087 → 1.876 s** on seed 7 and **2.074 → 1.859 s** on seed 15 (10.1% / 10.4% less wall time vs `4f75f52`). All rows matched on both seeds. Both dev checkers and 36 fixtures matched; all 60 official-generator cases (20 seeds at each of 10k, 100k and 1M) matched the independent Python implementation. [Component and alternative timings](PERF_178.md).
