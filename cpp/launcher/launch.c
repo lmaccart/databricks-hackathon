@@ -9,7 +9,14 @@
  * unreadable folders) goes to the general Rust pipeline, which maps columns by
  * name. The choice never depends on row contents, sizes or IDs.
  *
- * SS_FAST_BIN and SS_GENERAL_BIN override the two executables for native tests.
+ * The fast pipeline also needs AVX-512 VBMI2 to be fast: on an AMD EPYC 7763
+ * (no AVX-512) it took 70-89% longer than the Rust pipeline on warm 20M and 60M
+ * inputs in paired x86 Docker runs (CI runs 44958622548 and 44959388893), while
+ * its authors measured it about 3.5x faster on a Xeon 6975P-C. So it runs only
+ * on x86-64 CPUs that report AVX-512 BW and VBMI2 with OS-enabled ZMM state.
+ *
+ * SS_FAST_BIN and SS_GENERAL_BIN override the two executables for native tests;
+ * SS_FORCE_FAST=1 skips the CPU check (tests on other hosts).
  */
 #include <dirent.h>
 #include <fcntl.h>
@@ -17,6 +24,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__x86_64__)
+#include <cpuid.h>
+#endif
+
+/* AVX-512 BW and VBMI2, and the OS saves opmask/ZMM state (XCR0 bits 1,2,5,6,7). */
+static int cpu_fast(void) {
+#if defined(__x86_64__)
+    unsigned a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & (1u << 27))) return 0; /* OSXSAVE */
+    unsigned lo, hi;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    if ((lo & 0xe6) != 0xe6) return 0;
+    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return 0;
+    return (b & (1u << 30)) && (c & (1u << 6)); /* AVX512BW, AVX512_VBMI2 */
+#else
+    return 0;
+#endif
+}
 
 static const char *data_dir;
 
@@ -97,14 +122,17 @@ int main(int argc, char **argv) {
     const char *general = getenv("SS_GENERAL_BIN");
     if (!fast) fast = "/app/shopping";
     if (!general) general = "/app/shopping-general";
+    const char *force = getenv("SS_FORCE_FAST");
+    int cpu = (force && strcmp(force, "1") == 0) || cpu_fast();
     int canonical = manifest_ok()
         && folder_ok("events", "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents")
         && folder_ok("clicks", "click_id,user_id,campaign_id,ts")
         && folder_ok("links", "user_id_a,user_id_b")
         && file_ok("products.csv", "product_id,category")
         && file_ok("campaigns.csv", "campaign_id,channel");
-    const char *target = canonical ? fast : general;
-    if (!canonical) fprintf(stderr, "[launch] non-canonical input layout: general pipeline\n");
+    const char *target = canonical && cpu ? fast : general;
+    if (!cpu) fprintf(stderr, "[launch] no AVX-512 VBMI2: general pipeline\n");
+    else if (!canonical) fprintf(stderr, "[launch] non-canonical input layout: general pipeline\n");
     argv[0] = (char *)target;
     execv(target, argv);
     perror("[launch] exec");

@@ -3,6 +3,8 @@ BIN ?= $(CURDIR)/build/launch
 # The launcher picks Team 67's binary for canonical layouts and the Rust pipeline otherwise.
 export SS_FAST_BIN ?= $(CURDIR)/build/shopping
 export SS_GENERAL_BIN ?= $(CURDIR)/fast/target/release/shopping_sessions
+# Native tests exercise Team 67's binary on any host; the image checks the CPU.
+export SS_FORCE_FAST ?= 1
 SEEDS ?= 10
 EVENTS ?= 20000
 STARTER ?= vendor/starter-duckdb
