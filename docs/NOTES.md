@@ -1,5 +1,29 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Experimental `packet64` event parser — 2026-11-21
+
+Event-only, 16-row position tiles. AVX2 classifies commas/newlines/quotes;
+word addition matches the next structural byte to each opening quote, including
+across 64-byte boundaries. BMI2 compresses quote flags in delimiter order, and
+SSE2 transposes the positions. A suspect or oversized row is parsed as one
+physical line using the existing scanner; the general header fallback is unchanged.
+ID loads and both clocks fill typed values in column order; the previous tile
+routes behind the next tile's person prefetches. No change to rules or the oracle.
+
+Both dev comparers matched (117,038 user-days and 27,400 campaign-days);
+21 Rust tests (including hostile quote mutations, mixed/boundary cases, and
+exact padded ID loads), 38 Python/binary tests, 36 official fixtures per
+implementation, ten dirty seeds, four small official-generator cases (including
+leap day), and opaque/reordered cases at one and eight workers passed. Clippy
+passed with `-D warnings`. Eight CSV tests also passed on the Rosetta x86-64
+fallback; the AVX2/BMI2 path compiled but Rosetta does not expose those features.
+
+On M2 Pro with four workers, nine alternating pairs on public dev measured
+126 → 124 ms wall (1.0% at full precision; 5/9 pairs faster) and 45 → 45 ms for
+the event parse-and-route phase. This is not a demonstrated speedup. No
+scored-size or AMD timing was collected; keep the scored parser unless a
+same-machine AMD comparison establishes a gain and AVX2/BMI2 parity.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

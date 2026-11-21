@@ -26,6 +26,11 @@ pub fn inline(bytes: &[u8]) -> Option<u64> {
         tmp[..bytes.len()].copy_from_slice(bytes);
         (u64::from_be_bytes(tmp), 0)
     };
+    pack(word, tail)
+}
+
+#[inline(always)]
+fn pack(word: u64, tail: u8) -> Option<u64> {
     if word & HIGH_BITS != 0 || tail > 127 {
         return None;
     }
@@ -58,6 +63,32 @@ impl<'a> Codec<'a> {
     #[inline]
     pub fn key(&self, bytes: &'a [u8]) -> u64 {
         inline(bytes).unwrap_or_else(|| self.intern(bytes))
+    }
+
+    /// As `key`, but a short ID can use one padded load into the *source*.
+    /// Mask off all neighbouring bytes before any validity or identity check.
+    #[inline(always)]
+    pub(crate) fn key_at(&self, data: &'a [u8], start: usize, end: usize) -> u64 {
+        let n = end - start;
+        if n == 0 {
+            return 0; // reserved by the event parser, not passed to the codec
+        }
+        if n <= 9 && data[end - 1] != 0 {
+            let rest = &data[start..];
+            if let Some(word) = rest.first_chunk::<8>() {
+                let word = u64::from_be_bytes(*word);
+                let (word, tail) = if n < 8 {
+                    let high = u64::MAX << ((8 - n) * 8);
+                    (word & high, 0)
+                } else {
+                    (word, if n == 9 { rest[8] } else { 0 })
+                };
+                if let Some(key) = pack(word, tail) {
+                    return key;
+                }
+            }
+        }
+        self.key(&data[start..end])
     }
 
     #[inline]
@@ -127,6 +158,18 @@ mod tests {
         for input in &inputs {
             let key = codec.key(input);
             assert_eq!(codec.bytes(unmix(mix(key)), &mut [0; 9]), input.as_slice());
+        }
+        // Adjacent bytes must not change acceptance or identity, including
+        // ASCII high bits in padding and a final NUL in the actual span.
+        let padded: Vec<_> = inputs
+            .iter()
+            .map(|s| [b"\"".as_slice(), s, b"\xff,\0?????"].concat())
+            .collect();
+        let codec = Codec::new();
+        for (input, data) in inputs.iter().zip(&padded) {
+            let end = 1 + input.len();
+            assert_eq!(codec.key_at(data, 1, end), codec.key(input));
+            assert_eq!(codec.key_at(&data[..end], 1, end), codec.key(input));
         }
     }
 }

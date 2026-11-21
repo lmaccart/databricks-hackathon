@@ -12,6 +12,8 @@ use memchr::memchr;
 use std::marker::PhantomData;
 use std::path::Path;
 
+pub(super) mod packet;
+
 /// Output slot for fields no caller reads (the ninth entry of the row buffer).
 const SKIP: u8 = 8;
 
@@ -394,7 +396,7 @@ mod tests {
         parts.into_iter().map(py_unquote).collect()
     }
 
-    fn py_rows(data: &[u8], cols: &[&str]) -> Rows {
+    pub(super) fn py_rows(data: &[u8], cols: &[&str]) -> Rows {
         if data.is_empty() {
             return vec![];
         }
@@ -436,6 +438,17 @@ mod tests {
     fn kernel_rows(data: &[u8], cols: &[&str], size: usize, kernel: usize) -> Rows {
         let mut out: Rows = vec![];
         for c in chunks_sized(data, cols, Path::new("test.csv"), size) {
+            if kernel == 4 {
+                packet::for_tiles(&c, |batch| match batch {
+                    packet::Batch::Row(r) => out.push(r[..cols.len()].iter().map(|v| v.to_vec()).collect()),
+                    packet::Batch::Tile(tile) => {
+                        out.extend(
+                            (0..tile.len()).map(|i| (0..cols.len()).map(|k| tile.column(k).get(i).to_vec()).collect()),
+                        );
+                    }
+                });
+                continue;
+            }
             let mut f = |r: &[&[u8]; 8]| out.push(r[..cols.len()].iter().map(|v| v.to_vec()).collect());
             let slot = slots(&c);
             match kernel {
@@ -459,6 +472,9 @@ mod tests {
                 "kernel {k} {:?}",
                 String::from_utf8_lossy(data)
             );
+        }
+        if cols.len() == 7 {
+            assert_eq!(kernel_rows(data, cols, size, 4), rows);
         }
         rows
     }
@@ -686,7 +702,7 @@ mod tests {
             if rng.below(2) == 0 {
                 file.pop();
             }
-            check(&file, &["g", "c", "a"]);
+            check(&file, &["g", "c", "a", "b", "d", "e", "f"]);
         }
     }
 }

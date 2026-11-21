@@ -2,6 +2,7 @@
 //! stream of claims (ID, ingest time, payload location) decides which payloads
 //! must be removed. In particular, an invalid copy has a claim but no payload.
 use super::*;
+use crate::csv::packet::{Batch, LANES, Tile, for_tiles};
 use std::hash::{BuildHasherDefault, Hasher};
 
 #[derive(Clone, Copy)]
@@ -104,6 +105,76 @@ struct Pending {
     cat: u32,
 }
 
+#[inline]
+fn decode_tile<'a>(
+    tile: Tile<'a, '_>,
+    sm: &Small,
+    people: &People<'a>,
+    window: (i64, i64, &ManifestClock),
+    spill: &mut Vec<i64>,
+    out: &mut [Pending; LANES],
+) {
+    let (ws, we, clock) = window;
+    let ids = tile.column(0);
+    let times = tile.column(2);
+    let ingests = tile.column(3);
+    let users = tile.column(1);
+    let kinds = tile.column(4);
+    let products = tile.column(5);
+    let prices = tile.column(6);
+    let out = &mut out[..tile.len()];
+    for (i, e) in out.iter_mut().enumerate() {
+        *e = Pending {
+            claim_key: links::mix(ids.key(i, &people.codec)),
+            ..Pending::default()
+        };
+    }
+    for (i, e) in out.iter_mut().enumerate() {
+        e.ts = clock.parse_ts(times.get(i));
+    }
+    let mut eligible = 0u32;
+    for (i, e) in out.iter_mut().enumerate() {
+        let (ingest, seconds) = clock.ingest_for_claim(ingests.get(i));
+        if e.claim_key != 0 {
+            e.claim_order = Claim::order(ingest, seconds, spill);
+            eligible |= u32::from((ws..we).contains(&e.ts) && ingest.saturating_sub(e.ts) <= DAY) << i;
+        }
+    }
+    // Do not intern users of invalid events. Product value/price are only
+    // loaded for purchases. Empty product still invalidates all event kinds.
+    let mut valid = 0u32;
+    while eligible != 0 {
+        let i = eligible.trailing_zeros() as usize;
+        eligible &= eligible - 1;
+        if products.is_empty(i) {
+            continue;
+        }
+        let e = &mut out[i];
+        match kinds.get(i) {
+            b"view" | b"cart" => {}
+            b"purchase" => {
+                let Some(price) = parse_price(prices.get(i)) else {
+                    continue;
+                };
+                e.price = price;
+                e.cat = sm.product_cat.get(products.get(i)).unwrap_or(sm.unknown_cat);
+            }
+            _ => continue,
+        }
+        valid |= 1 << i;
+    }
+    while valid != 0 {
+        let i = valid.trailing_zeros() as usize;
+        valid &= valid - 1;
+        let e = &mut out[i];
+        e.uid = users.key(i, &people.codec);
+        if e.uid != 0 {
+            e.hash = links::mix(e.uid);
+            people.prefetch(e.hash);
+        }
+    }
+}
+
 fn parse<'a>(
     c: &Chunk<'a>,
     sm: &Small,
@@ -128,6 +199,9 @@ fn parse<'a>(
     let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
     let mut spill = Vec::new();
     let mut emit = |e: Pending| {
+        if e.claim_key == 0 {
+            return;
+        }
         let mut target = NONE;
         if e.uid != 0 {
             let person = people.lookup(e.uid, e.hash);
@@ -141,9 +215,29 @@ fn parse<'a>(
         // the stored low bits is equality of the full byte-exact ID token.
         claims[(e.claim_key >> KEY_BITS) as usize].push(Claim::new(e.claim_key, target, e.claim_order));
     };
-    let mut ring = [Pending::default(); 16];
-    let mut n = 0usize;
-    for_rows(c, |r| {
+    let mut typed = [[Pending::default(); LANES]; 2];
+    let mut write = 0;
+    let mut pending = 0;
+    for_tiles(c, |batch| {
+        let r = match batch {
+            Batch::Tile(tile) => {
+                let len = tile.len();
+                decode_tile(tile, sm, people, window, &mut spill, &mut typed[write]);
+                // Resolve the preceding tile after this tile's ID prefetches.
+                // No ID or timestamp needs to be decoded again during routing.
+                write ^= 1;
+                for &e in &typed[write][..pending] {
+                    emit(e);
+                }
+                pending = len;
+                return;
+            }
+            Batch::Row(r) => r,
+        };
+        for &e in &typed[write ^ 1][..pending] {
+            emit(e);
+        }
+        pending = 0;
         if r[0].is_empty() {
             return;
         }
@@ -175,15 +269,10 @@ fn parse<'a>(
                 next.cat = cat;
             }
         }
-        let i = n % ring.len();
-        if n >= ring.len() {
-            emit(ring[i]);
-        }
-        ring[i] = next;
-        n += 1;
+        emit(next);
     });
-    for i in n.saturating_sub(ring.len())..n {
-        emit(ring[i % ring.len()]);
+    for &e in &typed[write ^ 1][..pending] {
+        emit(e);
     }
     (payload, claims, spill)
 }
