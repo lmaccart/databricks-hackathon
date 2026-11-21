@@ -55,7 +55,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 /// F1 (`F2 == false`, 20 bytes) or F2 (25 bytes), or BAD.
 #[inline(always)]
-fn iso<const F2: bool>(s: &[u8]) -> i64 {
+fn iso<const F2: bool, const SECONDS: bool>(s: &[u8]) -> i64 {
     let a = load8(s, 0) ^ T_DATE;
     let t = load8(s, 8) ^ T_TIME;
     let (z, ok, off_min) = if F2 {
@@ -84,8 +84,8 @@ fn iso<const F2: bool>(s: &[u8]) -> i64 {
     if d < 1 || d > mdays {
         return BAD;
     }
-    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se;
-    (secs - off_min * 60) * 1000 // subtract the offset to get UTC
+    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se - off_min * 60;
+    if SECONDS { secs } else { secs * 1000 }
 }
 
 /// Eight ASCII digits (first byte most significant) as a number, or None.
@@ -163,8 +163,8 @@ fn epoch_ms(s: &[u8]) -> i64 {
 pub fn parse_ts(s: &[u8]) -> i64 {
     // s[4] == '-' rules out F3, so F1/F2 syntax decides alone
     match s.len() {
-        20 if s[4] == b'-' => iso::<false>(s),
-        25 if s[4] == b'-' => iso::<true>(s),
+        20 if s[4] == b'-' => iso::<false, false>(s),
+        25 if s[4] == b'-' => iso::<true, false>(s),
         _ => epoch_ms(s),
     }
 }
@@ -176,6 +176,150 @@ pub fn parse_ingest(s: &[u8]) -> i64 {
     match parse_ts(s) {
         BAD => i64::MAX,
         t => t,
+    }
+}
+
+const CLOCK_TEMPLATE: u64 = word(b"T00:00:0");
+const CLOCK_ADD: u64 = word(&[L, D, D, L, D, D, L, D]);
+
+const fn minute_table() -> [i32; 65536] {
+    let mut table = [-1; 65536];
+    let mut hour = 0;
+    while hour < 24 {
+        let mut minute = 0;
+        while minute < 60 {
+            let key = (hour / 10) << 12 | (hour % 10) << 8 | (minute / 10) << 4 | (minute % 10);
+            table[key] = (hour * 3600 + minute * 60) as i32;
+            minute += 1;
+        }
+        hour += 1;
+    }
+    table
+}
+
+static MINUTES: [i32; 65536] = minute_table();
+
+struct CivilDay {
+    first: u64,
+    last: u16,
+    midnight_seconds: i64,
+}
+
+/// Immutable exact date lookup derived from the manifest. A miss always
+/// falls back to the complete Gregorian parser, including for ingest claims.
+pub struct ManifestClock {
+    days: [Vec<CivilDay>; 32],
+}
+
+impl ManifestClock {
+    pub fn new(ws: i64, we: i64) -> Self {
+        const DAY: i64 = 86_400_000;
+        const LIMIT: i64 = 256;
+        let first_valid = days_from_civil(0, 1, 1);
+        let last_valid = days_from_civil(9999, 12, 31);
+        let lo = ws
+            .saturating_sub(8 * DAY)
+            .div_euclid(DAY)
+            .clamp(first_valid, last_valid);
+        let hi = we
+            .saturating_add(2 * DAY)
+            .div_euclid(DAY)
+            .clamp(first_valid, last_valid);
+        let mut clock = Self {
+            days: std::array::from_fn(|_| Vec::new()),
+        };
+        // Very wide windows get both ends, with all other dates using fallback.
+        if hi - lo >= LIMIT {
+            for day in lo..lo + LIMIT / 2 {
+                clock.add_day(day);
+            }
+            for day in hi - LIMIT / 2 + 1..=hi {
+                clock.add_day(day);
+            }
+        } else {
+            for day in lo..=hi {
+                clock.add_day(day);
+            }
+        }
+        clock
+    }
+
+    fn add_day(&mut self, day: i64) {
+        // Inverse proleptic Gregorian conversion, valid for years 0000..9999.
+        let z = day + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = mp + if mp < 10 { 3 } else { -9 };
+        let y = y + i64::from(m <= 2);
+        let date = format!("{y:04}-{m:02}-{d:02}");
+        let bytes = date.as_bytes();
+        self.days[d as usize].push(CivilDay {
+            first: load8(bytes, 0),
+            last: u16::from_le_bytes([bytes[8], bytes[9]]),
+            midnight_seconds: day * 86_400,
+        });
+    }
+
+    /// `s` has the F1 length and a date separator at byte 4.
+    #[inline]
+    fn f1_seconds(&self, s: &[u8]) -> i64 {
+        let tens = s[8].wrapping_sub(b'0');
+        let ones = s[9].wrapping_sub(b'0');
+        if tens <= 3 && ones <= 9 {
+            let day = usize::from(tens) * 10 + usize::from(ones);
+            if let Some(entries) = self.days.get(day) {
+                let first = load8(s, 0);
+                let last = u16::from_le_bytes([s[8], s[9]]);
+                for entry in entries {
+                    if entry.first == first && entry.last == last {
+                        let t = load8(s, 10) ^ CLOCK_TEMPLATE;
+                        let last_second = s[18].wrapping_sub(b'0');
+                        if !fits(t, CLOCK_ADD) || last_second > 9 || s[19] != b'Z' {
+                            return BAD;
+                        }
+                        let index = ((b(t, 1) as usize) << 12)
+                            | ((b(t, 2) as usize) << 8)
+                            | ((b(t, 4) as usize) << 4)
+                            | b(t, 5) as usize;
+                        let minute_seconds = MINUTES[index];
+                        let seconds = b(t, 7) * 10 + i64::from(last_second);
+                        if minute_seconds < 0 || seconds > 59 {
+                            return BAD;
+                        }
+                        return entry.midnight_seconds + i64::from(minute_seconds) + seconds;
+                    }
+                }
+            }
+        }
+        iso::<false, true>(s)
+    }
+
+    #[inline]
+    pub fn parse_ts(&self, s: &[u8]) -> i64 {
+        if s.len() == 20 && s[4] == b'-' {
+            let seconds = self.f1_seconds(s);
+            return if seconds == BAD { BAD } else { seconds * 1000 };
+        }
+        parse_ts(s)
+    }
+
+    /// The F1 path supplies both exact milliseconds for the late check
+    /// and seconds for the compact claim. Non-F1 input still uses the sidecar.
+    #[inline]
+    pub fn ingest_for_claim(&self, s: &[u8]) -> (i64, i64) {
+        if s.len() == 20 && s[4] == b'-' {
+            let seconds = self.f1_seconds(s);
+            if seconds != BAD {
+                return (seconds * 1000, seconds);
+            }
+            return (i64::MAX, BAD);
+        }
+        (parse_ingest(s), BAD)
     }
 }
 
@@ -291,6 +435,93 @@ mod tests {
         "0001791071890000",
         "9223372036854775807",
     ];
+
+    fn check_clock(clock: &ManifestClock, s: &[u8]) {
+        let ms = want(s);
+        let seconds = if ms != BAD && s.len() == 20 && s[4] == b'-' {
+            ms / 1000
+        } else {
+            BAD
+        };
+        assert_eq!(clock.parse_ts(s), ms, "{s:?}");
+        assert_eq!(
+            clock.ingest_for_claim(s),
+            (if ms == BAD { i64::MAX } else { ms }, seconds),
+            "{s:?}"
+        );
+    }
+
+    #[test]
+    fn clock_validates_every_second_and_byte_of_cached_dates() {
+        let clock = ManifestClock::new(parse_ts(b"2028-01-20T00:00:00Z"), parse_ts(b"2028-04-10T00:00:00Z"));
+        // Same day number but distinct YYYY-MM prefixes, including a miss.
+        assert!(clock.days[1].len() >= 3);
+        for s in [
+            "2028-01-01T05:06:07Z",
+            "2028-02-01T05:06:07Z",
+            "2028-03-01T05:06:07Z",
+            "2028-04-01T05:06:07Z",
+            "2028-05-01T05:06:07Z",
+            "2028-05-01T05:60:07Z",
+            "00000001791071890001",
+            "2028-02-29T23:59:59-23:59",
+        ] {
+            check_clock(&clock, s.as_bytes());
+        }
+        for base in [*b"2028-02-29T12:34:56Z", *b"2028-03-01T00:00:00Z"] {
+            for pos in 0..base.len() {
+                for byte in 0..=255 {
+                    let mut input = base;
+                    input[pos] = byte;
+                    check_clock(&clock, &input);
+                }
+            }
+        }
+        for second in 0..86_400 {
+            let s = format!(
+                "2028-02-29T{:02}:{:02}:{:02}Z",
+                second / 3600,
+                second / 60 % 60,
+                second % 60
+            );
+            check_clock(&clock, s.as_bytes());
+        }
+    }
+
+    #[test]
+    fn clock_bounds_cache_on_huge_spans_and_matches_fallback() {
+        for (ws, we) in [
+            (i64::MIN + 1, i64::MAX),
+            (parse_ts(b"0000-01-01T00:00:00Z"), parse_ts(b"9999-12-31T23:59:59Z")),
+            (parse_ts(b"1969-12-30T00:00:00Z"), parse_ts(b"1970-01-02T00:00:00Z")),
+        ] {
+            let clock = ManifestClock::new(ws, we);
+            assert!(clock.days.iter().map(Vec::len).sum::<usize>() <= 256);
+            for entries in &clock.days {
+                for entry in entries {
+                    let mut s = *b"0000-00-00T00:00:00Z";
+                    s[..8].copy_from_slice(&entry.first.to_le_bytes());
+                    s[8..10].copy_from_slice(&entry.last.to_le_bytes());
+                    assert_eq!(entry.midnight_seconds * 1000, want(&s), "{s:?}");
+                    check_clock(&clock, &s);
+                }
+            }
+            for s in [
+                "0000-02-29T23:59:59Z",
+                "0000-02-29T23:59:60Z",
+                "0001-03-01T00:00:00Z",
+                "1969-12-31T23:59:59Z",
+                "1970-01-01T00:00:00Z",
+                "9999-12-31T23:59:59Z",
+                "9999-12-31T23:60:59Z",
+                "9999-12-31T23:59:59-23:59",
+                "999999999999999999999",
+                "9223372036854775807",
+            ] {
+                check_clock(&clock, s.as_bytes());
+            }
+        }
+    }
 
     #[test]
     fn rules_examples() {

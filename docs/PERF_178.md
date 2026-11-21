@@ -1,5 +1,11 @@
 # Optimization trials against the 1.78 s practice build
 
+**Released checkpoint:** [`18d1d8c`](https://github.com/lmaccart/databricks-hackathon/commit/18d1d8ccec2559a5ca0e2fa97690bcc6eeeeb9dd). Direct catalog lookup and click prefetch cut 4.6–5.2% in isolation. Reusing exact linked-person ranks and putting purchase details in a separate stream cut 5.5–7.3%. Together they reduced **full Docker time by 9.3% at practice size and 9.0% at final size** in the [same-machine comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871127261).
+
+Chronological bins were a strong standalone alternative (5.8–7.5%), but replacing the compact sort in the combined build did not produce a further 3% on both seeds. Timing a new strategy against an old control can make it look more valuable than it is against the current best.
+
+## Native two-seed comparisons
+
 Leif reported **1.78 s** for the rebuild. The native comparisons here use `4f75f52` as the immutable control unless a different control is noted. Each row is a separate four-worker Linux/amd64 job; compare **within a row**, since runner CPUs vary. Seed 7 and seed 15 both have 20M events and 5M clicks; seed 15 includes leap day. Each time is the process start-to-exit median of five alternating-order pairs after warmup. The jobs also compare all rows on both inputs and check the published dev answer and 36 fixtures.
 
 A [native sampling profile](https://github.com/lmaccart/databricks-hackathon/actions/runs/44869205518) of the control found 11.0% of on-CPU samples in the event CSV scanner, 9.9% in the timestamp parser, 9.0% in the event routing closure, 8.8% in click parsing, and 6.8% in shopper-table prefetch. Event quicksort and smallsort together accounted for 12.5%. These are sampled symbols with inlining, not percentages of elapsed time. A separate five-pair comparison of the control against itself differed by 0.1% on this runner.
@@ -46,6 +52,10 @@ A [native sampling profile](https://github.com/lmaccart/databricks-hackathon/act
 | [Rank-routed counting sort by linked person, vs combined](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871389196) | 1.870 → 1.879 | 1.855 → 1.872 |
 | [16-byte claims sharing one exact hash permutation, vs combined](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871422064) | 1.933 → 1.869 | 1.920 → 1.873 |
 | [Compile manifest dates into an immutable F1 lookup, vs combined](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871432637) | 1.851 → 1.815 | 1.816 → 1.771 |
+| [Direct array state for rank-routed time bins, vs combined](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871506368) | 1.900 → 1.880 | 1.883 → 1.846 |
+| [Decode paired event/ingest timestamps in AVX2 lanes, vs combined](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871686981) | 2.738 → 2.790 | 2.786 → 2.799 |
+| [16-byte claims and manifest clock, vs the event-stream checkpoint](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871821060) | 1.949 → **1.844** | 1.917 → **1.832** |
+| [Same candidate vs 16-byte claims alone](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871838302) | 1.840 → 1.787 | 1.801 → 1.764 |
 
 The duplicate census roughly halved the time spent resolving claims, but the extra full-input scan cost more than it saved. The deferred-ingest variant had a similar tradeoff: reading the original input again on suspect IDs made duplicate resolution more expensive. The dimension/click change worked on both seeds: the median click phase fell from 0.218 to 0.154 s and from 0.221 to 0.156 s. Its direct table accepts only canonical, unpadded decimal suffixes after an exact learned prefix; all other spellings still use the original byte map.
 

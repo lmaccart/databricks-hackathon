@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Compact duplicate claims and manifest-derived UTC dates — 2026-11-21 UTC
+
+The [`62ad4de` candidate](https://github.com/lmaccart/databricks-hackathon/commit/62ad4dec65ed865cc5dcccc95d013c3954998490) cuts a duplicate claim from 24 to 16 bytes. The shard supplies the high eight bits of a **reversible** 64-bit ID token; the remaining 56 bits are compared exactly within that shard. Whole-second F1 ingests fit as signed seconds through year 9999. Other ingests keep full milliseconds in a per-chunk side table. An immutable clock derived from the actual manifest checks exact UTC date bytes; a miss uses the full timestamp parser.
+
+[Four-worker AMD 9V74](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871821060), versus the already faster `012174f` event-stream checkpoint: **1.949 → 1.844 s** on seed 7 and **1.917 → 1.832 s** on seed 15 (5.4% / 4.4% less time). It won all ten pairs. [Against compact claims alone on Intel](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871838302), the clock saved another 2.8% / 2.0%. Both studies matched all rows.
+
+On the M2 Pro, 60M output matched all 6,615,971 rows and passed a separate schema/uniqueness/aggregate check. Maximum RSS was **8.67 GiB**, down from 9.11 GiB. Three warm 60M pairs against the event-stream checkpoint had medians of **2.322 → 2.178 s**; the two separate 20M Mac medians were mixed (0.866 → 0.776 s; 0.735 → 0.749 s). The entire 60-case Python-oracle corpus matched, including leap day. The [prior event-stream checkpoint also completed the full matrix on Linux/amd64](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871640765).
+
 ## Same-machine, full-container finalist comparison — 2026-11-21 05:36 UTC
 
 [`18d1d8c`](https://github.com/lmaccart/databricks-hackathon/commit/18d1d8ccec2559a5ca0e2fa97690bcc6eeeeb9dd) has exactly the production source and Dockerfile of `91892b1`, tested in [run 44871127261](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871127261). Each row compares it to `4f75f52` on the **same four-worker Intel Xeon 6975P-C**, alternating order after one warmup per build. All runs include process startup and exit; Docker runs also include container creation and removal.

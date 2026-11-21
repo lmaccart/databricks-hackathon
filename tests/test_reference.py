@@ -89,6 +89,47 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
     return f"{eid},{uid},{ts},{ingest},{etype},{pid},{price}"
 
 
+class EventClaims(unittest.TestCase):
+    def test_wide_manifest_cached_and_uncached_ingest_claims(self):
+        ancient = "0001-01-02T00:00:00Z"
+        preepoch = "1969-12-31T23:59:59Z"
+        far = "9999-12-31T00:00:00Z"
+        events = [
+            ev("ancient", "ancient", ancient, ingest=ancient),
+            ev("pre", "pre", preepoch, ingest=preepoch),
+            ev("zero", "zero", "00000000000000000000", ingest=preepoch),
+            ev("far", "far", far, ingest="9999-12-31T23:59:59Z"),
+            ev("far-too-late", "late", "9999-12-30T00:00:00Z", ingest="9999-12-31T00:00:01Z"),
+            ev("drop-cached", "loser", preepoch, ingest=preepoch),
+            ev("drop-uncached", "loser", far, ingest=far),
+        ]
+        copies = [
+            ev("drop-cached", "", preepoch, ingest=ancient),
+            ev("drop-uncached", "", far, ingest=preepoch),
+            ev("pre", "", preepoch, pid='p"1', ingest=ancient),
+        ]
+        users, _ = run_case(events, extra={"events/part-1.csv": copies},
+                            window=("0001-01-01T00:00:00Z", "9999-12-31T23:59:59Z"))
+        self.assertEqual(set(users), {
+            ("ancient", "0001-01-02"), ("pre", "1969-12-31"),
+            ("zero", "1970-01-01"), ("far", "9999-12-31"),
+        })
+
+    def test_exact_bytes_and_distant_ingest_across_files(self):
+        # Quoting does not change identity, but trailing spaces, NULs, Unicode
+        # and prefix extensions do. The distant invalid copy still wins.
+        uid = "a"
+        distinct = ("e1 ", "e1\0", "é1", "e123456789", "e01", "E1")
+        events = [ev(key, uid, WS) for key in ("e1", *distinct)]
+        extra = {"events/part-1.csv": [
+            ev('"e1"', "", WS, ingest="1900-01-01T00:00:00Z"),
+            ev("e1\0", uid, WS, ingest="9999-01-01T00:00:00Z"),
+            ev('"é1"', "", WS, ingest="1900-01-01T00:00:00Z"),
+        ]}
+        users, _ = run_case(events, extra=extra)
+        self.assertEqual(users[(uid, "2026-10-01")]["events"], len(distinct) - 1)
+
+
 class Timestamps(unittest.TestCase):
     def test_forms(self):
         f1 = ms("2026-10-03T23:58:10Z")
@@ -189,6 +230,26 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_line_wider_than_a_parse_chunk_does_not_shift_duplicate_targets(self):
+        t = "2026-10-02T12:00:00Z"
+        early = "2026-10-02T11:59:59Z"
+        # view ignores price, even when that field extends beyond an 8 MiB
+        # parse chunk. Following claims must still identify their own payload.
+        huge = '"' + "x" * (9 << 20) + '"'
+        users, camps = run_case(
+            events=[ev("before", "solo", t, "purchase", "p1", "3"),
+                    ev("huge", "alias", t, price=huge),
+                    ev("loses", "solo", t, "purchase", "p2", "999"),
+                    ev("after", "alias", t, "purchase", "p1", "7")],
+            links=["A,alias"],
+            extra={"events/part-1.csv": [ev("loses", "another", "bad", ingest=early)]},
+        )
+        day = "2026-10-02"
+        self.assertEqual(set(users), {("A", day), ("solo", day)})
+        self.assertEqual((users[("A", day)]["events"], users[("A", day)]["revenue_cents"]), (2, 7))
+        self.assertEqual((users[("solo", day)]["events"], users[("solo", day)]["revenue_cents"]), (1, 3))
+        self.assertEqual(camps[("organic", day)]["revenue_cents"], 10)
+
     def test_purchase_stream_preserves_multiplicity_dedup_and_session_start_day(self):
         before = "2026-10-01T23:55:00Z"
         after = "2026-10-02T00:05:00Z"
