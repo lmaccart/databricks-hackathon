@@ -172,6 +172,11 @@ jobs:
           cargo +1.100.0 build --locked --release --manifest-path fast/Cargo.toml --example input_floor
           echo '### Event input only; no output, joins or sessions' >>"$GITHUB_STEP_SUMMARY"
           RAYON_NUM_THREADS="$t" "$CARGO_TARGET_DIR/release/examples/input_floor" "$RUNNER_TEMP/practice" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ -f fast/src/events/budget.rs ]]; then
+            SS_BENCH_DATA="$RUNNER_TEMP/practice" RAYON_NUM_THREADS="$t" \
+              cargo +1.100.0 test --locked --release --manifest-path fast/Cargo.toml \
+              typed_routing_budget -- --ignored --nocapture | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Sample native on-CPU work
         if: ${{ inputs.profile }}
         shell: bash
