@@ -45,7 +45,7 @@ Measure every change on the 20M official dataset, 5 runs, report the median. Kee
 - [ ] **T10. Shrink rows.** Store event_id / user / click_id as (u64 hash, offset, len) into the mmap; compare bytes only on hash ties. Target EvRow ≤ 32 bytes.
 - [ ] **T11. Fewer passes.** Fuse dedup-shard and person-shard work where possible; avoid the `flat_map` gather copy by pre-sizing per-shard vectors.
 - [ ] **T12. Radix sort** person shards by (hash, ts) instead of `sort_unstable_by`.
-- [ ] **T13. Output.** Try writing Parquet directly (PLAIN, no stats) vs arrow-rs; keep whichever is faster and passes `compare_outputs.py`.
+- [x] **T13. Output.** Sonnet’s typed, uncompressed PLAIN writer uses the Parquet crate’s supported column API and explicitly closes both tables before exit. Official dev answer exact. Integrated 20M median 1.073 → 1.036 s (-3.4%).
 - [ ] **T14. Image and start-up.** Try `FROM scratch` with a static musl build (`x86_64-unknown-linux-musl`, mimalloc or jemalloc for the allocator). Measure container start to exit.
 - [ ] **T15. Thread tuning.** Read `NCPU`; try rayon pool = 8 vs 16; try `CHUNK` 2/4/8/16 MB and `NS` 64/256/1024.
 

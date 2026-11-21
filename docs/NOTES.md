@@ -17,6 +17,7 @@ Leif reports **5.03 s** for `cc9f33e`. At the user-reported 0.68 s lead that is 
 | Parallel identity graph + exact flat lookup vs direct routing | 1.525 s | 1.346 s | 11.7% |
 | Reversible routing token, sampled bucket reservations and consuming gather vs flat lookup | 1.194 s | 1.157 s | 3.1% |
 | Prefetch the canonical-name slot 16 rows ahead vs routing | 1.223 s | 1.089 s | 11.0% |
+| Typed Parquet writer + exit after explicit close vs prefetch | 1.073 s | 1.036 s | 3.4% |
 
 The explicit prefetch hint dereferences no input and is issued only for an in-bounds slot in the live alias table. A small FIFO overlaps that lookup with the next rows' parsing. Other architectures can run the same FIFO without an ISA-specific hint.
 

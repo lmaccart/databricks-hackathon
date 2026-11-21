@@ -12,22 +12,17 @@
 //!   6. write Parquet in parallel
 
 use ahash::RandomState;
-use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
 use memchr::memchr;
 use memmap2::Mmap;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 mod person;
 mod events;
 mod links;
+mod output;
 use person::Codec;
 use links::{People, person_names};
 
@@ -581,21 +576,6 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small) -> ShardOut {
 
 // ------------------------------------------------------------------ output
 
-fn write_batch(path: PathBuf, batch: RecordBatch) {
-    let props = WriterProperties::builder()
-        .set_compression(Compression::UNCOMPRESSED)
-        .set_dictionary_enabled(false)
-        .build();
-    let f = File::create(&path).expect("create parquet");
-    let mut w = ArrowWriter::try_new(f, batch.schema(), Some(props)).expect("writer");
-    w.write(&batch).expect("write");
-    w.close().expect("close");
-}
-
-fn s(b: &[u8]) -> &str {
-    std::str::from_utf8(b).expect("IDs must be UTF-8")
-}
-
 fn main() {
     let t0 = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
@@ -658,65 +638,25 @@ fn main() {
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
 
-    let cbatch = {
-        let rows: Vec<(u64, [i64; 4])> = camps.iter().map(|(k, v)| (*k, *v)).collect();
-        let camp_of = |k: u64| (k >> 32) as u32;
-        let cid = |k: u64| if camp_of(k) == ORGANIC { "organic" } else { s(sm.camp_names[camp_of(k) as usize]) };
-        let ch = |k: u64| if camp_of(k) == ORGANIC { "organic" } else { s(sm.camp_channel[camp_of(k) as usize]) };
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("campaign_id", DataType::Utf8, false),
-            Field::new("channel", DataType::Utf8, false),
-            Field::new("day", DataType::Date32, false),
-            Field::new("sessions", DataType::Int64, false),
-            Field::new("purchasing_sessions", DataType::Int64, false),
-            Field::new("revenue_cents", DataType::Int64, false),
-            Field::new("assisted_sessions", DataType::Int64, false),
-        ]));
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| cid(r.0)))),
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| ch(r.0)))),
-            Arc::new(Date32Array::from_iter_values(rows.iter().map(|r| r.0 as u32 as i32))),
-            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1[0]))),
-            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1[1]))),
-            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1[2]))),
-            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1[3]))),
-        ];
-        RecordBatch::try_new(schema, cols).expect("campaign batch")
-    };
-
-    let uschema = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("events", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("top_category", DataType::Utf8, true),
-    ]));
+    let camp_rows: Vec<output::CampRow> = camps
+        .iter()
+        .map(|(k, v)| {
+            let c = (*k >> 32) as u32;
+            let (campaign, channel) = if c == ORGANIC {
+                (&b"organic"[..], &b"organic"[..])
+            } else {
+                (sm.camp_names[c as usize], sm.camp_channel[c as usize])
+            };
+            output::CampRow { campaign, channel, day: *k as u32 as i32, counts: *v }
+        })
+        .collect();
+    let shards: Vec<&[UserRow]> = outs.iter().map(|o| &o.users[..]).collect();
     let parts = rayon::current_num_threads().clamp(1, 16);
-    let per = NS.div_ceil(parts);
     rayon::join(
-        || write_batch(cd.join("part-0.parquet"), cbatch),
-        || {
-            outs.par_chunks(per).enumerate().for_each(|(pi, group)| {
-                let rows: Vec<&UserRow> = group.iter().flat_map(|o| o.users.iter()).collect();
-                let mut keys = arrow_array::builder::StringBuilder::with_capacity(rows.len(), 9 * rows.len());
-                for r in &rows {
-                    keys.append_value(s(names.codec.bytes(links::unmix(r.person), &mut [0; 9])));
-                }
-                let cols: Vec<ArrayRef> = vec![
-                    Arc::new(keys.finish()),
-                    Arc::new(Date32Array::from_iter_values(rows.iter().map(|r| r.day))),
-                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.sessions))),
-                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.events))),
-                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.revenue))),
-                    Arc::new(StringArray::from_iter(
-                        rows.iter().map(|r| r.top.map(|c| s(&sm.cat_names[c as usize]))),
-                    )),
-                ];
-                let b = RecordBatch::try_new(uschema.clone(), cols).expect("user batch");
-                write_batch(ud.join(format!("part-{pi}.parquet")), b);
-            });
-        },
+        || output::campaign_daily(&cd.join("part-0.parquet"), &camp_rows),
+        || output::user_daily(&ud, &shards, parts, &|p, out| out.extend_from_slice(names.codec.bytes(links::unmix(p), &mut [0; 9])), &sm.cat_names),
     );
     log("written");
+    // Everything is on disk; skip tearing down the shard tables and mmaps.
+    std::process::exit(0);
 }
