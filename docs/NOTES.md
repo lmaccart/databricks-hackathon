@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Duplicate-census candidate — 2026-11-20
+
+An ID-only prepass uses worker-local blocked bitsets, merged by seen-bit intersection and local repeat bits. The strict pass shuffles full exact claims only for possible duplicates. Malformed census rows and hash collisions can only increase exact work; neither identifies a winner. Filter size is a capped runtime allocation hint, not an ID or data assumption. This candidate needs the parent session's 20M paired timing and final-scale memory check before any performance decision.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.

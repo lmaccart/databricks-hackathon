@@ -189,6 +189,25 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_mixed_ids_cross_file_duplicates_and_invalid_first_copy(self):
+        t = "2026-10-02T10:00:00Z"
+        later = "2026-10-02T10:00:05Z"
+        u, _ = run_case(events=[
+            ev("id0001", "wrong", t, ingest=later),
+            ev("id001", "padded", t),
+            ev("数字01", "unicode", t, ingest=later),
+            ev("span99999999999999999999999999999", "distant", t),
+            ev("bad", "later", t, ingest=later),
+            ev("other", "other", t),
+        ], extra={"events/part-1.csv": [
+            ev('"id0001"', "winner", t, ingest=t),
+            ev("数字01", "unicode-first", t, ingest=t),
+            ev("bad", "", t, ingest=t),
+            'other,malformed,2026-10-02T10:00:00Z,2026-10-02T10:00:00Z,view,p1',
+        ]})
+        self.assertEqual({key[0] for key in u},
+                         {"winner", "padded", "unicode-first", "distant", "other"})
+
     def test_no_survivors_still_writes_both_empty_tables(self):
         u, c = run_case(events=[ev("e", "", WS)], clicks=[f"k,u,c_1,{WS}"])
         self.assertEqual((u, c), ({}, {}))

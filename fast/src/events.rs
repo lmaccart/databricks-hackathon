@@ -1,5 +1,5 @@
 //! Send payloads directly to the session partition. A separate, smaller
-//! stream of claims (ID, ingest time, payload location) decides which payloads
+//! duplicate census followed by an exact claim pass decides which payloads
 //! must be removed. In particular, an invalid copy has a claim but no payload.
 use super::*;
 
@@ -27,6 +27,7 @@ struct Pending {
     id: u64,
     uid: u64, // zero is never the key of a nonempty ID
     hash: u64,
+    signature: u64,
     ts: i64,
     ingest: i64,
     price: u32,
@@ -39,11 +40,13 @@ fn parse<'a>(
     people: &People<'a>,
     ws: i64,
     we: i64,
+    repeated: &[(u64, u64)],
     hs: &RandomState,
 ) -> (Vec<Vec<PEv>>, Vec<Vec<Claim>>) {
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Vec<PEv>> = (0..NS).map(|_| Vec::with_capacity(reserve)).collect();
-    let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
+    let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::new()).collect();
+    let mask = repeated.len() - 1;
     let mut emit = |e: Pending| {
         let mut target = NONE;
         if e.uid != 0 {
@@ -57,11 +60,14 @@ fn parse<'a>(
                 cat: e.cat,
             });
         }
-        claims[shard(hs.hash_one(e.id))].push(Claim {
-            id: e.id,
-            ingest: e.ingest,
-            target,
-        });
+        let (i, bits) = probe(e.signature, mask);
+        if repeated[i].1 & bits == bits {
+            claims[shard(hs.hash_one(e.id))].push(Claim {
+                id: e.id,
+                ingest: e.ingest,
+                target,
+            });
+        }
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
@@ -74,6 +80,7 @@ fn parse<'a>(
         let ts = parse_ts(r[2]);
         let mut next = Pending {
             id,
+            signature: hs.hash_one(r[0]),
             ts,
             ingest,
             ..Default::default()
@@ -115,6 +122,27 @@ fn probe(id: u64, mask: usize) -> (usize, u64) {
     let x = (id ^ (id >> 27)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     let bits = 1u64.rotate_left((x >> 52) as u32) | 1u64.rotate_left((x >> 58) as u32);
     (((x >> 17) as usize) & mask, bits)
+}
+
+// The intersection identifies bits seen by two different workers. A duplicate
+// in one worker has already marked both bits in that worker's repeated set.
+fn merge_census(into: &mut [(u64, u64)], other: &[(u64, u64)]) {
+    into.par_iter_mut().zip(other.par_iter()).for_each(|(a, b)| {
+        a.1 |= b.1 | (a.0 & b.0);
+        a.0 |= b.0;
+    });
+}
+
+fn census_chunk(chunk: &Chunk<'_>, hs: &RandomState, census: &mut [(u64, u64)]) {
+    let mask = census.len() - 1;
+    csv::for_first_id(chunk, |id| {
+        let (i, bits) = probe(hs.hash_one(id), mask);
+        let (seen, repeated) = &mut census[i];
+        if *seen & bits == bits {
+            *repeated |= bits;
+        }
+        *seen |= bits;
+    });
 }
 
 fn losers(parts: Vec<(usize, Vec<Claim>)>) -> Vec<Location> {
@@ -183,7 +211,48 @@ pub(super) fn by_person<'a>(
     hs: &RandomState,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Vec<PEv>>> {
-    let parsed: Vec<_> = chunks.par_iter().map(|c| parse(c, sm, people, ws, we, hs)).collect();
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+    // This is only a sizing hint: collisions and underestimated row counts
+    // increase exact work, never change which IDs are retained.
+    let estimated_rows = chunks
+        .iter()
+        .map(|c| reserve_per_shard(c.data).saturating_mul(NS))
+        .fold(0usize, usize::saturating_add);
+    let words = estimated_rows.div_ceil(8).clamp(1, 1 << 24).next_power_of_two();
+    let workers = rayon::current_num_threads().min(8).min(chunks.len());
+    // Chunks from different files can be header-sized or full-sized. Balance
+    // bytes instead of chunk count, without sharing a filter between workers.
+    let mut ordered: Vec<_> = chunks.iter().collect();
+    ordered.sort_unstable_by_key(|c| std::cmp::Reverse(c.data.len()));
+    let mut groups: Vec<Vec<_>> = (0..workers).map(|_| Vec::new()).collect();
+    let mut sizes = vec![0usize; workers];
+    for chunk in ordered {
+        let worker = (0..workers).min_by_key(|&i| sizes[i]).unwrap();
+        sizes[worker] = sizes[worker].saturating_add(chunk.data.len());
+        groups[worker].push(chunk);
+    }
+    let groups: Vec<_> = groups
+        .into_par_iter()
+        .map(|group| {
+            let mut census = vec![(0u64, 0u64); words];
+            for chunk in group {
+                census_chunk(chunk, hs, &mut census);
+            }
+            census
+        })
+        .collect();
+    let mut groups = groups.into_iter();
+    let mut census = groups.next().unwrap();
+    for other in groups {
+        merge_census(&mut census, &other);
+    }
+    log("events census");
+    let parsed: Vec<_> = chunks
+        .par_iter()
+        .map(|c| parse(c, sm, people, ws, we, &census, hs))
+        .collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
     let mut claims: Vec<Vec<_>> = (0..NS).map(|_| Vec::new()).collect();
@@ -217,6 +286,33 @@ pub(super) fn by_person<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn census_finds_local_and_cross_worker_duplicates_despite_aliases() {
+        let mask = 31;
+        let ids = [7u64, 91, 2000, 9_000_000_000, u64::MAX];
+        let mut a = vec![(0u64, 0u64); mask + 1];
+        let mut b = a.clone();
+        let add = |bloom: &mut [(u64, u64)], id| {
+            let (i, bits) = probe(id, mask);
+            let word = &mut bloom[i];
+            if word.0 & bits == bits {
+                word.1 |= bits;
+            }
+            word.0 |= bits;
+        };
+        for id in [ids[0], ids[1], ids[1], ids[2]] {
+            add(&mut a, id);
+        }
+        for id in [ids[0], ids[3], ids[4], ids[4]] {
+            add(&mut b, id);
+        }
+        merge_census(&mut a, &b);
+        for id in [ids[0], ids[1], ids[4]] {
+            let (i, bits) = probe(id, mask);
+            assert_eq!(a[i].1 & bits, bits);
+        }
+    }
 
     #[test]
     fn bloom_alias_keeps_distinct_id_and_invalid_winner_kills_valid_loser() {

@@ -102,6 +102,41 @@ pub fn for_rows<'a>(c: &Chunk<'a>, mut f: impl FnMut(&[&'a [u8]; 8])) {
     scan::<Native, _>(c.data, &slot, &mut f);
 }
 
+/// Census-only scan. Malformed rows may add false suspects, but every valid
+/// nonempty selected ID must be returned exactly as `for_rows` unquotes it.
+pub fn for_first_id<'a>(c: &Chunk<'a>, mut f: impl FnMut(&'a [u8])) {
+    let mut start = 0;
+    for end in memchr::memchr_iter(b'\n', c.data).chain(std::iter::once(c.data.len())) {
+        if start > end {
+            break;
+        }
+        let line = &c.data[start..end];
+        start = end.saturating_add(1);
+        let mut rest = line;
+        let mut found = true;
+        for _ in 0..c.idx[0] {
+            if let Some(p) = memchr(b',', rest) {
+                rest = &rest[p + 1..];
+            } else {
+                found = false;
+                break;
+            }
+        }
+        if !found {
+            continue;
+        }
+        let id = &rest[..memchr(b',', rest).unwrap_or(rest.len())];
+        let id = if id.len() >= 2 && id[0] == b'"' && id[id.len() - 1] == b'"' {
+            &id[1..id.len() - 1]
+        } else {
+            id
+        };
+        if !id.is_empty() {
+            f(id);
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn scan_avx2<'a, F: FnMut(&[&'a [u8]; 8])>(data: &'a [u8], slot: &[u8], f: &mut F) {
@@ -539,6 +574,28 @@ mod tests {
         check(b"a,b,c\n\"x\",\"y\",\"", &cols); // lone quote at end of file
         check(b"a,b,c", &cols); // header only, no newline
         check(b"a,b,c\n", &cols);
+    }
+
+    #[test]
+    fn census_contains_every_valid_id_with_reordered_headers_and_chunk_boundaries() {
+        let data = b"x,event_id,z\np,\"a\",q\np,a,q\np,00,q\np,\"\",q\np,bad\"id,q\np,\xce\xbb,q\np,last,q";
+        for size in [1, 4, 20, usize::MAX] {
+            let chunks = chunks_sized(data, &["event_id", "x", "z"], Path::new("test.csv"), size);
+            let mut valid = Vec::new();
+            let mut census = Vec::new();
+            for chunk in &chunks {
+                for_rows(chunk, |r| {
+                    if !r[0].is_empty() {
+                        valid.push(r[0].to_vec());
+                    }
+                });
+                for_first_id(chunk, |id| census.push(id.to_vec()));
+            }
+            for id in valid {
+                let i = census.iter().position(|seen| *seen == id).expect("missing valid ID");
+                census.swap_remove(i);
+            }
+        }
     }
 
     #[test]
