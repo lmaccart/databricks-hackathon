@@ -83,21 +83,33 @@ Times below are seconds, **control → candidate**. The control is `9758471` unl
 | [Exact one-word quotient/rank lookup vs typed parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877138125) | 1.645 → 1.673 | 1.617 → 1.649 |
 | [Hardware bit extraction inside the fused ID load vs typed parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877191802) | 1.657 → 1.655 | 1.626 → 1.626 |
 | [Common-date reuse plus typed click and link parsing vs typed event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877061972) | 2.179 → **2.092** | 2.152 → **2.085** |
+| [Same combination vs shared-date optimization alone, AMD](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877354334) | 1.772 → 1.749 | 1.711 → 1.681 |
+| [Same combination vs the independent-clock click/link parser, Intel](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877354205) | 1.692 → 1.754 | 1.652 → 1.706 |
+| [Typed partition-local join vs typed parser alone, full Docker follow-up](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584) | 2.101 → 2.047 | 2.066 → 2.014 |
+| [Calendar reuse and typed click/link parsing vs typed event parser, Intel repeat](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877352468) | 1.672 → 1.738 | 1.639 → 1.703 |
+| [Partition-local join on top of the shared-clock, three-input parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877598890) | 1.704 → 1.631 | 1.675 → 1.602 |
+| [Three-input shared-clock parser vs partition-local join with typed events](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877538589) | 1.648 → 1.717 | 1.608 → 1.694 |
 
-Two instructive tradeoffs:
+What the direct comparisons show:
 
 - Postponing the exact alias lookup reduced the Intel event phase from **0.844 to 0.637 s** and click parsing from **0.139 to 0.095 s**, but added a **0.165 s join** plus cost in the session phase. With the typed parser already present, this design saved only 0.8% and 2.2% in its first direct comparison.
 - Compressing quote pairs did help on both seeds. Fusing validation and ID encoding saved more. In contrast, compact duplicate evidence followed by random rereads, or a new retrieval graph built from scratch at startup, cost more than their smaller intermediates saved.
+- The partition-local join also missed the incremental threshold in [a Docker comparison against the typed parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584): **2.278 → 2.253 s** at 20M but **6.835 → 6.988 s** at 60M. Its 10.1% final-scale win over the *older scored build* is real; that is not a reason to add the shuffle to the typed parser.
+- Sharing civil date/hour decoding won all ten native pairs on the first AMD run of the combined parser. On Intel it lost all ten pairs against the version that parsed the two clock fields independently. Against the event-only parser on that Intel host, full Docker regressed **1.758 → 1.827 s at 20M and 5.347 → 5.641 s at 60M**. A global change to the clock on the strength of the AMD run alone would have been a poor bet.
 
 ## Eight-worker Mac comparison
 
 Five alternating process start-to-exit pairs on an Apple M2 Pro, native arm64, warmed input, no Docker. Control `9758471` was built from a fresh worktree; candidate `7fd1b76` used the same release settings. On seed 7 the median fell **0.610 → 0.570 s** (5/5 pairs); on seed 15, **0.682 → 0.601 s** (4/5). All five candidate times were 0.573, 0.569, 0.576, 0.560, 0.570 s on seed 7 and 0.569, 0.556, 0.601, 0.644, 0.840 s on seed 15. Seed 15 slowed over the course of the run for both binaries. The Mac medians are below 0.63 s, but even the scored control ran seed 7 below 0.63 s here. They cannot establish an organizer score.
+
+The trial with typed clicks/links and shared F1 fields (`03cd84c`) measured **0.667 → 0.612 s** and **0.622 → 0.572 s** in a different paired Mac run. The independent-clock click/link trial measured **3.301 → 3.233 s** and **1.466 → 1.381 s** immediately after a 60M comparison on this workstation. Its seed-7 paired savings ranged from −25% to +48%; those absolute Mac times cannot rank the implementations across runs.
 
 ## Exactness and reproduction
 
 The independent Python oracle checks 20 seeds each at 10k, 100k and 1M events. The added grammar corpus mutates timestamps, quoted fields, IDs and ignored prices on real physical lines. Each mutant competes with a later valid event for a different shopper, and valid lines follow malformed ones. This catches the difference between *invalid earliest* (suppresses the event) and *malformed earliest* (never enters dedup). As a negative control, deliberately dropping invalid claims before dedup produced **2,658 extra user-day rows** and a differing campaign row; the new verifier rejected it.
 
 For the typed parser, six additional Python comparisons passed on three seeds outside the timing and standard oracle sets (6331, 20261121, 31415927; 250k and 1M events each). A second final-scale input, seed 20261121 with **60M events and 15M clicks**, matched the scored control row-for-row on native ARM64: **6,643,504 user-day and 28,014 campaign-day rows**. This was an exactness check, not an extra timing result.
+
+The shared-clock and independent-clock click/link candidates also matched this second 60M input. Across the two tables there were **10,042,701 sessions** and **17,123,475,935 cents** in each; the user table contained 58,625,071 retained events. The campaign table recorded 108,071,722 assists and none for `organic`.
 
 The 60M timing comparisons below use the same workload (seed 13, 15M clicks, 14 GiB memory and no swap), but each row ran on its own host. Every comparison matched **6,587,957 user-day and 28,014 campaign-day rows**.
 
@@ -123,4 +135,21 @@ To check mixed fast/fallback rows, opaque identities and header permutations loc
 make build
 .venv/bin/python tools/grammar_diff.py fast/target/release/shopping_sessions
 .venv/bin/python tools/opaque_diff.py vendor/dev fast/target/release/shopping_sessions
+```
+
+To reproduce the independent final-scale holdout, set `CONTROL_BIN` to an absolute path to the release binary built from `9758471` and `CANDIDATE_BIN` to the candidate binary:
+
+```sh
+mkdir -p scratch
+case_dir=$(mktemp -d "$PWD/scratch/holdout60.XXXXXX")
+vendor/generator/target/release/generate \
+  --seed 20261121 --events 60000000 --clicks 15000000 --output "$case_dir/data"
+for side in control candidate; do
+  if [ "$side" = control ]; then bin=$CONTROL_BIN; else bin=$CANDIDATE_BIN; fi
+  DATA_DIR="$case_dir/data" OUTPUT_DIR="$case_dir/$side" SCRATCH_DIR="$case_dir" \
+    RAYON_NUM_THREADS=4 "$bin" >"$case_dir/$side.stdout" || exit 1
+  test ! -s "$case_dir/$side.stdout" || exit 1
+done
+POLARS_MAX_THREADS=4 .venv/bin/python vendor/starter-duckdb/scripts/compare.py \
+  "$case_dir/control" "$case_dir/candidate"
 ```
