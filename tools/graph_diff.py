@@ -10,7 +10,14 @@ import subprocess
 import sys
 import tempfile
 
-from grammar_diff import C, E, L, ROOT, TS, pipeline
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "reference"))
+import pipeline
+
+EVENT_HEADER = b"event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n"
+CLICK_HEADER = b"click_id,user_id,campaign_id,ts\n"
+LINK_HEADER = b"user_id_a,user_id_b\n"
+TS = b"2028-02-29T00:00:00Z"
 
 
 def colliders():
@@ -62,20 +69,20 @@ def generate(root, large):
     else:
         # More independent people than statically available ranks.
         people.extend(f"extra-{i}".encode() for i in range(1024))
-    write_parts(root, "links", L, [a + b"," + b for a, b in links], rng)
+    write_parts(root, "links", LINK_HEADER, [a + b"," + b for a, b in links], rng)
     events, clicks = [], []
     t = pipeline.parse_ts(TS)
     for i, person in enumerate(people):
         for j, delta in enumerate((0, 1_800_000, 3_600_001, 90_000_000)):
             eid = f"e{i:06x}{j}".encode()
             tick = str(t + delta).encode()
-            pid = b"p1" if (i+j) % 2 else b"p2"
+            pid = b"p1" if (i + j) % 2 else b"p2"
             events.append(b",".join([eid, person, tick, TS, b"purchase", pid, str(1 + i % 997).encode()]))
         for j, (delta, camp) in enumerate(((-604_800_000, b"c1"), (0, b"c2"), (0, b"c1"), (1_800_001, b"c1"))):
-            click = b",".join((f"k{i:06x}{j}".encode(), person, camp, str(t+delta).encode()))
+            click = b",".join((f"k{i:06x}{j}".encode(), person, camp, str(t + delta).encode()))
             clicks.extend([click, click])
-    write_parts(root, "events", E, events, rng)
-    write_parts(root, "clicks", C, clicks, rng)
+    write_parts(root, "events", EVENT_HEADER, events, rng)
+    write_parts(root, "clicks", CLICK_HEADER, clicks, rng)
 
 
 def main():
@@ -93,8 +100,11 @@ def main():
                 ("short", ("2028-02-28", "2028-03-04")),
                 ("wide", ("0002-01-01", "9999-01-01")),
             ):
-                (data / "manifest.json").write_text(json.dumps(dict(zip(
-                    ("window_start", "window_end"), (d + "T00:00:00Z" for d in bounds)))))
+                start, end = bounds
+                (data / "manifest.json").write_text(json.dumps({
+                    "window_start": start + "T00:00:00Z",
+                    "window_end": end + "T00:00:00Z",
+                }))
                 expected = case / f"{graph}-{width}-oracle"
                 pipeline.run(str(data), str(expected))
                 for workers in (1, 8):
