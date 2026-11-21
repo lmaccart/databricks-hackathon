@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 mod dims;
 mod events;
+mod input_populate;
 mod links;
 mod output;
 mod person;
@@ -535,7 +536,6 @@ fn main() {
     let cf = File::open(data.join("campaigns.csv")).expect("campaigns.csv");
     let pm = unsafe { Mmap::map(&pf).unwrap() };
     let cm = unsafe { Mmap::map(&cf).unwrap() };
-    let sm = read_small(&pm, &cm, &data.join("products.csv"), &data.join("campaigns.csv"));
 
     let link_files = mmap_files(&data.join("links"));
     let event_files = mmap_files(&data.join("events"));
@@ -554,7 +554,42 @@ fn main() {
         ],
     );
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
-    let names = person_names(&link_chunks);
+    let mut input_maps: Vec<&Mmap> = vec![&pm, &cm];
+    input_maps.extend(link_files.iter().map(|(_, map)| map));
+    input_maps.extend(event_files.iter().map(|(_, map)| map));
+    input_maps.extend(click_files.iter().map(|(_, map)| map));
+    let populate_enabled = std::env::var_os("POPULATE_READ").is_none_or(|value| value != "0");
+    let populate_diagnostics = std::env::var_os("POPULATE_READ_DIAGNOSTICS").is_some_and(|value| value == "1");
+    let ((sm, names), populate_stats) = input_populate::during(
+        &input_maps,
+        || {
+            let sm = read_small(&pm, &cm, &data.join("products.csv"), &data.join("campaigns.csv"));
+            let names = person_names(&link_chunks);
+            (sm, names)
+        },
+        populate_enabled,
+        populate_diagnostics,
+    );
+    if populate_diagnostics && populate_stats.workers > 0 {
+        let percent = if populate_stats.input_bytes == 0 {
+            100.0
+        } else {
+            100.0 * populate_stats.populated_bytes as f64 / populate_stats.input_bytes as f64
+        };
+        let faults = match (populate_stats.minor_faults, populate_stats.major_faults) {
+            (Some(minor), Some(major)) => format!(", {minor} minor/{major} major faults during overlap"),
+            _ => String::new(),
+        };
+        let status = populate_stats
+            .error
+            .map_or_else(|| "complete".to_owned(), |errno| format!("stopped errno={errno}"));
+        log(&format!(
+            "MADV_POPULATE_READ: {:.2}/{:.2} GiB ({percent:.1}%), {} workers, {status}{faults}",
+            populate_stats.populated_bytes as f64 / (1u64 << 30) as f64,
+            populate_stats.input_bytes as f64 / (1u64 << 30) as f64,
+            populate_stats.workers,
+        ));
+    }
     let packing = Packing::new(ws, we, names.count);
     log(&format!("links: {} linked ids", names.count));
 

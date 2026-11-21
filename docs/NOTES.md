@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Bounded Linux page-table population candidate — 2026-11-21
+
+Added a Linux-only `MADV_POPULATE_READ` path for the existing read-only mappings. It divides the actual mapped byte lengths into 16 MiB regions and schedules at most two regions at a time on the existing Rayon pool, reserving at least one pool worker for the initial link graph. This installs this process's readable PTEs; it is not `WILLNEED`/`FADV` cache readahead, and it makes no input copies or writes. Unsupported kernels and any advice error stop prepopulation and leave ordinary demand paging intact. Other platforms use the unchanged mmap path.
+
+The default candidate is enabled on Linux; set `POPULATE_READ=0` for a control run. `POPULATE_READ_DIAGNOSTICS=1` opts into reporting successful advised-byte coverage and process `getrusage` minor/major fault deltas over the overlap interval. The Linux unit test invokes this same helper and checks present bits in `/proc/self/pagemap`, rather than inferring PTE population from file-cache residency.
+
+Local checks on macOS: 39 Python tests, 22 Rust release tests, release build, 39 binary tests, all 36 official fixtures against both implementations, the 1M dev answer (117,038 user rows and 27,400 campaign rows), and 10 dirty generator seeds (30k events each) passed. `cargo clippy --all-targets -D warnings` is also clean on the host. This machine has no Linux Rust target/runtime, so the `/proc/self/pagemap` test has not run here; the requested no-large-input constraint also precluded a local 20M timing. Linux PTE validation and warm timing remain for the Linux CI run. No speedup is claimed yet.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).
