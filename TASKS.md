@@ -33,7 +33,7 @@ Each task is sized for one agent session. Do them in order; T1 to T4 decide whet
 - [ ] **T6. Differential testing on the official generator.** Script: for 20+ seeds × sizes {10k, 100k, 1M}, generate, run reference and binary, compare. Include a seed whose window holds 2028-02-29 (try seeds until `manifest.json` shows a Feb 2028 window). Use the reference for ≤ 1M only (it is slow).
   *Accept:* all match. Every mismatch becomes a minimized test case in `tests/`.
 
-- [ ] **T7. Scale test at 60M.** Generate ~60M events (and the click count the starter uses at that scale; check the Makefile or ask organizers' ratio from the dev set). Run with `NCPU=8`, `/usr/bin/time -v`.
+- [x] **T7. Native scale test at 60M.** Seed 13, 60M events and 15M clicks: 14.97 s wall, 9.38 GiB peak RSS, eight Rayon threads, zero spill; schema, keys and sums passed. Native Mac capacity check, not a scorer run; see `docs/NOTES.md`.
   *Accept:* < 60 s (target < 5 s), peak RSS < 20 GB, no `/scratch` needed. Output passes `compare_outputs.py --check`.
 
 ## Phase C: speed (only after A and B are green)

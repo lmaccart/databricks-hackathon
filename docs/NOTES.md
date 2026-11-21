@@ -14,6 +14,16 @@ The printed track page times **container start to exit** on eight pinned hyperth
 - The kit comparer converted a numeric Parquet ID to a string and could report a match that the scorer rejected. It now checks string types and keeps null distinct from an empty Parquet string. Local edge tests now detect duplicate keys before indexing outputs by key.
 - Use a fresh output directory for each run. Reusing the same directory with fewer Rayon workers can leave extra `part-*.parquet` from a previous run. The official harness and the new native benchmark use fresh directories.
 
+## Native scale evidence
+
+Baseline: original Rust data path on an Apple M2 Pro (32 GiB RAM), release build, `NCPU=8 RAYON_NUM_THREADS=8`, local APFS, fresh output directories, `/usr/bin/time -l` start to exit. The file cache was not flushed. These are neither pinned Linux hyperthreads nor hidden-score timings.
+
+| Official input | Wall time | Maximum RSS | Result |
+|---|---:|---:|---|
+| Seed 13, 60M events + 15M clicks, 5.71 GB of input | 14.97 s, one run | 9.38 GiB | 6,587,957 unique user-days, 28,014 unique campaign-days; both tables sum to 9,944,073 sessions and 25,416,324,016 cents |
+
+The 60M run overlapped compilation on the host. Its 14.97 s comprised 0.71 s setup/links, **3.43 s event parse, 4.40 s event dedup, 3.82 s sessions**, 1.65 s clicks, 0.40 s writing and ~0.56 s from the last log to process exit. No stdout or scratch usage. `tools/check_scale.py` verified schema, uniqueness and cross-table invariants on the full output; no hand-written expected answer exists for that seed. The 24 GB no-swap scorer limit was not enforced on this native run.
+
 ## Latency experiments to run in order
 
 These are code-review findings, not measured speedups. The current entry retains the validated sessionization, duplicate selection, byte ordering and attribution algorithms. Run `tools/bench.py` on the same official 20M input for both builds; compare five-run medians, dev answer, and peak memory at 60M. Measure start-to-exit, since moving work between phases can look like an improvement in one log line.
@@ -32,3 +42,5 @@ These are code-review findings, not measured speedups. The current entry retains
 | 10 | process/runtime | Test chunk size, shard count, allocator and read-ahead separately on Linux. Track file-backed vs anonymous memory and cold vs warm reads. Rayon honors `RAYON_NUM_THREADS`; `NCPU` alone is not an explicit pool override in this implementation. |
 
 Two shortcuts in the original playbook were unsafe: pruning unused link IDs (they can bridge active users or name the entire person), and packing only part of a person's hash plus time as a definitive sort key (collisions can interleave people). Both notes have been corrected.
+
+**A larger experiment for assists:** the 60M output counted 103,189,966 assists. The current session loop performs a hash-table update for every one. For a person with many sessions and campaigns, invert the calculation: a click at `t` assists session starts in `[t, t + 7 days]`. Compute each campaign's union of such intervals for that person, find covered ranges in their sorted session starts, and add range lengths to the corresponding start-day totals. This counts overlapping clicks once and still includes the crediting campaign. Try it only for people with expensive windows; on people with one session, building intervals is likely more work than iterating the active campaign list. Diff exact assist-only rows, ties, midnight and both 7-day boundaries. The simpler first experiment is to retain the current algorithm but avoid hashing the `(campaign, day)` on each increment.
