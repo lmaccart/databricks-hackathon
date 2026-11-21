@@ -1,15 +1,19 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Official practice: rebuild at 1.78 s — 2026-11-21 UTC
+
+Leif reports **1.78 s** on the rebuild submitted before the final-scale CI job finished, down from **5.03 s** on `cc9f33e` (**2.83× faster**). The exact submitted SHA was not specified. Use [`4f75f52`](https://github.com/lmaccart/databricks-hackathon/commit/4f75f526cef27623e406d2ec1008b40eb1935f23) as the fixed control for the next round; the subsequent `bcdc149` commit only recorded the CI result. These official and CI clocks are tracked separately.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.
 
 - **Final size, seed 13:** 60M events + 15M clicks took **12.323 s** for one full `docker run` under a **14 GiB memory cap with swap disabled**. Stdout was empty. The organizer’s comparer matched all **6,615,971 rows** against the scored baseline `cc9f33e`: 6,587,957 in `user_daily` and 28,014 in `campaign_daily`, with zero differing rows or duplicate keys.
-- **Practice size, seed 7:** across five alternating pairs on 20M events + 5M clicks, full Docker medians were **5.779 s baseline → 2.153 s rebuild (2.68×)**, including startup and removal. Process-only medians on that runner were 5.783 s → 2.050 s. These are CI measurements; the confirmed official practice time remains 5.03 s for `cc9f33e`.
+- **Practice size, seed 7:** across five alternating pairs on 20M events + 5M clicks, full Docker medians were **5.779 s baseline → 2.153 s rebuild (2.68×)**, including startup and removal. Process-only medians on that runner were 5.783 s → 2.050 s.
 
 ## Rebuilt pipeline: whole-process comparisons
 
-Scored baseline `cc9f33e` vs the SIMD/direct-routing/typed-writer candidate (`3f1d667`). Official practice time is known only for the baseline, **5.03 s**.
+Scored baseline `cc9f33e` vs the SIMD/direct-routing/typed-writer candidate (`3f1d667`).
 
 During testing, the [public Shopping Sessions board](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions) advanced to **0.65 s** (Mahalas, score timestamp 2026-11-21 03:45 UTC). The earlier 0.68 s figure below describes the target when this round started.
 

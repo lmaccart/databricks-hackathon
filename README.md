@@ -2,7 +2,7 @@
 
 A native Rust entry for the [Databricks Shopping Sessions buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). It reads the mounted CSVs, resolves linked identities, deduplicates events, sessionizes, attributes clicks and assists, and writes `user_daily/` and `campaign_daily/` as Parquet. [Official rules](docs/rules.md) · [architecture](ARCHITECTURE.md) · [review, measurements and open checks](docs/NOTES.md).
 
-**Performance:** the organizer scored the original `cc9f33e` at **5.03 s**. In paired 20M-event native Linux runs with four workers, the rebuild took **2.078 s vs 6.112 s on Intel** and **2.635 s vs 7.708 s on AMD**—about 2.9× faster in both environments. These are measured process times, not a hidden practice score. The independent dev answer, all 36 official fixtures, 60 generator comparisons, and a row-for-row 60M comparison passed.
+**Official practice:** the rebuild scored **1.78 s**, down from **5.03 s** on `cc9f33e` (2.83× faster). In separate paired 20M-event Linux runs with four workers, it took **2.078 s vs 6.112 s on Intel** and **2.635 s vs 7.708 s on AMD**. The independent dev answer, all 36 official fixtures, 60 generator comparisons, and a row-for-row 60M comparison passed.
 
 ## Build and run
 
