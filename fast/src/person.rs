@@ -29,11 +29,18 @@ pub fn inline(bytes: &[u8]) -> Option<u64> {
     if word & HIGH_BITS != 0 || tail > 127 {
         return None;
     }
+    Some(pack_inline(word, tail))
+}
+
+/// Pack eight big-endian ASCII bytes and a ninth ASCII byte, zero-padded
+/// on the right. The caller has already proved the inline key's byte range.
+#[inline(always)]
+pub fn pack_inline(word: u64, tail: u8) -> u64 {
     // Compress unsigned byte pairs, then quads, then the entire word.
     let pairs = (word & 0x007f_007f_007f_007f) | ((word >> 1) & 0x3f80_3f80_3f80_3f80);
     let quads = (pairs & 0x0000_3fff_0000_3fff) | ((pairs >> 2) & 0x0fff_c000_0fff_c000);
     let eight = (quads & 0x0fff_ffff) | ((quads >> 4) & 0x00ff_ffff_f000_0000);
-    Some((eight << 7) | u64::from(tail))
+    (eight << 7) | u64::from(tail)
 }
 
 #[derive(Default)]

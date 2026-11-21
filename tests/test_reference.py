@@ -90,6 +90,26 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
+        stamp = "2026-10-03T10:00:00Z"
+        early = "2026-10-03T09:59:59Z"
+        # A malformed early copy must not suppress the matching valid event.
+        # A well-formed early copy with a bad timestamp must suppress it.
+        events = [
+            ev("opaque7", "USER_07", stamp, pid="item-07", price='"ignored"'),
+            ev('"opaque7"', '"USER_08"', stamp, pid='"item-07"', price='"x"y', ingest=early),
+            ev('"opaque08"', '"USER_08"', "1791021600000", pid='"item-07"', price="\r", ingest=stamp),
+            ev("opaque009", "USER_009", "2026-10-03T10:30:00+00:30", pid="item-07", ingest=stamp),
+            ev("opaque009", "USER_009", "2026-10-03T10:30:00+00:60", pid="item-07", ingest=early),
+            ev("opaque10", "USER_10", stamp, pid="item-07", price="x,y", ingest=early),
+            ev("opaque11", "USER_11", stamp, pid="item-07", price='"x\n"'),
+            ev("opaque12", "USER_12", stamp, etype='"purchase"', pid='"item-07"', price='"00123"'),
+            ev("opaque13", "USER_13", stamp, pid="item-07", price='""'),
+        ]
+        users, _ = run_case(events, products=("item-07,shoes",))
+        self.assertEqual({key[0]: (row["events"], row["revenue_cents"]) for key, row in users.items()},
+                         {"USER_07": (1, 0), "USER_08": (1, 0), "USER_12": (1, 123), "USER_13": (1, 0)})
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"

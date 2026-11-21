@@ -300,6 +300,21 @@ impl ManifestClock {
     }
 
     #[inline]
+    pub fn event_f1_seconds(&self, s: &[u8; 20]) -> i64 {
+        self.f1_seconds(s)
+    }
+
+    #[inline(always)]
+    pub fn event_f2(s: &[u8; 25]) -> i64 {
+        iso::<true, false>(s)
+    }
+
+    #[inline(always)]
+    pub fn event_f3(s: &[u8; 13]) -> i64 {
+        epoch_ms(s)
+    }
+
+    #[inline]
     pub fn parse_ts(&self, s: &[u8]) -> i64 {
         if s.len() == 20 && s[4] == b'-' {
             let seconds = self.f1_seconds(s);

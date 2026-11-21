@@ -1,5 +1,37 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Experimental word-offset event parser — 2026-11-21 UTC
+
+For the seven-column canonical header, validate and pack 7–9 byte ASCII IDs
+from the same word loads. Verify exact timestamp boundaries and bodies with
+the manifest clock and timestamp validators, and classify product plus price
+in a single 16-byte structural mask. A successful row makes a typed claim
+directly, without scanning ahead for the line ending or visiting the
+interner. Every miss retries the original physical line with the strict
+decoder; other header layouts use the ordinary chunk decoder.
+
+Native ARM64, official 1M dev set, nine alternating pairs per comparison:
+
+| Variant vs `5fd0d05` | 1 worker | 8 workers |
+|---|---:|---:|
+| Uniform 7–9 byte boundary mask | 0.207 → 0.195 s | 0.059 → 0.057 s |
+| Branchless quote/footer experiment (not retained) | 0.197 → 0.193 s | 0.063 → 0.062 s |
+| Direct 9-byte check, mask for 7–8 (final rerun) | 0.234 → 0.220 s | 0.080 → 0.074 s |
+
+The final rerun cut median parse time from 102 to 86 ms at one worker and
+22 to 19 ms at eight workers (wall time −5.9%/−6.6%; won 7/9 and 9/9 pairs).
+An earlier heavily contended series showed variable wall improvements
+(0.457 → 0.401 s and 0.231 → 0.228 s); directly against the uniform mask,
+the one-worker result was essentially flat (0.507 → 0.504 s). These are
+exploratory results, not evidence of an improvement on amd64. No Docker or
+20M/60M runs; do not promote based on these timings alone.
+
+Validation: both dev comparers matched all 144,438 rows, with empty stdout.
+Both implementations passed all 36 official fixtures and 39 Python cases.
+All 21 Rust tests passed, including single-byte row mutations and exact ID
+packing at each accepted width. Ten dirty seeds and a small seed-15 opaque
+ID/reordered-header Python comparison (one and eight workers) matched.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

@@ -34,6 +34,19 @@ pub struct Chunk<'a> {
     idx: [usize; 8],
 }
 
+impl Chunk<'_> {
+    pub fn identity_order(&self, width: usize) -> bool {
+        self.nfields == width && self.ncols == width && self.idx[..width].iter().copied().eq(0..width)
+    }
+}
+
+/// Decode one physical line after the caller has checked the identity header.
+pub fn identity_row<'a, const N: usize>(line: &'a [u8], f: &mut impl FnMut(&[&'a [u8]; 8])) {
+    const { assert!(N <= 8) };
+    let slot: [u8; N] = std::array::from_fn(|i| i as u8);
+    scan::<Native, _>(line, &slot, f);
+}
+
 pub fn chunks_of<'a>(file: &'a [u8], cols: &[&str], path: &Path) -> Vec<Chunk<'a>> {
     chunks_sized(file, cols, path, crate::CHUNK)
 }
