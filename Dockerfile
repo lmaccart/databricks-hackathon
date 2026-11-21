@@ -11,4 +11,6 @@ FROM --platform=linux/amd64 debian:bookworm-slim
 COPY --from=build /src/target/release/shopping_sessions /usr/local/bin/shopping_sessions
 USER 1000
 ENV DATA_DIR=/data OUTPUT_DIR=/output
+# Trial: let subsequent stages reuse freed allocator pages for this short run.
+ENV MIMALLOC_PURGE_DELAY=-1
 ENTRYPOINT ["/usr/local/bin/shopping_sessions"]
