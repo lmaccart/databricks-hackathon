@@ -6,46 +6,101 @@ use std::mem::MaybeUninit;
 const T: usize = 0;
 const P: usize = 1;
 const C: usize = 2;
-type Cursor = [usize; 3];
-
-trait Directory {
-    fn event(&mut self, rank: u32) -> &mut Cursor;
-    fn existing(&mut self, rank: u32) -> Option<&mut Cursor>;
+trait Word: Copy + PartialEq + std::ops::AddAssign {
+    const ZERO: Self;
+    const ONE: Self;
+    fn from_usize(value: usize) -> Self;
+    fn as_usize(self) -> usize;
 }
 
-impl Directory for Vec<Cursor> {
+impl Word for u32 {
+    const ZERO: Self = 0;
+    const ONE: Self = 1;
     #[inline]
-    fn event(&mut self, rank: u32) -> &mut Cursor {
+    fn from_usize(value: usize) -> Self {
+        u32::try_from(value).expect("compact directory endpoint exceeds u32")
+    }
+    #[inline]
+    fn as_usize(self) -> usize {
+        self as usize
+    }
+}
+
+impl Word for usize {
+    const ZERO: Self = 0;
+    const ONE: Self = 1;
+    #[inline]
+    fn from_usize(value: usize) -> Self {
+        value
+    }
+    #[inline]
+    fn as_usize(self) -> usize {
+        self
+    }
+}
+
+type Cursor<W> = [W; 3];
+
+trait Directory<W: Word> {
+    fn event(&mut self, rank: u32) -> &mut Cursor<W>;
+    fn existing(&mut self, rank: u32) -> Option<&mut Cursor<W>>;
+}
+
+impl<W: Word> Directory<W> for Vec<Cursor<W>> {
+    #[inline]
+    fn event(&mut self, rank: u32) -> &mut Cursor<W> {
         &mut self[rank as usize]
     }
 
     #[inline]
-    fn existing(&mut self, rank: u32) -> Option<&mut Cursor> {
+    fn existing(&mut self, rank: u32) -> Option<&mut Cursor<W>> {
         self.get_mut(rank as usize)
     }
 }
 
-impl Directory for Map<u32, Cursor> {
+impl<W: Word> Directory<W> for Map<u32, Cursor<W>> {
     #[inline]
-    fn event(&mut self, rank: u32) -> &mut Cursor {
-        self.entry(rank).or_insert([0; 3])
+    fn event(&mut self, rank: u32) -> &mut Cursor<W> {
+        self.entry(rank).or_insert([W::ZERO; 3])
     }
 
     #[inline]
-    fn existing(&mut self, rank: u32) -> Option<&mut Cursor> {
+    fn existing(&mut self, rank: u32) -> Option<&mut Cursor<W>> {
         self.get_mut(&rank)
     }
 }
 
 #[inline]
-fn count(dir: &mut impl Directory, occupied: &mut Vec<u32>, key: u64, purchase: bool) {
+fn count<W: Word>(dir: &mut impl Directory<W>, occupied: &mut Vec<u32>, key: u64, purchase: bool) {
     let rank = (key >> 32) as u32;
     let cursor = dir.event(rank);
-    if cursor[T] == 0 {
+    if cursor[T] == W::ZERO {
         occupied.push(rank);
     }
-    cursor[T] += 1;
-    cursor[P] += usize::from(purchase);
+    cursor[T] += W::ONE;
+    if purchase {
+        cursor[P] += W::ONE;
+    }
+}
+
+fn compact_fits(events: usize, mut clicks: impl Iterator<Item = usize>) -> bool {
+    u32::try_from(events).is_ok()
+        && clicks
+            .try_fold(0u32, |total, n| total.checked_add(u32::try_from(n).ok()?))
+            .is_some()
+}
+
+fn prefix<W: Word>(dir: &mut impl Directory<W>, occupied: &[u32]) -> [usize; 3] {
+    let mut totals = [0usize; 3];
+    for &rank in occupied {
+        let cursor = dir.event(rank);
+        for i in 0..3 {
+            let count = cursor[i].as_usize();
+            cursor[i] = W::from_usize(totals[i]);
+            totals[i] = totals[i].checked_add(count).expect("directory total overflow");
+        }
+    }
+    totals
 }
 
 fn buffer<V>(len: usize) -> Vec<MaybeUninit<V>> {
@@ -74,11 +129,29 @@ pub(super) fn process(
     if ne == 0 {
         return;
     }
+    // The total events bound both event and purchase endpoints. Counting all
+    // clicks, including click-only ranks, bounds the selected-click endpoints.
+    if compact_fits(ne, clicks.iter().map(Vec::len)) {
+        dispatch::<u32>(owner, events, clicks, people, pack, reduce, ne);
+    } else {
+        dispatch::<usize>(owner, events, clicks, people, pack, reduce, ne);
+    }
+}
+
+fn dispatch<W: Word>(
+    owner: usize,
+    events: Vec<Stream<u64>>,
+    clicks: Vec<Vec<RankedClick>>,
+    people: &People,
+    pack: Packing,
+    reduce: &mut Reduce,
+    ne: usize,
+) {
     // A tiny input can touch only a few addresses of a large link table.
     // In that case do not allocate or walk the entire address space.
     if people.local_slots <= ne.saturating_mul(2) {
         scatter(
-            vec![[0; 3]; people.local_slots],
+            vec![[W::ZERO; 3]; people.local_slots],
             owner,
             events,
             clicks,
@@ -87,12 +160,12 @@ pub(super) fn process(
             reduce,
         );
     } else {
-        scatter(Map::with_hasher(rs()), owner, events, clicks, people, pack, reduce);
+        scatter::<W>(Map::with_hasher(rs()), owner, events, clicks, people, pack, reduce);
     }
 }
 
-fn scatter(
-    mut dir: impl Directory,
+fn scatter<W: Word>(
+    mut dir: impl Directory<W>,
     owner: usize,
     events: Vec<Stream<u64>>,
     clicks: Vec<Vec<RankedClick>>,
@@ -111,52 +184,45 @@ fn scatter(
     }
     for part in &clicks {
         for c in part {
-            if let Some(cursor) = dir.existing(c.rank).filter(|c| c[T] != 0) {
-                cursor[C] += 1;
+            if let Some(cursor) = dir.existing(c.rank).filter(|c| c[T] != W::ZERO) {
+                cursor[C] += W::ONE;
             }
         }
     }
-    let mut totals = [0; 3];
-    for &rank in &occupied {
-        let cursor = dir.event(rank);
-        let counts = std::mem::replace(cursor, totals);
-        for i in 0..3 {
-            totals[i] += counts[i];
-        }
-    }
+    let totals = prefix(&mut dir, &occupied);
     let mut times = buffer(totals[T]);
     let mut purchases = buffer(totals[P]);
     let mut selected_clicks = buffer(totals[C]);
     for part in events {
         for key in part.times {
             let cursor = dir.event((key >> 32) as u32);
-            times[cursor[T]].write(key as u32);
-            cursor[T] += 1;
+            times[cursor[T].as_usize()].write(key as u32);
+            cursor[T] += W::ONE;
         }
         for p in part.purchases {
             let cursor = dir.event((p.key >> 32) as u32);
             let key = p.key as u32;
-            times[cursor[T]].write(key);
-            cursor[T] += 1;
-            purchases[cursor[P]].write(Purchase {
+            times[cursor[T].as_usize()].write(key);
+            cursor[T] += W::ONE;
+            purchases[cursor[P].as_usize()].write(Purchase {
                 key,
                 price: p.price,
                 cat: p.cat,
             });
-            cursor[P] += 1;
+            cursor[P] += W::ONE;
         }
     }
     for part in clicks {
         for c in part {
             // All occupied ranks now have a nonzero event *end*. A rank
             // with no event was never prefixed and retains its zero count.
-            if let Some(cursor) = dir.existing(c.rank).filter(|c| c[T] != 0) {
-                selected_clicks[cursor[C]].write(Click {
+            if let Some(cursor) = dir.existing(c.rank).filter(|c| c[T] != W::ZERO) {
+                selected_clicks[cursor[C].as_usize()].write(Click {
                     ts: c.ts,
                     cid: c.cid,
                     camp: c.camp,
                 });
-                cursor[C] += 1;
+                cursor[C] += W::ONE;
             }
         }
     }
@@ -167,7 +233,7 @@ fn scatter(
     let mut bins = Vec::new();
     let mut start = [0; 3];
     for rank in occupied {
-        let end = *dir.event(rank);
+        let end = dir.event(rank).map(Word::as_usize);
         let ts = &mut times[start[T]..end[T]];
         let ps = &mut purchases[start[P]..end[P]];
         let cs = &mut clicks[start[C]..end[C]];
@@ -231,6 +297,63 @@ fn bin_sessions<'a>(times: &[u32], bins: &'a mut Vec<Bin>) -> impl Iterator<Item
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_width_includes_maximum_endpoints() {
+        assert_eq!(std::mem::size_of::<Cursor<u32>>(), 12);
+        let max = u32::MAX as usize;
+        assert!(compact_fits(max, [max, 0].into_iter()));
+        assert!(compact_fits(1, [max - 1, 1].into_iter()));
+        assert!(!compact_fits(1, [max, 1].into_iter()));
+        assert!(!compact_fits(1, [usize::MAX, 1].into_iter()));
+        #[cfg(target_pointer_width = "64")]
+        assert!(!compact_fits(max + 1, [0].into_iter()));
+
+        let mut counted = vec![[u32::MAX - 1; 3]];
+        let mut occupied = Vec::new();
+        count(&mut counted, &mut occupied, 0, true);
+        counted[0][C] += 1;
+        assert_eq!(counted[0], [u32::MAX; 3]);
+        assert!(occupied.is_empty());
+
+        let mut dir = vec![[0u32; 3]; 2];
+        dir[0] = [u32::MAX - 1, u32::MAX - 1, u32::MAX - 1];
+        dir[1] = [1, 1, 1];
+        assert_eq!(prefix(&mut dir, &[0, 1]), [max; 3]);
+        assert_eq!(dir[1], [u32::MAX - 1; 3]);
+        for cursor in &mut dir[1] {
+            *cursor += 1;
+        }
+        assert_eq!(dir[1], [u32::MAX; 3]);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn wide_prefix_keeps_counts_above_u32_max() {
+        let max = u32::MAX as usize;
+        let mut dir = vec![[max, max, max], [1, 1, 1]];
+        assert_eq!(prefix(&mut dir, &[0, 1]), [max + 1; 3]);
+        assert_eq!(dir[1], [max; 3]);
+        let mut sparse: Map<u32, Cursor<usize>> = Map::with_hasher(rs());
+        sparse.insert(3, [max; 3]);
+        sparse.insert(u32::MAX, [1; 3]);
+        assert_eq!(prefix(&mut sparse, &[3, u32::MAX]), [max + 1; 3]);
+        assert_eq!(sparse[&u32::MAX], [max; 3]);
+    }
+
+    #[test]
+    fn sparse_directory_keeps_large_rank_and_ignores_missing_clicks() {
+        let mut dir: Map<u32, Cursor<u32>> = Map::with_hasher(rs());
+        let mut occupied = Vec::new();
+        let rank = u32::MAX;
+        count(&mut dir, &mut occupied, (rank as u64) << 32, true);
+        count(&mut dir, &mut occupied, (rank as u64) << 32, false);
+        assert!(dir.existing(rank - 1).is_none());
+        dir.existing(rank).unwrap()[C] += 1;
+        assert_eq!(prefix(&mut dir, &occupied), [2, 1, 1]);
+        assert_eq!(occupied, [rank]);
+        assert_eq!(*dir.existing(rank).unwrap(), [0, 0, 0]);
+    }
 
     #[test]
     fn bin_extrema_equal_sorted_sessions_even_across_empty_bins() {

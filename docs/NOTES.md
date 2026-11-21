@@ -1,5 +1,15 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round four: compact exact rank directory — 2026-11-21
+
+Experimental candidate against `0558eaa`: select a 12-byte `[u32; 3]` directory only when the actual per-owner event and aggregate click counts both fit, including exactly `u32::MAX`. Otherwise retain `[usize; 3]`; both dense and sparse directories use the selected width. The purchase total is bounded by the event total, and counting all clicks also bounds the selected subset. Histogram, prefix, and scatter use the same exact intervals. Tests exercise the maximum count and endpoint without allocating billions of rows, wide prefix totals, and the sparse `u32::MAX` rank.
+
+Validation: 27 Rust tests, 44 Python tests against each implementation, 36/36 official fixtures for each, 10 dirty 20k seeds, and official-generator seeds 7 and 15 at 10k and 100k (including leap day) all pass. Both dev checkers match all 117,038 user and 27,400 campaign rows. Stdout and the scratch directory were empty. `cargo fmt --check` and clippy with `-D warnings` passed.
+
+Eight-worker native 21-pair repeat on 1M dev: **0.051 → 0.051 s**, 7/21 candidate wins, median paired savings **-0.6%**. An earlier heavily contended run had 10/21 wins and median paired savings -1.2%, despite misleading standalone medians of 0.097 → 0.079 s. The 20k dirty input gave 0.009 → 0.009 s, 13/21 wins, median paired savings +0.8%. These small-input results do **not** establish a target-scale improvement; no input above 1M and no Docker run was permitted. Raw paired results are in ignored `scratch/compact-{dev,dev-repeat,small}.json`.
+
+A separate temporarily instrumented dev run saw eight simultaneous dense directories of 512 entries, **49,152 bytes peak**, versus a **98,304-byte** corresponding machine-width bound; no sparse directories occurred in that run. A single uninstrumented whole-process measurement was 218,497,024 → 219,217,920 bytes maximum RSS, so no process-wide peak reduction is demonstrated at this size. No second staging table or on-disk scratch was added.
+
 ## Round four: slot-indexed range reduction — 2026-11-21
 
 Port of `be4a89c` onto `4933dbe` for a direct final-scale comparison. The flat CAS graph is unchanged: the physical slot anchors identity and `slot & 255` still selects its owner. The range path indexes the owner-local histogram by `slot >> 8`, without a rank remap or another hash. Compact offsets and exact bins feed the same `finish_user_day` and `finish_person` calls as the full-width path. The columnar writer is unchanged from `4ad0e5d`. Singletons that cannot claim a slot and windows too wide for a 32-bit offset keep full-width time and exact identity. The prior standalone range branch reportedly won all ten 20M pairs by 3.5% / 2.5% against `a32d0b7`; those figures are not timings for this integration.
