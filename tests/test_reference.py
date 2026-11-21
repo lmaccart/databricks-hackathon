@@ -90,6 +90,31 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_wide_manifest_cached_and_uncached_ingest_claims(self):
+        ancient = "0001-01-02T00:00:00Z"
+        preepoch = "1969-12-31T23:59:59Z"
+        far = "9999-12-31T00:00:00Z"
+        events = [
+            ev("ancient", "ancient", ancient, ingest=ancient),
+            ev("pre", "pre", preepoch, ingest=preepoch),
+            ev("zero", "zero", "00000000000000000000", ingest=preepoch),
+            ev("far", "far", far, ingest="9999-12-31T23:59:59Z"),
+            ev("far-too-late", "late", "9999-12-30T00:00:00Z", ingest="9999-12-31T00:00:01Z"),
+            ev("drop-cached", "loser", preepoch, ingest=preepoch),
+            ev("drop-uncached", "loser", far, ingest=far),
+        ]
+        copies = [
+            ev("drop-cached", "", preepoch, ingest=ancient),
+            ev("drop-uncached", "", far, ingest=preepoch),
+            ev("pre", "", preepoch, pid='p"1', ingest=ancient),
+        ]
+        users, _ = run_case(events, extra={"events/part-1.csv": copies},
+                            window=("0001-01-01T00:00:00Z", "9999-12-31T23:59:59Z"))
+        self.assertEqual(set(users), {
+            ("ancient", "0001-01-02"), ("pre", "1969-12-31"),
+            ("zero", "1970-01-01"), ("far", "9999-12-31"),
+        })
+
     def test_exact_bytes_and_distant_ingest_across_files(self):
         # Quoting does not change identity, but trailing spaces, NULs, Unicode
         # and prefix extensions do. The distant invalid copy still wins.

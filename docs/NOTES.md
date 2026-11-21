@@ -1,5 +1,14 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Manifest clock stacked on exact permuted claims — 2026-11-20
+
+Stack `1c1ccc9`'s exact manifest-day and minute lookup on `3811b3c`.
+The clock returns whole seconds for F1: the claim keeps them directly and
+event/click timestamps convert them to milliseconds. Date misses use the
+full Gregorian parser; non-F1 or malformed ingests keep the existing exact
+millisecond or invalid sidecar order. Claim layout, prefetch and routing are unchanged.
+Stacked native A/B timing is pending; no large runs in this worktree.
+
 ## Exact permuted event claims experiment — 2026-11-20
 
 Against `012174f`, route by the top byte of the reversible event-ID token.

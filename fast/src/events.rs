@@ -108,10 +108,10 @@ fn parse<'a>(
     c: &Chunk<'a>,
     sm: &Small,
     people: &People<'a>,
-    ws: i64,
-    we: i64,
+    window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
 ) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
+    let (ws, we, clock) = window;
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Payload> = (0..NS)
         .map(|_| {
@@ -148,8 +148,8 @@ fn parse<'a>(
             return;
         }
         let claim_key = links::mix(people.codec.key(r[0]));
-        let (ingest, seconds) = ts::ingest_for_claim(r[3]);
-        let ts = parse_ts(r[2]);
+        let (ingest, seconds) = clock.ingest_for_claim(r[3]);
+        let ts = clock.parse_ts(r[2]);
         let mut next = Pending {
             claim_key,
             ts,
@@ -286,14 +286,13 @@ pub(super) fn by_person<'a>(
     chunks: &[Chunk<'a>],
     sm: &Small,
     people: &People<'a>,
-    ws: i64,
-    we: i64,
+    window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Payload>> {
     let parsed: Vec<_> = chunks
         .par_iter()
-        .map(|c| parse(c, sm, people, ws, we, packing))
+        .map(|c| parse(c, sm, people, window, packing))
         .collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
@@ -362,6 +361,7 @@ mod tests {
 
     #[test]
     fn claims_round_trip_exact_tokens_locators_and_millisecond_spills() {
+        let clock = ManifestClock::new(parse_ts(b"2000-02-28T00:00:00Z"), parse_ts(b"2000-03-03T00:00:00Z"));
         let mut spill = Vec::new();
         for id in [b"e1".as_slice(), b"e1\0", b"e123456789", "é".as_bytes()] {
             let codec = Codec::new();
@@ -372,9 +372,12 @@ mod tests {
                     b"9999-12-31T23:59:59Z",
                     b"2000-02-29T00:00:00Z",
                     b"00000001551",
+                    b"2000-02-29T00:00:00+00:00",
+                    b"2000-02-29T00:00:60Z",
+                    b"9999-12-31T23:59:60Z",
                     b"not a timestamp",
                 ] {
-                    let (ms, secs) = ts::ingest_for_claim(s);
+                    let (ms, secs) = clock.ingest_for_claim(s);
                     let claim = Claim::new(mixed, target, Claim::order(ms, secs, &mut spill));
                     assert_eq!(claim.ingest(&spill), ts::parse_ingest(s));
                     assert_eq!(claim.target(), target);
