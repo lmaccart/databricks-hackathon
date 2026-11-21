@@ -55,7 +55,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 /// F1 (`F2 == false`, 20 bytes) or F2 (25 bytes), or BAD.
 #[inline(always)]
-fn iso<const F2: bool>(s: &[u8]) -> i64 {
+fn iso<const F2: bool>(s: &[u8], days: Option<&mut DayCache>) -> i64 {
     let a = load8(s, 0) ^ T_DATE;
     let t = load8(s, 8) ^ T_TIME;
     let (z, ok, off_min) = if F2 {
@@ -72,19 +72,30 @@ fn iso<const F2: bool>(s: &[u8]) -> i64 {
     if !(fits(a, A_DATE) & fits(t, A_TIME) & ok) {
         return BAD;
     }
-    let y = b(a, 0) * 1000 + b(a, 1) * 100 + b(a, 2) * 10 + b(a, 3);
-    let (mo, d) = (b(a, 5) * 10 + b(a, 6), b(t, 0) * 10 + b(t, 1));
     let (h, mi, se) = (b(t, 3) * 10 + b(t, 4), b(t, 6) * 10 + b(t, 7), b(z, 1) * 10 + b(z, 2));
-    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 {
+    if h > 23 || mi > 59 || se > 59 {
         return BAD;
     }
-    const MD: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let mdays = if mo == 2 && leap { 29 } else { MD[mo as usize] };
-    if d < 1 || d > mdays {
-        return BAD;
-    }
-    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se;
+    let day = if let Some(cache) = days {
+        match cache.day(&s[..10]) {
+            Some(day) => day,
+            None => return BAD,
+        }
+    } else {
+        let y = b(a, 0) * 1000 + b(a, 1) * 100 + b(a, 2) * 10 + b(a, 3);
+        let (mo, d) = (b(a, 5) * 10 + b(a, 6), b(t, 0) * 10 + b(t, 1));
+        if !(1..=12).contains(&mo) {
+            return BAD;
+        }
+        const MD: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let mdays = if mo == 2 && leap { 29 } else { MD[mo as usize] };
+        if d < 1 || d > mdays {
+            return BAD;
+        }
+        days_from_civil(y, mo, d)
+    };
+    let secs = day * 86_400 + h * 3600 + mi * 60 + se;
     (secs - off_min * 60) * 1000 // subtract the offset to get UTC
 }
 
@@ -163,9 +174,137 @@ fn epoch_ms(s: &[u8]) -> i64 {
 pub fn parse_ts(s: &[u8]) -> i64 {
     // s[4] == '-' rules out F3, so F1/F2 syntax decides alone
     match s.len() {
-        20 if s[4] == b'-' => iso::<false>(s),
-        25 if s[4] == b'-' => iso::<true>(s),
+        20 if s[4] == b'-' => iso::<false>(s, None),
+        25 if s[4] == b'-' => iso::<true>(s, None),
         _ => epoch_ms(s),
+    }
+}
+
+#[inline]
+pub fn parse_ts_cached(s: &[u8], days: &mut DayCache) -> i64 {
+    match s.len() {
+        20 if s[4] == b'-' => iso::<false>(s, Some(days)),
+        25 if s[4] == b'-' => iso::<true>(s, Some(days)),
+        _ => parse_ts(s),
+    }
+}
+
+const DATE_CACHE_LEN: usize = 64;
+const INVALID_DAY: i32 = i32::MIN;
+const EMPTY_DATE: [u8; 10] = [0xFF; 10];
+
+#[derive(Clone, Copy)]
+struct DateEntry {
+    spelling: [u8; 10],
+    day: i32,
+}
+
+/// Small per-parse-task cache. Exact spelling is the key so malformed dates
+/// (including impossible calendar days) are cached without aliasing valid ones.
+pub struct DayCache {
+    entries: [DateEntry; DATE_CACHE_LEN],
+}
+
+impl DayCache {
+    pub fn new() -> Self {
+        Self {
+            entries: [DateEntry {
+                spelling: EMPTY_DATE,
+                day: INVALID_DAY,
+            }; DATE_CACHE_LEN],
+        }
+    }
+
+    #[inline]
+    fn day(&mut self, date: &[u8]) -> Option<i64> {
+        if date.len() != 10 {
+            return None;
+        }
+        let key: [u8; 10] = date.try_into().unwrap();
+        let day_digits = u16::from_le_bytes([key[8], key[9]]) as u64;
+        let packed = load8(date, 0) ^ (day_digits << 48);
+        let slot = packed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - DATE_CACHE_LEN.trailing_zeros());
+        let entry = &mut self.entries[slot as usize];
+        if entry.spelling != key {
+            entry.day = decode_date(date).unwrap_or(INVALID_DAY);
+            entry.spelling = key;
+        }
+        (entry.day != INVALID_DAY).then_some(entry.day as i64)
+    }
+}
+
+#[inline]
+fn f1_with_day(s: &[u8], day: Option<i64>) -> Option<i64> {
+    if s.len() != 20 || s[4] != b'-' {
+        return None;
+    }
+    let day = day?;
+    let t = load8(s, 8) ^ T_TIME;
+    let z = u32::from_le_bytes(s[16..20].try_into().unwrap()) as u64 ^ T_F1;
+    if !(fits(t, A_TIME) && fits(z, A_F1)) {
+        return None;
+    }
+    let (h, mi, se) = (b(t, 3) * 10 + b(t, 4), b(t, 6) * 10 + b(t, 7), b(z, 1) * 10 + b(z, 2));
+    if h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    Some(day * 86_400_000 + (h * 3600 + mi * 60 + se) * 1000)
+}
+
+/// F1 and F2 share the same strict calendar rules; F1's date-only cache avoids
+/// repeating the Gregorian conversion for the many timestamps on each date.
+#[inline]
+fn decode_date(s: &[u8]) -> Option<i32> {
+    if s.len() != 10 {
+        return None;
+    }
+    let a = load8(s, 0) ^ T_DATE;
+    let d0 = s[8].wrapping_sub(b'0');
+    let d1 = s[9].wrapping_sub(b'0');
+    if !(fits(a, A_DATE) && d0 <= 9 && d1 <= 9) {
+        return None;
+    }
+    let y = b(a, 0) * 1000 + b(a, 1) * 100 + b(a, 2) * 10 + b(a, 3);
+    let mo = b(a, 5) * 10 + b(a, 6);
+    let d = d0 as i64 * 10 + d1 as i64;
+    if !(1..=12).contains(&mo) {
+        return None;
+    }
+    const MD: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mdays = if mo == 2 && leap { 29 } else { MD[mo as usize] };
+    if d < 1 || d > mdays {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d) as i32)
+}
+
+/// Return `(event_ts, ingest_ts, proven_same_day)`. The final bit is true only
+/// for two valid F1 values with identical date spellings.
+#[inline]
+pub fn parse_event_times(ts: &[u8], ingest: &[u8], days: &mut DayCache) -> (i64, i64, bool) {
+    if ts.len() == 20 && ts[4] == b'-' && ingest.len() == 20 && ingest[4] == b'-' {
+        let shared_date = ts[..10] == ingest[..10];
+        let event_day = days.day(&ts[..10]);
+        let ingest_day = if shared_date {
+            event_day
+        } else {
+            days.day(&ingest[..10])
+        };
+        let event = f1_with_day(ts, event_day);
+        let ing = f1_with_day(ingest, ingest_day);
+        let same_day = event.is_some() && ing.is_some() && shared_date;
+        return (event.unwrap_or(BAD), ing.unwrap_or(i64::MAX), same_day);
+    }
+    (parse_ts_cached(ts, days), parse_ingest_cached(ingest, days), false)
+}
+
+#[inline]
+fn parse_ingest_cached(s: &[u8], days: &mut DayCache) -> i64 {
+    if s.len() == 20 && s[4] == b'-' {
+        f1_with_day(s, days.day(&s[..10])).unwrap_or(i64::MAX)
+    } else {
+        parse_ingest(s)
     }
 }
 
@@ -266,8 +405,90 @@ mod tests {
 
     fn check(s: &[u8]) {
         assert_eq!(parse_ts(s), want(s), "{:?}", String::from_utf8_lossy(s));
+        assert_eq!(
+            parse_ts_cached(s, &mut DayCache::new()),
+            want(s),
+            "cached {:?}",
+            String::from_utf8_lossy(s)
+        );
         let ingest = if want(s) == BAD { i64::MAX } else { want(s) };
         assert_eq!(parse_ingest(s), ingest, "ingest {:?}", String::from_utf8_lossy(s));
+        let (paired_ts, paired_ingest, same_day) = parse_event_times(s, s, &mut DayCache::new());
+        assert_eq!(paired_ts, want(s), "paired ts {:?}", String::from_utf8_lossy(s));
+        assert_eq!(paired_ingest, ingest, "paired ingest {:?}", String::from_utf8_lossy(s));
+        assert_eq!(
+            same_day,
+            s.len() == 20 && s.get(4) == Some(&b'-') && want(s) != BAD,
+            "paired same-day proof {:?}",
+            String::from_utf8_lossy(s)
+        );
+    }
+
+    #[test]
+    fn paired_event_and_ingest_f1_reuses_exact_dates() {
+        let mut dates = DayCache::new();
+        let cases: &[(&[u8], &[u8], bool)] = &[
+            (b"2028-02-29T23:59:59Z", b"2028-02-29T00:00:00Z", true),
+            (b"2028-02-29T00:00:00Z", b"2028-02-29T23:59:59Z", true),
+            (b"1900-02-28T23:59:59Z", b"1900-03-01T00:00:00Z", false),
+            (b"2026-10-03T23:58:10-04:00", b"2026-10-03T23:58:10Z", false),
+            (b"1791071890000", b"2026-10-03T23:58:10Z", false),
+            (b"2026-02-30T00:00:00Z", b"2026-02-30T00:00:00Z", false),
+            (b"2026-10-03T23:59:60Z", b"2026-10-03T23:58:10Z", false),
+            (b"2026-10-03T23:58:10Z", b"2026-10-03T23:59:60Z", false),
+            (b"2026-10-03T23:58:10Z", b"2026-10-03T23:58:10+00:00", false),
+            (b"2026-10-03T23:58:10Z\r", b"not-an-ingest", false),
+        ];
+        for &(ts, ingest, same_day) in cases {
+            let (got_ts, got_ingest, got_same_day) = parse_event_times(ts, ingest, &mut dates);
+            assert_eq!(got_ts, parse_ts(ts), "ts {ts:?}");
+            assert_eq!(got_ingest, parse_ingest(ingest), "ts {ts:?}, ingest {ingest:?}");
+            assert_eq!(got_same_day, same_day, "same day {ts:?} {ingest:?}");
+        }
+    }
+
+    #[test]
+    fn day_cache_rechecks_exact_spelling_after_collisions() {
+        let mut cache = DayCache::new();
+        for year in 2020..2025 {
+            for month in 1..=12 {
+                for date in 1..=31 {
+                    let spelling = format!("{year:04}-{month:02}-{date:02}");
+                    assert_eq!(
+                        cache.day(spelling.as_bytes()),
+                        decode_date(spelling.as_bytes()).map(i64::from)
+                    );
+                }
+            }
+        }
+        let invalid = b"2024-02-30";
+        assert_eq!(cache.day(invalid), None);
+        assert_eq!(cache.day(b"2024-02-29"), Some(days_from_civil(2024, 2, 29)));
+        assert_eq!(cache.day(invalid), None);
+    }
+
+    #[test]
+    fn paired_clocks_reject_corruption_and_match_fallback_independently() {
+        let good = b"2028-02-29T23:59:59Z";
+        let mut cache = DayCache::new();
+        for i in 0..good.len() {
+            for byte in 0..=255 {
+                let mut changed = *good;
+                changed[i] = byte;
+                for (event, ingest) in [
+                    (changed.as_slice(), good.as_slice()),
+                    (good.as_slice(), changed.as_slice()),
+                ] {
+                    let (e, ing, same) = parse_event_times(event, ingest, &mut cache);
+                    assert_eq!(e, parse_ts(event), "event {event:?}, ingest {ingest:?}");
+                    assert_eq!(ing, parse_ingest(ingest), "event {event:?}, ingest {ingest:?}");
+                    if same {
+                        assert!(e != BAD && ing != i64::MAX && ing.saturating_sub(e) <= 86_400_000);
+                        assert_eq!(&event[..10], &ingest[..10]);
+                    }
+                }
+            }
+        }
     }
 
     struct Rng(u64);

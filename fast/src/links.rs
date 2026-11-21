@@ -63,13 +63,6 @@ pub(super) struct People<'a> {
 
 impl<'a> People<'a> {
     #[inline]
-    pub(super) fn resolve(&self, uid: &'a [u8]) -> u64 {
-        let key = self.codec.key(uid);
-        let h = mix(key);
-        self.lookup(key, h)
-    }
-
-    #[inline]
     pub(super) fn lookup(&self, key: u64, h: u64) -> u64 {
         let lane = &self.lanes[h as usize & (LANES - 1)];
         let s = lane.slots[lane.find(key, h)];

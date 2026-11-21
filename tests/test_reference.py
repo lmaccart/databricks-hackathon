@@ -90,6 +90,28 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class Timestamps(unittest.TestCase):
+    def test_paired_clocks_boundaries_and_cached_click_dates(self):
+        events = [
+            ev("same", "same", "2026-10-02T00:00:00Z", ingest="2026-10-02T23:59:59Z"),
+            ev("before", "before", "2026-10-02T23:59:59Z", ingest="2026-10-02T00:00:00Z"),
+            ev("exact", "exact", "2026-10-02T00:00:00Z", ingest="2026-10-03T00:00:00Z"),
+            ev("late", "late", "2026-10-02T00:00:00Z", ingest="2026-10-03T00:00:01Z"),
+            ev("offset", "offset", "2026-10-01T20:00:00-04:00", ingest="2026-10-03T00:00:00Z"),
+            ev("bad", "bad", "2026-10-02T00:00:60Z", ingest="2026-10-02T00:00:00Z"),
+        ]
+        clicks = [
+            '"k1","same","c_1","2026-10-01T23:59:59Z"',
+            "k2,same,c_2,2026-10-01T19:59:59-04:00",
+            "bad1,same,c_3,2026-10-01T23:59:60Z",
+            "bad2,same,c_3,2026-10-01T23:59:59Z\r",
+        ]
+        users, campaigns = run_case(events=events, clicks=clicks)
+        day = "2026-10-02"
+        self.assertEqual({name for name, _ in users}, {"same", "before", "exact", "offset"})
+        self.assertEqual(campaigns[("c_1", day)]["sessions"], 1)
+        self.assertEqual(campaigns[("c_2", day)]["assisted_sessions"], 1)
+        self.assertNotIn(("c_3", day), campaigns)
+
     def test_forms(self):
         f1 = ms("2026-10-03T23:58:10Z")
         self.assertEqual(f1, 1791071890000)
@@ -378,6 +400,32 @@ class Clicks(unittest.TestCase):
 
 
 class ByteDistinctIds(unittest.TestCase):
+    def test_dimension_spellings_and_pipelined_click_ties(self):
+        s = ms("2026-10-09T12:00:00Z")
+        products = ["p1,first", "p2,second", "p01,padded", "P1,upper",
+                    "p\u00e91,unicode", "p\x001,nul", "p999999999999999999999999999,large"]
+        campaigns = ["c_1,one", "c_2,two", "c_01,padded", "C_1,upper",
+                     "c_\u00e91,unicode", "c_\x001,nul",
+                     "c_999999999999999999999999999,large"]
+        # More than one FIFO rotation, including external and zero-padded keys.
+        clicks = [f"z{i},user,c_1,{s - HOUR}" for i in range(40)]
+        clicks += [f"\u00e9,user,c_2,{s - HOUR}", f"a\x00,user,c_01,{s - HOUR}",
+                   f"a,user,C_1,{s - HOUR}", f"b,user,c_\u00e91,{s - HOUR}",
+                   f"c,user,c_\x001,{s - HOUR}",
+                   f"d,user,c_999999999999999999999999999,{s - HOUR}",
+                   f"bad,user,c_001,{s - HOUR}"]
+        events = [ev(f"e{i}", "user", str(s), "purchase", product, str(i + 1))
+                  for i, product in enumerate(("p1", "p2", "p01", "P1", "p\u00e91",
+                                                "p\x001", "p999999999999999999999999999", "p001"))]
+        users, result = run_case(events=events, clicks=clicks, products=products, campaigns=campaigns)
+        day = "2026-10-09"
+        self.assertEqual(users[("user", day)]["top_category"], "unknown")
+        self.assertEqual(result[("C_1", day)]["sessions"], 1)
+        for campaign in ("c_1", "c_2", "c_01", "C_1", "c_\u00e91", "c_\x001",
+                         "c_999999999999999999999999999"):
+            self.assertEqual(result[(campaign, day)]["assisted_sessions"], 1)
+        self.assertNotIn(("c_001", day), result)
+
     def test_lookalike_ids_and_lexical_click_tie(self):
         s = ms("2026-10-09T12:00:00Z")
         k = s - HOUR

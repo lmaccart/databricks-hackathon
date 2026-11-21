@@ -1,10 +1,20 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Sweep + catalog/ring + paired clocks — 2026-11-20
+
+Combined the chronological sweep with exact catalog indexing, click-owner prefetch and exact-date cached paired event clocks. The packed-stream/rank experiment is not included. The combined candidate passed 21 Rust tests, clippy with warnings denied, 34 reference and binary edge cases, 36/36 official fixtures for both, ten 20k kit dirty seeds, official 100k seeds 7 and 15 (leap day), and both dev-answer comparers with empty stdout. No combined timing: parent will run the Linux two-seed A/B.
+
 ## Candidate: chronological bin sweep — 2026-11-20 (Houston)
 
 Each person shard counts and scatters the surviving events by 30-minute bin, then sweeps nonempty person/bin summaries into sessions. Only a dense person slot, current extrema, and a purchase chain are maintained; there is no global `(person, bin)` table. Sorting and attribution operate on the resulting sessions. Windows beyond 4,096 bins, shards too small to amortize setup, sparsely repeated prefixes, and shards producing over one session per two events use the full event-sort path. Candidate only; 20M native paired timing is deferred to the parent.
 
 Local checks: 16 Rust tests, 32 edge cases on both implementations, 36/36 official fixtures on both, 10 kit seeds, and exact public dev parity with empty stdout. No scale or Docker run.
+
+## Paired F1 timestamp challenger — 2026-11-20
+
+Added an exact-spelling, direct-mapped day cache to strict F1/F2 timestamp decoding (events and clicks), and a paired event/ingest F1 path. When both F1 dates match and both timestamps validate, parsing proves the event is not more than 24 hours late without subtracting the full epoch values. Invalid dates use a cached sentinel; other timestamp forms and malformed ingests retain the existing parser behavior. This follows rules.md: “`ingest_ts` is always valid F1.”
+
+The locked release Rust suite, 31 Python tests against the binary, 36 official fixtures, ten 20k dirty-data seeds, and both dev-answer comparers pass. No native timing was run here; the parent session will decide whether this challenger clears the speed threshold.
 
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
