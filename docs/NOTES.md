@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## First hidden practice result
+
+Leif reports **5.03 s** for `cc9f33e`. At the user-reported 0.68 s lead that is a 7.40× gap on the practice clock. The 2.45 s native baseline below is a different measurement; use interleaved local runs to rank changes and a fresh organizer run to evaluate rank.
+
 ## What the official material established
 
 The printed track page times **container start to exit** on eight pinned hyperthreads with 24 GB and no swap. The final runs approximately 60M events three times; any run over 180 s means no final score. The printout's practice leader was 0.75 s. Neither Opus's 0.59 s on 2M kit events nor a native Mac timing is comparable to that leaderboard.

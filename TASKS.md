@@ -25,7 +25,7 @@ Each task is sized for one agent session. Do them in order; T1 to T4 decide whet
   ```
   *Accept:* outputs match the dev answer; nothing written to stdout; image < 200 MB; build < 10 min.
 
-- [ ] **T5. First practice submission** (Leif does the submit on the track page: public repo URL + commit). Record the score.
+- [x] **T5. First practice submission.** Leif reports the organizer scored `cc9f33e` at **5.03 s**. Reference point for optimization; local and organizer clocks differ.
   *Accept:* a practice score on the leaderboard.
 
 ## Phase B: make it bullet-proof
