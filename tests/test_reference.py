@@ -110,6 +110,20 @@ class EventClaims(unittest.TestCase):
         self.assertEqual({key[0]: (row["events"], row["revenue_cents"]) for key, row in users.items()},
                          {"USER_07": (1, 0), "USER_08": (1, 0), "USER_12": (1, 123), "USER_13": (1, 0)})
 
+    def test_row_end_skips_neither_long_rows_nor_invalid_earliest(self):
+        t = "2026-10-03T10:00:00Z"
+        early = "2026-10-03T09:59:59Z"
+        users, _ = run_case(events=[
+            ev("long00001", "odd000001", t, price='"' + "x" * 8193 + '"'),
+            "",
+            ev("invalid01", "invalid01", t, ingest=early, etype='"purchase"', price='"9\r"'),
+            ev("invalid01", "rescued01", t),
+            ev("bad000001", "hidden001", t, ingest=early, price='"x"x'),
+            ev("bad000001", "valid0001", t, etype='"purchase"', pid='"p2"', price='"42"'),
+        ])
+        self.assertEqual({key[0]: (row["events"], row["revenue_cents"]) for key, row in users.items()},
+                         {"odd000001": (1, 0), "valid0001": (1, 42)})
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"

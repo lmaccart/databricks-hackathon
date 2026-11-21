@@ -47,6 +47,57 @@ pub fn identity_row<'a, const N: usize>(line: &'a [u8], f: &mut impl FnMut(&[&'a
     scan::<Native, _>(line, &slot, f);
 }
 
+/// Unlike field boundaries, physical line ends do not depend on CSV syntax.
+#[inline]
+pub fn physical_lines<'a>(data: &'a [u8], mut line: impl FnMut(&'a [u8])) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 is available.
+        return unsafe { physical_lines_avx2(data, &mut line) };
+    }
+    lines::<Native>(data, &mut line);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn physical_lines_avx2<'a>(data: &'a [u8], line: &mut impl FnMut(&'a [u8])) {
+    lines::<Avx2>(data, line)
+}
+
+#[inline(always)]
+fn lines<'a, C: Classify>(data: &'a [u8], line: &mut impl FnMut(&'a [u8])) {
+    let mut start = 0;
+    let (blocks, tail) = data.as_chunks::<64>();
+    let mut blocks = blocks.iter().enumerate();
+    let mut hits = 0u64;
+    let mut base = 0;
+    loop {
+        while hits == 0 {
+            let Some((i, b)) = blocks.next() else {
+                // Cold: at most 63 as-yet unscanned bytes, but the last row
+                // may have started in any of the preceding blocks.
+                let offset = data.len() - tail.len();
+                for i in memchr::memchr_iter(b'\n', tail) {
+                    let end = offset + i;
+                    line(&data[start..end]);
+                    start = end + 1;
+                }
+                if start < data.len() {
+                    line(&data[start..]);
+                }
+                return;
+            };
+            base = i * 64;
+            // SAFETY: b is 64 readable bytes.
+            hits = unsafe { C::mask::<true>(b.as_ptr()) };
+        }
+        let end = base + hits.trailing_zeros() as usize;
+        hits &= hits - 1;
+        line(&data[start..end]);
+        start = end + 1;
+    }
+}
+
 pub fn chunks_of<'a>(file: &'a [u8], cols: &[&str], path: &Path) -> Vec<Chunk<'a>> {
     chunks_sized(file, cols, path, crate::CHUNK)
 }
@@ -202,7 +253,7 @@ impl<'a, C: Classify> Cursor<'a, C> {
     fn block(data: &[u8], at: usize) -> u64 {
         if data.len() - at >= 64 {
             // SAFETY: 64 readable bytes at `at`.
-            unsafe { C::mask(data.as_ptr().add(at)) }
+            unsafe { C::mask::<false>(data.as_ptr().add(at)) }
         } else {
             Self::tail(&data[at..])
         }
@@ -214,7 +265,7 @@ impl<'a, C: Classify> Cursor<'a, C> {
         let mut buf = [0u8; 64]; // zero is not structural
         buf[..rest.len()].copy_from_slice(rest);
         // SAFETY: buf has 64 bytes.
-        unsafe { C::mask(buf.as_ptr()) }
+        unsafe { C::mask::<false>(buf.as_ptr()) }
     }
 
     #[inline(always)]
@@ -246,9 +297,9 @@ impl<'a, C: Classify> Cursor<'a, C> {
 // ------------------------------------------------------------------ classifiers
 
 trait Classify {
-    /// Bit i set iff byte i of the 64 at `p` is `,`, `"` or `\n`.
+    /// Bit i set iff byte i of the 64 at `p` is `\n` (or `,`, `"` if !LF_ONLY).
     /// SAFETY: 64 bytes at `p` must be readable.
-    unsafe fn mask(p: *const u8) -> u64;
+    unsafe fn mask<const LF_ONLY: bool>(p: *const u8) -> u64;
 }
 
 /// Portable fallback: exact zero-byte detection on eight 64-bit words.
@@ -257,7 +308,7 @@ struct Swar;
 
 impl Classify for Swar {
     #[inline(always)]
-    unsafe fn mask(p: *const u8) -> u64 {
+    unsafe fn mask<const LF_ONLY: bool>(p: *const u8) -> u64 {
         const LO: u64 = 0x7F7F_7F7F_7F7F_7F7F;
         const ONES: u64 = 0x0101_0101_0101_0101;
         // 0x80 in each zero byte, nothing else (no borrow between bytes)
@@ -266,7 +317,12 @@ impl Classify for Swar {
         for i in 0..8 {
             // SAFETY: caller guarantees 64 readable bytes.
             let w = u64::from_le_bytes(unsafe { p.add(8 * i).cast::<[u8; 8]>().read_unaligned() });
-            let hit = zero(w ^ (ONES * b',' as u64)) | zero(w ^ (ONES * b'"' as u64)) | zero(w ^ (ONES * b'\n' as u64));
+            let lf = zero(w ^ (ONES * b'\n' as u64));
+            let hit = if LF_ONLY {
+                lf
+            } else {
+                lf | zero(w ^ (ONES * b',' as u64)) | zero(w ^ (ONES * b'"' as u64))
+            };
             m |= ((hit >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * i);
         }
         m
@@ -287,7 +343,7 @@ struct Sse2;
 #[cfg(target_arch = "x86_64")]
 impl Classify for Sse2 {
     #[inline(always)]
-    unsafe fn mask(p: *const u8) -> u64 {
+    unsafe fn mask<const LF_ONLY: bool>(p: *const u8) -> u64 {
         use std::arch::x86_64::*;
         // SAFETY: caller guarantees 64 readable bytes; SSE2 is baseline on x86_64.
         unsafe {
@@ -299,10 +355,12 @@ impl Classify for Sse2 {
             let mut m = 0u64;
             for i in 0..4 {
                 let v = _mm_loadu_si128(p.add(16 * i).cast());
-                let hit = _mm_or_si128(
-                    _mm_or_si128(_mm_cmpeq_epi8(v, cm), _mm_cmpeq_epi8(v, qt)),
-                    _mm_cmpeq_epi8(v, nl),
-                );
+                let lf = _mm_cmpeq_epi8(v, nl);
+                let hit = if LF_ONLY {
+                    lf
+                } else {
+                    _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, cm), _mm_cmpeq_epi8(v, qt)), lf)
+                };
                 m |= (_mm_movemask_epi8(hit) as u16 as u64) << (16 * i);
             }
             m
@@ -317,16 +375,16 @@ struct Avx2;
 #[cfg(target_arch = "x86_64")]
 impl Classify for Avx2 {
     #[inline(always)]
-    unsafe fn mask(p: *const u8) -> u64 {
+    unsafe fn mask<const LF_ONLY: bool>(p: *const u8) -> u64 {
         // SAFETY: caller guarantees 64 readable bytes and AVX2 support.
-        unsafe { avx2_mask(p) }
+        unsafe { avx2_mask::<LF_ONLY>(p) }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn avx2_mask(p: *const u8) -> u64 {
+unsafe fn avx2_mask<const LF_ONLY: bool>(p: *const u8) -> u64 {
     use std::arch::x86_64::*;
     // SAFETY: caller guarantees 64 readable bytes.
     unsafe {
@@ -337,14 +395,16 @@ unsafe fn avx2_mask(p: *const u8) -> u64 {
         );
         let lo = _mm256_loadu_si256(p.cast());
         let hi = _mm256_loadu_si256(p.add(32).cast());
-        let lo = _mm256_or_si256(
-            _mm256_or_si256(_mm256_cmpeq_epi8(lo, cm), _mm256_cmpeq_epi8(lo, qt)),
-            _mm256_cmpeq_epi8(lo, nl),
-        );
-        let hi = _mm256_or_si256(
-            _mm256_or_si256(_mm256_cmpeq_epi8(hi, cm), _mm256_cmpeq_epi8(hi, qt)),
-            _mm256_cmpeq_epi8(hi, nl),
-        );
+        let hit = |v| {
+            let lf = _mm256_cmpeq_epi8(v, nl);
+            if LF_ONLY {
+                lf
+            } else {
+                _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(v, cm), _mm256_cmpeq_epi8(v, qt)), lf)
+            }
+        };
+        let lo = hit(lo);
+        let hi = hit(hi);
         (_mm256_movemask_epi8(lo) as u32 as u64) | ((_mm256_movemask_epi8(hi) as u32 as u64) << 32)
     }
 }
@@ -356,7 +416,7 @@ struct Neon;
 #[cfg(target_arch = "aarch64")]
 impl Classify for Neon {
     #[inline(always)]
-    unsafe fn mask(p: *const u8) -> u64 {
+    unsafe fn mask<const LF_ONLY: bool>(p: *const u8) -> u64 {
         use std::arch::aarch64::*;
         const BIT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
         // SAFETY: caller guarantees 64 readable bytes; NEON is baseline on aarch64.
@@ -366,8 +426,13 @@ impl Classify for Neon {
             let mut h = [vdupq_n_u8(0); 4];
             for (i, h) in h.iter_mut().enumerate() {
                 let v = vld1q_u8(p.add(16 * i));
+                let lf = vceqq_u8(v, nl);
                 *h = vandq_u8(
-                    vorrq_u8(vorrq_u8(vceqq_u8(v, cm), vceqq_u8(v, qt)), vceqq_u8(v, nl)),
+                    if LF_ONLY {
+                        lf
+                    } else {
+                        vorrq_u8(vorrq_u8(vceqq_u8(v, cm), vceqq_u8(v, qt)), lf)
+                    },
                     bit,
                 );
             }
@@ -383,6 +448,23 @@ mod tests {
     use super::*;
 
     type Rows = Vec<Vec<Vec<u8>>>;
+
+    #[test]
+    fn lf_only_walker_matches_physical_splits_at_every_block_offset() {
+        let long = [b'X'; 211];
+        for offset in 0..128 {
+            for suffix in [&b""[..], b"\n", b"\"\n", b"\"\n\r", b"\n\"\n", b"abc"] {
+                let data = [&long[..offset], b"\n\n\"a\nb\",x\r\n", &long, suffix].concat();
+                let want = data
+                    .split_inclusive(|&b| b == b'\n')
+                    .map(|s| s.strip_suffix(b"\n").unwrap_or(s));
+                let mut got = vec![];
+                physical_lines(&data, |line| got.push(line));
+                assert!(got.into_iter().eq(want), "offset {offset}, suffix {suffix:?}");
+            }
+        }
+        physical_lines(b"", |_| panic!("empty input is not a line"));
+    }
 
     // ---- literal transcription of reference/pipeline.py (read_csv_rows, parse_line, _unquote)
 
@@ -515,11 +597,11 @@ mod tests {
             }
             let want = scalar_mask(&buf);
             unsafe {
-                assert_eq!(Swar::mask(buf.as_ptr()), want, "swar {buf:?}");
-                assert_eq!(Native::mask(buf.as_ptr()), want, "native {buf:?}");
+                assert_eq!(Swar::mask::<false>(buf.as_ptr()), want, "swar {buf:?}");
+                assert_eq!(Native::mask::<false>(buf.as_ptr()), want, "native {buf:?}");
                 #[cfg(target_arch = "x86_64")]
                 if std::arch::is_x86_feature_detected!("avx2") {
-                    assert_eq!(Avx2::mask(buf.as_ptr()), want, "avx2 {buf:?}");
+                    assert_eq!(Avx2::mask::<false>(buf.as_ptr()), want, "avx2 {buf:?}");
                 }
             }
         }

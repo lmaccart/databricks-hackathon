@@ -14,11 +14,6 @@ fn quoted(s: &[u8]) -> (bool, &[u8]) {
     }
 }
 
-#[inline(always)]
-fn comma(s: &[u8], q: bool) -> Option<&[u8]> {
-    s.strip_prefix(if q { b"\"," as &[u8] } else { b"," })
-}
-
 /// The tight ID path uses the same load to prove ASCII and construct the
 /// inline token. `'-'..=127` excludes all three CSV structural bytes and NUL;
 /// IDs with any other spelling are still handled by the ordinary codec.
@@ -57,45 +52,49 @@ fn id(s: &[u8]) -> Option<(u64, &[u8])> {
 }
 
 #[inline(always)]
-fn fixed<const N: usize>(s: &[u8], q: bool) -> Option<(&[u8; N], &[u8])> {
-    let body = s.first_chunk::<N>()?;
-    Some((body, comma(&s[N..], q)?))
+fn ingest(s: &[u8], clock: &ManifestClock) -> Option<(i64, usize)> {
+    let q = s.ends_with(b"\"");
+    let body = &s[..s.len() - usize::from(q)];
+    let (before, ingest) = body.split_last_chunk::<20>()?;
+    let seconds = clock.event_f1_seconds(ingest);
+    let s = before.strip_suffix(if q { b",\"" as &[u8] } else { b"," })?;
+    (seconds != BAD).then_some((seconds, s.len()))
 }
 
 #[inline(always)]
-fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [u8])> {
+fn event_time(s: &[u8], clock: &ManifestClock) -> Option<i64> {
     let (q, b) = quoted(s);
-    let (ts, rest) = if *b.get(4)? != b'-' {
-        let (body, rest) = fixed::<13>(b, q)?;
-        (ManifestClock::event_f3(body), rest)
-    } else if *b.get(19)? == b'Z' {
-        let (body, rest) = fixed::<20>(b, q)?;
-        let sec = clock.event_f1_seconds(body);
-        if sec == BAD {
-            return None;
+    let b = if q { b.strip_suffix(b"\"")? } else { b };
+    let ts = match b.len() {
+        20 => {
+            let seconds = clock.event_f1_seconds(b.first_chunk::<20>()?);
+            if seconds == BAD {
+                return None;
+            }
+            seconds * 1000
         }
-        (sec * 1000, rest)
-    } else {
-        let (body, rest) = fixed::<25>(b, q)?;
-        (ManifestClock::event_f2(body), rest)
+        13 => ManifestClock::event_f3(b.first_chunk::<13>()?),
+        25 => ManifestClock::event_f2(b.first_chunk::<25>()?),
+        _ => return None,
     };
-    if ts == BAD {
-        return None;
-    }
-    let (q, rest) = quoted(rest);
-    let (body, rest) = fixed::<20>(rest, q)?;
-    let seconds = clock.event_f1_seconds(body);
-    (seconds != BAD).then_some((ts, seconds, rest))
+    (ts != BAD).then_some(ts)
 }
 
 #[inline(always)]
-fn event_type(s: &[u8]) -> Option<(bool, &[u8])> {
-    let (q, s) = quoted(s);
-    let purchase = match s.first_chunk::<4>()? {
-        b"view" | b"cart" => false,
-        _ => return Some((true, comma(s.strip_prefix(b"purchase")?, q)?)),
+fn event_type(s: &[u8]) -> Option<(bool, usize)> {
+    // Match the preceding comma too: suffix matches alone would accept
+    // e.g. preview or a quote at only one end.
+    let word = u64::from_le_bytes(*s.last_chunk::<8>()?);
+    let n = match (word >> 24).to_le_bytes() {
+        [b',', b'v', b'i', b'e', b'w', ..] | [b',', b'c', b'a', b'r', b't', ..] => 5,
+        _ => match (word >> 8).to_le_bytes() {
+            [b',', b'"', b'v', b'i', b'e', b'w', b'"', _] | [b',', b'"', b'c', b'a', b'r', b't', b'"', _] => 7,
+            _ if s.ends_with(b",purchase") => 9,
+            _ if s.ends_with(b",\"purchase\"") => 11,
+            _ => return None,
+        },
     };
-    Some((purchase, comma(&s[4..], q)?))
+    Some((n > 7, s.len() - n))
 }
 
 // NEON naturally supplies a nibble per byte. SSE supplies a single bit.
@@ -106,106 +105,99 @@ const STEP: usize = 1;
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn structural(b: &[u8; 16]) -> u64 {
+fn structural(b: &[u8; 16]) -> (u64, u64) {
     use std::arch::aarch64::*;
     // SAFETY: 16 readable bytes and NEON is baseline.
     unsafe {
         let v = vld1q_u8(b.as_ptr());
-        let x = vorrq_u8(
-            vorrq_u8(vceqq_u8(v, vdupq_n_u8(b',')), vceqq_u8(v, vdupq_n_u8(b'"'))),
-            vceqq_u8(v, vdupq_n_u8(b'\n')),
-        );
-        vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(x))))
+        let bits = |x| {
+            vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(x)))) & 0x1111_1111_1111_1111
+        };
+        (bits(vceqq_u8(v, vdupq_n_u8(b','))), bits(vceqq_u8(v, vdupq_n_u8(b'"'))))
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn structural(b: &[u8; 16]) -> u64 {
+fn structural(b: &[u8; 16]) -> (u64, u64) {
     use std::arch::x86_64::*;
     // SAFETY: 16 readable bytes and SSE2 is baseline.
     unsafe {
         let v = _mm_loadu_si128(b.as_ptr().cast());
-        let x = _mm_or_si128(
-            _mm_or_si128(
-                _mm_cmpeq_epi8(v, _mm_set1_epi8(b',' as i8)),
-                _mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8)),
-            ),
-            _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\n' as i8)),
-        );
-        _mm_movemask_epi8(x) as u64
+        let bits = |byte| _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(byte as i8))) as u64;
+        (bits(b','), bits(b'"'))
     }
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
-fn structural(b: &[u8; 16]) -> u64 {
-    b.iter()
-        .enumerate()
-        .fold(0, |m, (i, c)| m | (u64::from(matches!(c, b',' | b'"' | b'\n')) << i))
+fn structural(b: &[u8; 16]) -> (u64, u64) {
+    b.iter().enumerate().fold((0, 0), |(m, q), (i, &c)| {
+        (m | (u64::from(c == b',') << i), q | (u64::from(c == b'"') << i))
+    })
 }
 
 #[inline(always)]
-fn next(m: u64, start: usize) -> usize {
-    if start >= 16 {
-        return 16;
-    }
-    start + (m >> (start * STEP)).trailing_zeros() as usize / STEP
+fn last_bit(m: u64) -> usize {
+    // A missing match wraps to usize::MAX, never a lane.
+    63usize.wrapping_sub(m.leading_zeros() as usize)
 }
 
-type PriceCategory = (u32, u32);
-
-/// One classification for both product and price, even when the price is
-/// ignored. The first structural byte in each body must be its exact end.
+/// Every comma separates fields, even inside malformed quotes. The final
+/// two commas delimit product and price; their quotes must still be proved
+/// before deciding whether to ignore the price.
 #[inline(always)]
-fn suffix<'a>(s: &'a [u8], purchase: bool, sm: &Small) -> Option<(Option<PriceCategory>, &'a [u8])> {
-    let b = s.first_chunk::<16>()?;
-    let mask = structural(b);
-    let p = usize::from(b[0] == b'"');
-    let end = next(mask, p);
-    let comma = if p == 1 {
-        if *b.get(end)? != b'"' {
-            return None;
-        }
-        end + 1
-    } else {
-        end
-    };
-    if *b.get(comma)? != b',' {
+fn suffix(s: &[u8]) -> Option<(usize, bool, &[u8], &[u8])> {
+    let b = s.last_chunk::<16>()?;
+    let (commas, quotes) = structural(b);
+    let last = last_bit(commas);
+    let rest = commas & !(1 << (last & 63));
+    if rest == 0 {
         return None;
     }
-    let p2 = comma + 1;
-    let q2 = usize::from(*b.get(p2)? == b'"');
-    let start2 = p2 + q2;
-    let end2 = next(mask, start2);
-    let nl = if q2 == 1 {
-        if *b.get(end2)? != b'"' {
-            return None;
-        }
-        end2 + 1
-    } else {
-        end2
-    };
-    if *b.get(nl)? != b'\n' {
-        return None;
+    let prev = last_bit(rest);
+    let p = prev / STEP;
+    let mut product = &b[p + 1..last / STEP];
+    let mut price = &b[last / STEP + 1..];
+    let tail_quotes = quotes & (u64::MAX << prev);
+    if tail_quotes != 0 {
+        // At most an opening and closing quote can occur in each field.
+        // Check the full mask, not just whether the endpoints are quotes.
+        let (prod, cost) = match_quoted_tail(b, tail_quotes, prev, last)?;
+        product = prod;
+        price = cost;
     }
-    let payload = if end == p {
-        None
-    } else if purchase {
-        parse_price(&b[start2..end2]).map(|price| (price, sm.product_cat.get(&b[p..end]).unwrap_or(sm.unknown_cat)))
-    } else {
-        Some((0, 0))
-    };
-    Some((payload, &s[nl + 1..]))
+    let (purchase, before_type) = event_type(&s[..s.len() - 16 + p])?;
+    Some((before_type, purchase, product, price))
 }
 
 #[inline(always)]
-fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestClock)) -> Option<(Pending, &'a [u8])> {
+fn match_quoted_tail(b: &[u8; 16], quotes: u64, prev: usize, last: usize) -> Option<(&[u8], &[u8])> {
+    let hi = (15 * STEP) as u32;
+    let close_prod = last.wrapping_sub(STEP);
+    let qp = (quotes >> close_prod) & 1;
+    let qc = (quotes >> hi) & 1;
+    let prod_mask = (qp << (prev + STEP)) | (qp << close_prod);
+    let cost_mask = (qc << ((last + STEP) & 63)) | (qc << hi);
+    if quotes != prod_mask | cost_mask {
+        return None;
+    }
+    let (qp, qc) = (qp as usize, qc as usize);
+    Some((
+        b.get(prev / STEP + 1 + qp..last / STEP - qp)?,
+        b.get(last / STEP + 1 + qc..16 - qc)?,
+    ))
+}
+
+#[inline(always)]
+fn decode(s: &[u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestClock)) -> Option<Pending> {
+    let row_len = s.len();
+    let (before_type, purchase, product, raw_price) = suffix(s)?;
+    let (seconds, ts_end) = ingest(&s[..before_type], clock)?;
     let (eid, s) = id(s)?;
     let (uid, s) = id(s)?;
-    let (ts, seconds, s) = timestamps(s, clock)?;
-    let (purchase, s) = event_type(s)?;
-    let (payload, rest) = suffix(s, purchase, sm)?;
+    // Decode exactly the gap between the UID and ingest proofs.
+    let ts = event_time(s.get(..ts_end.checked_sub(row_len - s.len())?)?, clock)?;
     let mut e = Pending {
         claim_key: links::mix(eid),
         ts,
@@ -216,30 +208,33 @@ fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestCloc
     // millisecond difference safe in i64, including pre-epoch ingest.
     if (ws..we).contains(&ts)
         && seconds * 1000 - ts <= DAY
-        && let Some((price, cat)) = payload
+        && !product.is_empty()
+        && let Some(price) = if purchase { parse_price(raw_price) } else { Some(0) }
     {
         e.uid = uid;
         e.hash = links::mix(uid);
         e.price = price;
-        e.cat = cat;
+        e.cat = if purchase {
+            sm.product_cat.get(product).unwrap_or(sm.unknown_cat)
+        } else {
+            0
+        };
     }
-    Some((e, rest))
+    Some(e)
 }
 
 #[cold]
 #[inline(never)]
 fn fallback<'a>(
-    s: &'a [u8],
+    line: &'a [u8],
     sm: &Small,
     codec: &Codec<'a>,
     window: (i64, i64, &ManifestClock),
     spill: &mut Vec<i64>,
-) -> (Option<Pending>, &'a [u8]) {
-    let end = memchr::memchr(b'\n', s).map_or(s.len(), |i| i + 1);
-    let (line, rest) = s.split_at(end);
+) -> Option<Pending> {
     let mut row = None;
     csv::identity_row::<7>(line, &mut |r| row = decode_fields(r, sm, codec, window, spill));
-    (row, rest)
+    row
 }
 
 #[inline]
@@ -258,19 +253,11 @@ pub(super) fn for_events<'a>(
             }
         });
     }
-    let mut rest = c.data;
-    while !rest.is_empty() {
-        if let Some((e, tail)) = decode(rest, sm, window) {
+    csv::physical_lines(c.data, |line| {
+        if let Some(e) = decode(line, sm, window).or_else(|| fallback(line, sm, codec, window, spill)) {
             emit(e);
-            rest = tail;
-        } else {
-            let (e, tail) = fallback(rest, sm, codec, window, spill);
-            if let Some(e) = e {
-                emit(e);
-            }
-            rest = tail;
         }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -347,10 +334,8 @@ mod tests {
             b"\"opaque08\",\"user00008\",\"1791021600001\",\"2026-10-03T10:00:00Z\",\"cart\",\"item-7\",\"\"",
             b"opaque009,\"USER_07\",\"2026-10-03T10:30:00+00:30\",\"2026-10-03T10:00:00Z\",\"purchase\",\"item-7\",\"0123\"",
         ] {
-            let file = [row, &followed].concat();
-            let (event, rest) = decode(&file, &sm, window).unwrap_or_else(|| panic!("must exercise the word path: {row:?}"));
+            let event = decode(row, &sm, window).unwrap_or_else(|| panic!("must exercise the word path: {row:?}"));
             assert_ne!(event.uid, 0);
-            assert_eq!(rest, following);
             check(row, b"");
             for i in 0..row.len() {
                 check(&row[..i], &followed);

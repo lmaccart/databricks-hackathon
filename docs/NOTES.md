@@ -1,5 +1,17 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round four: LF-only scanner and reverse event proof — 2026-11-21
+
+Experimental candidate against `dfbd330`: streaming 64-byte LF-only masks remove the decoder from next-row discovery. Reverse comma and quote proofs delimit the tail in one 16-byte load; the ingest and ID proofs run from opposite ends. Only the exact gap can be an event timestamp. Odd or long rows retry a single physical line, including at EOF. Non-purchases skip price conversion and category lookup, not CSV syntax validation.
+
+| Candidate, M2 Pro, 1M dev input | Workers | Alternating pairs | Baseline → candidate |
+|---|---:|---:|---:|
+| LF-only masks + reverse proof | 1 | 7 | 0.178 → 0.191 s |
+| LF-only masks + reverse proof | 8 | 9 | 0.070 → 0.073 s |
+| Eight LF offsets + original typed decoder (discarded) | 1 | 5 | 0.175 → 0.189 s |
+
+The final reverse proof's one-worker `events parsed` median was 0.071 → 0.085 s. The branch is an exact experiment, not a recommended replacement on these measurements; no Docker, amd64 or inputs larger than 1M were run locally for this trial. The 1M official answer, all 36 official fixtures, 10 dirty seeds, and 7,254 grammar mutations with competing copies at one and eight workers matched.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).
