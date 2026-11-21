@@ -432,6 +432,30 @@ class LinkedIds(unittest.TestCase):
 
 
 class Clicks(unittest.TestCase):
+    def test_alias_ties_and_millisecond_edges_in_same_coarse_cell(self):
+        s = WS_MS + 7
+        events = [
+            ev("edge", "alias", str(s + 30 * MIN), "purchase", price="5"),
+            ev("later", "alias", str(s + 60 * MIN + 1), "purchase", price="7"),
+            ev("first", "canonical", str(s), "purchase", price="11"),
+            ev("solo", "standalone", str(s)),
+        ]
+        clicks = [
+            f"z,alias,c_1,{s}",
+            f"very-long-click,standalone,c_1,{s - 7 * DAY}",
+            f"too-old,standalone,c_3,{s - 7 * DAY - 1}",
+            f"0,alias,c_3,{s + 1}",
+            f"0-only-at-end,alias,c_2,{ms(WE)}",
+        ]
+        _, c = run_case(events, clicks, links=["alias,canonical"], extra={
+            "clicks/part-1.csv": [f"a,canonical,c_2,{s}", f'"a",canonical,"c_2","{s}"'],
+        })
+        d = "2026-10-01"
+        self.assertEqual((c[("c_2", d)]["sessions"], c[("c_2", d)]["revenue_cents"]), (1, 16))
+        self.assertEqual((c[("c_3", d)]["sessions"], c[("c_3", d)]["revenue_cents"]), (1, 7))
+        self.assertEqual(c[("c_3", d)]["assisted_sessions"], 1)
+        self.assertEqual(c[("c_1", d)]["assisted_sessions"], 3)
+
     def test_credit_boundaries(self):
         s = ms("2026-10-09T12:00:00Z")
         events = [ev(f"e{i}", f"u{i}", str(s)) for i in range(1, 7)]

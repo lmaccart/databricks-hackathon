@@ -23,6 +23,7 @@ mod events;
 mod links;
 mod output;
 mod person;
+mod shard_order;
 mod stream;
 use links::{Identity, People, person_names};
 use person::Codec;
@@ -168,10 +169,10 @@ fn read_small<'a>(prod: &'a [u8], camp: &'a [u8], pp: &Path, cp: &Path) -> Small
 // ------------------------------------------------------------------ events & clicks
 
 #[derive(Clone, Copy)]
-struct PCl {
+struct PCl<'a> {
     person: u64,
     ts: i64,
-    cid: u64,
+    cid: &'a [u8],
     camp: u32,
 }
 
@@ -216,9 +217,9 @@ fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
 }
 
 #[derive(Default)]
-struct Clicks {
-    packed: Vec<PCl>,
-    wide: Vec<PCl>,
+struct Clicks<'a> {
+    packed: Vec<PCl<'a>>,
+    wide: Vec<PCl<'a>>,
 }
 
 fn parse_clicks<'a>(
@@ -227,7 +228,7 @@ fn parse_clicks<'a>(
     window: (i64, i64, &ManifestClock),
     names: &People<'a>,
     packed: bool,
-) -> Vec<Clicks> {
+) -> Vec<Clicks<'a>> {
     let (lo, we, clock) = window;
     let hint = reserve_per_shard(c.data);
     let mut b: Vec<_> = (0..NS)
@@ -237,14 +238,14 @@ fn parse_clicks<'a>(
         })
         .collect();
     #[derive(Clone, Copy, Default)]
-    struct PendingClick {
+    struct PendingClick<'a> {
         uid: u64,
         hash: u64,
-        cid: u64,
+        cid: &'a [u8],
         ts: i64,
         camp: u32,
     }
-    let mut emit = |row: PendingClick| {
+    let mut emit = |row: PendingClick<'a>| {
         let (dest, person) = match names.lookup(row.uid, row.hash) {
             Identity::Linked(p) if packed => (&mut b[shard(p)].packed, u64::from(p as u32)),
             Identity::Linked(p) => (&mut b[shard(p)].wide, names.original(p as u32)),
@@ -281,7 +282,7 @@ fn parse_clicks<'a>(
             uid: key,
             hash,
             ts,
-            cid: names.codec.key(cid),
+            cid,
             camp: ci,
         };
         n += 1;
@@ -330,11 +331,11 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
 
 fn process_stream<T: Temporal>(
     pieces: Vec<Stream<T>>,
-    mut cls: Vec<PCl>,
+    mut cls: Vec<PCl<'_>>,
     sm: &Small,
-    people: &People,
+    name: impl Fn(u64) -> u64,
     layout: T::Layout,
-    ShardOut { users, camps }: &mut ShardOut,
+    out: &mut ShardOut,
 ) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
     let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
@@ -351,6 +352,71 @@ fn process_stream<T: Temporal>(
     evs.sort_unstable();
     purchases.sort_unstable_by_key(|p| p.key);
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
+    aggregate(&evs, &purchases, &cls[..], sm, name, layout, out);
+}
+
+trait EventCell<T> {
+    fn first(&self) -> T;
+    fn last(&self) -> T;
+    fn count(&self) -> usize;
+}
+
+impl<T: Temporal> EventCell<T> for T {
+    #[inline]
+    fn first(&self) -> T {
+        *self
+    }
+    #[inline]
+    fn last(&self) -> T {
+        *self
+    }
+    #[inline]
+    fn count(&self) -> usize {
+        1
+    }
+}
+
+trait ClickOrder {
+    fn len(&self) -> usize;
+    fn person(&self, i: usize) -> u64;
+    fn ts(&self, i: usize) -> i64;
+    fn camp(&self, i: usize) -> u32;
+    fn id(&self, i: usize) -> &[u8];
+}
+
+impl ClickOrder for [PCl<'_>] {
+    #[inline]
+    fn len(&self) -> usize {
+        <[_]>::len(self)
+    }
+    #[inline]
+    fn person(&self, i: usize) -> u64 {
+        self[i].person
+    }
+    #[inline]
+    fn ts(&self, i: usize) -> i64 {
+        self[i].ts
+    }
+    #[inline]
+    fn camp(&self, i: usize) -> u32 {
+        self[i].camp
+    }
+    #[inline]
+    fn id(&self, i: usize) -> &[u8] {
+        self[i].cid
+    }
+}
+
+fn aggregate<T: Temporal>(
+    evs: &[impl EventCell<T>],
+    purchases: &[stream::Purchase<T>],
+    cls: &(impl ClickOrder + ?Sized),
+    sm: &Small,
+    name: impl Fn(u64) -> u64,
+    layout: T::Layout,
+    ShardOut { users, camps }: &mut ShardOut,
+) {
+    let np = purchases.len();
     let ncamp = sm.camp_names.len();
     let mut cnt = vec![0usize; ncamp]; // copies enter and leave the window together
     let mut active: Vec<u32> = Vec::new(); // campaigns with cnt > 0
@@ -361,22 +427,21 @@ fn process_stream<T: Temporal>(
     let mut i = 0usize;
     let mut pi = 0usize;
     while i < evs.len() {
-        let rank = evs[i].person(layout);
-        let person = T::name(rank, people);
+        let rank = evs[i].first().person(layout);
+        let person = name(rank);
         let mut j = i;
-        while j < evs.len() && evs[j].person(layout) == rank {
+        while j < evs.len() && evs[j].first().person(layout) == rank {
             j += 1;
         }
-        while ci < cls.len() && cls[ci].person < rank {
+        while ci < cls.len() && cls.person(ci) < rank {
             ci += 1;
         }
         let c0 = ci;
-        while ci < cls.len() && cls[ci].person == rank {
+        while ci < cls.len() && cls.person(ci) == rank {
             ci += 1;
         }
-        let clicks = &cls[c0..ci];
-        let (mut lo, mut hi) = (0usize, 0usize);
-        let mut latest = 0;
+        let (mut lo, mut hi) = (c0, c0);
+        let mut latest = c0;
 
         let mut cur_day: i32 = i32::MIN;
         let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
@@ -384,9 +449,12 @@ fn process_stream<T: Temporal>(
         let mut k = i;
         while k < j {
             // one session is evs[k..m]
-            let start = evs[k].ts(layout);
+            let first = evs[k].first();
+            let start = first.ts(layout);
+            let mut count = evs[k].count();
             let mut m = k + 1;
-            while m < j && evs[m].gap(evs[m - 1]) <= GAP as u64 {
+            while m < j && evs[m].first().gap(evs[m - 1].last()) <= GAP as u64 {
+                count += evs[m].count();
                 m += 1;
             }
             let day = start.div_euclid(DAY) as i32;
@@ -411,8 +479,8 @@ fn process_stream<T: Temporal>(
             // before the sort. Sessions end on inclusive, disjoint key ranges:
             // consume ALL purchases at the last instant, including exact ties.
             let p0 = pi;
-            let end = evs[m - 1];
-            debug_assert!(purchases.get(pi).is_none_or(|p| p.key >= evs[k]));
+            let end = evs[m - 1].last();
+            debug_assert!(purchases.get(pi).is_none_or(|p| p.key >= first));
             while pi < np && purchases[pi].key <= end {
                 let e = &purchases[pi];
                 rev += e.price as i64;
@@ -420,18 +488,15 @@ fn process_stream<T: Temporal>(
                 pi += 1;
             }
             d_sess += 1;
-            d_ev += (m - k) as i64;
+            d_ev += count as i64;
             d_rev += rev;
 
             // slide the click window to [start - 7d, start]
-            while hi < clicks.len() && clicks[hi].ts <= start {
-                if hi == 0
-                    || clicks[hi].ts != clicks[latest].ts
-                    || people.codec.less(clicks[hi].cid, clicks[latest].cid)
-                {
+            while hi < ci && cls.ts(hi) <= start {
+                if hi == c0 || cls.ts(hi) != cls.ts(latest) || cls.id(hi) < cls.id(latest) {
                     latest = hi;
                 }
-                let c = clicks[hi].camp as usize;
+                let c = cls.camp(hi) as usize;
                 if cnt[c] == 0 {
                     pos[c] = active.len() as u32;
                     active.push(c as u32);
@@ -439,8 +504,8 @@ fn process_stream<T: Temporal>(
                 cnt[c] += 1;
                 hi += 1;
             }
-            while lo < hi && clicks[lo].ts < start.saturating_sub(WEEK) {
-                let c = clicks[lo].camp as usize;
+            while lo < hi && cls.ts(lo) < start.saturating_sub(WEEK) {
+                let c = cls.camp(lo) as usize;
                 cnt[c] -= 1;
                 if cnt[c] == 0 {
                     let p = pos[c] as usize;
@@ -454,7 +519,7 @@ fn process_stream<T: Temporal>(
             }
             // The entire latest timestamp run expires together. Identical
             // copies change neither the tie winner nor campaign membership.
-            let credit = if lo < hi { clicks[latest].camp } else { ORGANIC };
+            let credit = if lo < hi { cls.camp(latest) } else { ORGANIC };
             let e = camps.entry(ckey(credit, day)).or_insert([0; 4]);
             e[0] += 1;
             e[1] += (pi != p0) as i64;
@@ -484,22 +549,25 @@ fn process_stream<T: Temporal>(
 }
 
 fn process_shard(
-    evs: Vec<Payload>,
-    cls: Vec<Clicks>,
+    mut evs: Vec<Payload>,
+    mut cls: Vec<Clicks<'_>>,
     sm: &Small,
     people: &People,
-    packing: Option<Packing>,
+    layout: shard_order::Layout,
 ) -> ShardOut {
-    let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
-    let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
     let mut out = ShardOut {
         users: Vec::new(),
         camps: Map::with_hasher(rs()),
     };
-    if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+    if shard_order::try_compact(&mut evs, &mut cls, sm, people, layout, &mut out) {
+        return out;
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
+    let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
+    let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
+    if let Some(pack) = layout.packing {
+        process_stream(packed, gather(pc), sm, |r| people.original(r as u32), pack, &mut out);
+    }
+    process_stream(wide, gather(wc), sm, |p| p, (), &mut out);
     out
 }
 
@@ -574,15 +642,23 @@ fn main() {
         .zip(by_destination(cl_by_person, |c| {
             !c.packed.is_empty() || !c.wide.is_empty()
         }))
+        .enumerate()
         .collect();
-    jobs.sort_unstable_by_key(|(e, c)| {
+    jobs.sort_unstable_by_key(|(_, (e, c))| {
         std::cmp::Reverse(
             e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
         )
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(shard, (e, c))| {
+            let layout = shard_order::Layout {
+                packing,
+                click_window: (ws.saturating_sub(WEEK), we),
+                shard,
+            };
+            process_shard(e, c, &sm, &names, layout)
+        })
         .collect();
     log("sessions done");
 

@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 3 experiment: shared shard-local person descriptors — 2026-11-21
+
+One exact descriptor maps both event and click owners to a local rank. The primary slot omits a common address prefix and implicit shard bits; a separate full-token map handles collisions. Event cells never need an internal time sort: their span is less than 30 minutes, and the precise extrema determine gaps to adjacent cells. Dense person timelines bypass sorting individual events. The click sort moves only eight-byte words; original ID bytes stay in a sidecar and are compared only at exact millisecond ties. For a wide manifest, the compact path checks the actual shard bounds before falling back. No change to the reference semantics.
+
+The public dev answer matched in both comparers, 36/36 official fixtures passed against each implementation, 39 edge tests and 22 Rust tests passed, and the Python oracle matched 10 dirty kit seeds plus three 10k-event official seeds (including seed 15's leap day).
+
+This is a detached experimental candidate, not a practice pick. On the 1M-event public dev input, 11 alternating four-worker native process pairs against `5fd0d05` yielded a median **0.126 → 0.125 s** (0.7% less wall time; candidate won 5/11). The median session phase was **0.026 → 0.027 s**. No 20M, 60M, or Docker runs were done, and this dev result does not establish a speedup.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.
