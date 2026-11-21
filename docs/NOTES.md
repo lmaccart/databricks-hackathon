@@ -1,5 +1,34 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## F1 pair experiment (`flipclock`) — 2026-11-21 UTC
+
+In the typed event parser, an exact `YYYY-MM-DDTHH` match lets both F1
+timestamps share one manifest calendar lookup and one decoded UTC hour.
+Both tails still check every byte and enforce minute/second ranges. A shared
+date with a different hour uses a signed clock delta after strict event
+validation. A date change uses the full F1 parsers, and F2/F3 events and
+exceptional ingests keep their previous paths.
+
+Official 1M dev data, against direct parent `f4ac682`, on ARM64 macOS:
+
+| Workers | Alternating pairs | Wall median | Event parse median |
+|---|---:|---:|---:|
+| 1 | 11 | 0.316 → 0.300 s (−5.3%) | 0.123 → 0.117 s |
+| 4 | 11 | 0.116 → 0.115 s (−0.8%) | 0.037 → 0.036 s |
+
+An earlier version that decoded the event independently and then used the
+ingest delta was about 2% slower wall-to-wall on the same dev set. Neither
+small dev trial establishes a gain on Intel or at practice size. Next:
+dispatch `native-bench.yml` with `challenge=true`, candidate revision, and
+baseline `f4ac68210af37e3c8ce19e073557d7cc2a1111a6`; no local large run,
+Docker run, or push.
+
+Both dev comparers matched all 144,438 rows with empty stdout. Both
+implementations passed 36 fixtures and 40 Python cases; 22 Rust tests and
+10 dirty-seed comparisons passed. New coverage includes every second of a
+pre-epoch day, byte mutations in either or both F1 fields, missed date-cache
+lookups, offset and millisecond boundaries, and invalid earliest copies.
+
 ## Experimental word-offset event parser — 2026-11-21 UTC
 
 For the seven-column canonical header, validate and pack 7–9 byte ASCII IDs
