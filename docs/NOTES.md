@@ -6,6 +6,15 @@ The printed track page times **container start to exit** on eight pinned hyperth
 
 `docs/rules.md` is the byte-for-byte organizer download. The transcription differs in its preface, table padding and paragraph breaks, not in rules. The starter pins the public dev arguments to seed 1, **1,000,000 events and 250,000 clicks**. The root Dockerfile now builds the locked Rust crate; the Docker context admits only its manifests and source.
 
+For reproduction, the local organizer downloads had these SHA-256 hashes:
+
+```
+9dc9c600fb483292de92932ab30b0d40ec626b14df92777d84451c59cc2a2437  rules.md
+13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  generator.zip
+7eb8e1f0b1f431d178d28ac9437ce85809c44eb6393fdd42fb59857f30834fa9  dev-answer.zip
+b84ff8726c43749043c33c250548a9ac9987b9132d28ac818a47515bd128f77c  starter-duckdb.zip
+```
+
 ## Correctness audit
 
 - Both implementations pass the **36 official hand-written fixtures** and the local test suite. On the native dev run, both independent comparers found **117,038 user rows and 27,400 campaign rows**, with zero missing, extra, differing or duplicate keys. Stdout: zero bytes. The Python oracle independently matched the published dev answer as well. Ten kit-generated 20k-event seeds also matched the oracle.
@@ -22,7 +31,10 @@ Baseline: original Rust data path on an Apple M2 Pro (32 GiB RAM), release build
 
 | Official input | Wall time | Maximum RSS | Result |
 |---|---:|---:|---|
+| Seed 7, 20M events + 5M clicks, 1.92 GB of input | **2.45 s median of five** | 6.25 GiB maximum across runs | Native and amd64 Docker outputs matched row-for-row |
 | Seed 13, 60M events + 15M clicks, 5.71 GB of input | 14.97 s, one run | 9.38 GiB | 6,587,957 unique user-days, 28,014 unique campaign-days; both tables sum to 9,944,073 sessions and 25,416,324,016 cents |
+
+20M wall times, in order: **3.67, 2.51, 2.45, 2.00, 1.88 s**. All five used the same executable and data. The downward trend and changing host load make this a baseline, not evidence of a code speedup. The fifth run was taken after the harness restarted; the first four results were preserved.
 
 The 60M run overlapped compilation on the host. Its 14.97 s comprised 0.71 s setup/links, **3.43 s event parse, 4.40 s event dedup, 3.82 s sessions**, 1.65 s clicks, 0.40 s writing and ~0.56 s from the last log to process exit. No stdout or scratch usage. `tools/check_scale.py` verified schema, uniqueness and cross-table invariants on the full output; no hand-written expected answer exists for that seed. The 24 GB no-swap scorer limit was not enforced on this native run.
 
