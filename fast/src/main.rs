@@ -59,6 +59,16 @@ mod ts;
 use csv::{Chunk, chunks_of, for_rows};
 use ts::{ManifestClock, parse_ts};
 
+#[cfg(feature = "layout-simd-diag")]
+fn run_layout_simd_diag() -> bool {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--layout-simd-diag")) {
+        return false;
+    }
+    events::layout_diag::run(args.map(PathBuf::from).collect());
+    true
+}
+
 // ------------------------------------------------------------------ prices
 
 #[inline]
@@ -583,6 +593,11 @@ fn process_shard<S: CampaignSink>(
 // ------------------------------------------------------------------ output
 
 fn main() {
+    #[cfg(feature = "layout-simd-diag")]
+    if run_layout_simd_diag() {
+        return;
+    }
+
     let t0 = Instant::now();
     // Some runtimes expose host CPU count despite the competition's quota.
     // Respect an explicit Rayon setting for reproducible local comparisons.

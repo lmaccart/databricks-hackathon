@@ -2,6 +2,9 @@
 //! byte of the physical line; misses retry from the original line start.
 use super::*;
 
+#[cfg(feature = "layout-simd-diag")]
+pub(super) mod layout_diag;
+
 const ONES: u64 = 0x0101_0101_0101_0101;
 const HIGH: u64 = ONES << 7;
 const FLOOR: u64 = ONES * b'-' as u64;

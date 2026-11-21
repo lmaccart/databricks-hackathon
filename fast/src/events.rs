@@ -6,6 +6,9 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 mod word;
 
+#[cfg(feature = "layout-simd-diag")]
+pub(super) mod layout_diag;
+
 #[derive(Clone, Copy)]
 struct Claim {
     key_and_target: u64,
@@ -96,7 +99,7 @@ struct Location {
 }
 
 #[derive(Clone, Copy, Default)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[cfg_attr(any(test, feature = "layout-simd-diag"), derive(Debug, PartialEq, Eq))]
 struct Pending {
     claim_key: u64,
     uid: u64, // zero is never the key of a nonempty ID
