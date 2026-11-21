@@ -4,6 +4,7 @@
 use super::*;
 use std::hash::{BuildHasherDefault, Hasher};
 
+mod peel;
 mod word;
 
 #[derive(Clone, Copy)]
@@ -321,7 +322,7 @@ pub(super) fn by_person<'a>(
             }
         }
     }
-    let removals: Vec<_> = claims.into_par_iter().map(|parts| losers(parts, &spills)).collect();
+    let removals: Vec<_> = claims.into_par_iter().map(|parts| peel::losers(parts, &spills)).collect();
     let mut by_batch: Vec<Vec<u32>> = (0..payloads.len()).map(|_| Vec::new()).collect();
     for locations in removals {
         for loc in locations {
@@ -371,6 +372,56 @@ mod tests {
         let lost = losers(vec![(0, vec![later, distinct]), (1, vec![invalid])], &[vec![], spill]);
         assert_eq!(lost.len(), 1);
         assert_eq!((lost[0].batch, lost[0].target), (0, 0));
+    }
+
+    #[test]
+    fn tiled_owners_forward_all_copies_through_both_peels() {
+        // Distinct full tokens share the same primary and secondary cells.
+        // Millisecond spills and invalid claims participate in both stages,
+        // as do same-batch duplicates.
+        let mut parts = Vec::new();
+        let mut spills = Vec::new();
+        let mut expected = Vec::new();
+        for batch in 0..3 {
+            let mut claims = Vec::new();
+            let mut spill = Vec::new();
+            for i in 0..1811u64 {
+                let key = 27 | (i << 40);
+                let ingest = match batch {
+                    0 => 3_500,
+                    1 => 2_500,
+                    _ => 2_500,
+                };
+                let target = if batch != 0 && i % 2 == 0 { NONE } else { i as u32 };
+                claims.push(Claim::new(key, target, Claim::order(ingest, BAD, &mut spill)));
+                if batch != 1 && target != NONE {
+                    expected.push((batch, i as u32));
+                }
+                if batch == 1 && i % 13 == 0 {
+                    let target = 4_000 + i as u32;
+                    claims.push(Claim::new(key, target, Claim::order(4_000, 4, &mut spill)));
+                    expected.push((batch, target));
+                }
+            }
+            // A fresh exact key shares the same first and second cells.
+            claims.push(Claim::new(27 | ((1811 + batch as u64) << 40), 9_000, 3));
+            parts.push((batch, claims));
+            spills.push(spill);
+        }
+        let mut actual: Vec<_> = peel::losers(parts, &spills).into_iter().map(|loc| (loc.batch, loc.target)).collect();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn oversized_skewed_shard_keeps_exact_earliest() {
+        let id = 42;
+        let late = vec![Claim::new(id, 0, 3); 1 << 19];
+        let invalid = Claim::new(id, NONE, 2);
+        let actual = peel::losers(vec![(0, late), (1, vec![invalid])], &[vec![], vec![]]);
+        assert_eq!(actual.len(), 1 << 19);
+        assert!(actual.iter().all(|loc| (loc.batch, loc.target) == (0, 0)));
     }
 
     #[test]

@@ -90,6 +90,27 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_direct_owner_collisions_keep_byte_exact_ids(self):
+        # Constructed by reversing the full token permutation. These
+        # spellings share shard 0x2b, low byte 0x1b, and zero bits 20..27.
+        a, b, c, d = "0A06JFLo;", ".jiGRW4{n", "T@.dzQo/3", "Dw[sq5@=O"
+        early = "2026-09-30T23:59:59Z"
+        original = [
+            ev(a, "suppressed", WS),
+            ev(b, "tied", WS),
+            ev(c, "distinct", WS),
+            ev(d, "not-rescued-by-malformed", WS),
+        ]
+        copies = [
+            ev(f'"{a}"', "another-loser", WS),
+            ev(f'"{b}"', "tied", WS),
+            ev(d, "", WS, price='x"y', ingest=early),
+        ]
+        last = [ev(a, "", WS, ingest=early)]
+        users, _ = run_case(original, extra={"events/part-1.csv": copies, "events/part-2.csv": last})
+        self.assertEqual({key[0]: row["events"] for key, row in users.items()},
+                         {"tied": 1, "distinct": 1, "not-rescued-by-malformed": 1})
+
     def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
         stamp = "2026-10-03T10:00:00Z"
         early = "2026-10-03T09:59:59Z"
