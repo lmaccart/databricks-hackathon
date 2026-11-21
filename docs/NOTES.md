@@ -4,6 +4,8 @@
 
 Scored baseline `cc9f33e` vs the SIMD/direct-routing/typed-writer candidate (`3f1d667`). Official practice time is known only for the baseline, **5.03 s**.
 
+During testing, the [public Shopping Sessions board](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions) advanced to **0.65 s** (Mahalas, score timestamp 2026-11-21 03:45 UTC). The earlier 0.68 s figure below describes the target when this round started.
+
 | Host, input | Scored binary | Rebuild | Speedup |
 |---|---:|---:|---:|
 | M2 Pro, 8 workers, 20M seed 7 | 2.339 s | 0.833 s | 2.81× |

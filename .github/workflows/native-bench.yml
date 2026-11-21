@@ -6,8 +6,12 @@ on:
         description: Also measure allocator and whole-binary ISA experiments
         type: boolean
         default: false
+      containers:
+        description: Also compare the actual restricted amd64 Docker images
+        type: boolean
+        default: false
   push:
-    branches: [bench/native-amd64]
+    branches: [bench/native-amd64, bench/container]
 
 permissions:
   contents: read
@@ -124,5 +128,27 @@ jobs:
             echo '```'
             python3 tools/bench_pair.py "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/practice" \
               --threads "$t" --candidate-threads "$((2*t))" --tmpdir "$RUNNER_TEMP"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Compare the actual scorer images on native Linux
+        if: ${{ inputs.containers || github.ref_name == 'bench/container' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 -t ss-bench:scored "$RUNNER_TEMP/control"
+          docker build --platform linux/amd64 -t ss-bench:current .
+          t=$(nproc); if (( t > 8 )); then t=8; fi
+          export NCPU=$t DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$RUNNER_TEMP/dev-docker" SCRATCH_DIR="$RUNNER_TEMP/docker-scratch"
+          mkdir -p "$OUTPUT_DIR" "$SCRATCH_DIR"
+          SS_BENCH_IMAGE=ss-bench:current tools/bench_container.sh >"$RUNNER_TEMP/docker.stdout"
+          test ! -s "$RUNNER_TEMP/docker.stdout"
+          "$RUNNER_TEMP/venv/bin/python" tools/compare_outputs.py "$RUNNER_TEMP/dev-answer" "$OUTPUT_DIR"
+          {
+            echo '### Full restricted docker run, including CLI startup/removal'
+            echo '```'
+            # Root can remove timed output directories created by container UID 1000.
+            sudo python3 tools/bench_pair.py tools/bench_container.sh tools/bench_container.sh "$RUNNER_TEMP/practice" \
+              --threads "$t" --tmpdir "$RUNNER_TEMP" --baseline-env SS_BENCH_IMAGE=ss-bench:scored \
+              --candidate-env SS_BENCH_IMAGE=ss-bench:current --phases
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
