@@ -113,6 +113,40 @@ class Timestamps(unittest.TestCase):
             self.assertIs(P.parse_ts(bad), P.BAD, bad)
 
 
+class DirectLinkedRanges(unittest.TestCase):
+    def test_dense_linked_ranges_after_cross_person_dedup(self):
+        # Enough retained events per linked root to exercise dense grouping.
+        t0 = "2026-10-02T23:50:00Z"
+        t1 = "2026-10-03T00:20:00Z"   # exactly 30 minutes later; previous day
+        t2 = "2026-10-03T00:50:01Z"   # new session/day
+        rows = [ev(f"e{i}", "device", t0 if i % 2 else t1) for i in range(1200)]
+        rows += [ev(f"f{i}", "other", t0) for i in range(1100)]
+        rows += [ev("move", "other", t0, "purchase", price="99", ingest=t1)]
+        u, c = run_case(
+            events=rows,
+            links=["z,device", "z,a", "other,b"],
+            clicks=[f"z-click,device,c_2,{t0}", f"a-click,a,c_1,{t0}",
+                    f"a-click,a,c_1,{t0}", f"b-click,other,c_3,{t0}"],
+            extra={"events/part-1.csv": [
+                ev("move", "z", t1, "purchase", price="30", ingest=t0),
+                ev("tie", "a", t1, "purchase", "p2", "30"),
+                ev("next", "device", t2),
+                ev("solo", "A", t0),
+            ]},
+        )
+        d0, d1 = "2026-10-02", "2026-10-03"
+        self.assertEqual(set(u), {("a", d0), ("a", d1), ("b", d0), ("A", d0)})
+        self.assertEqual((u["a", d0]["sessions"], u["a", d0]["events"],
+                          u["a", d0]["revenue_cents"], u["a", d0]["top_category"]),
+                         (1, 1202, 60, "hats"))
+        self.assertEqual(u["a", d1]["events"], 1)
+        self.assertEqual((u["b", d0]["events"], u["b", d0]["revenue_cents"]), (1100, 0))
+        self.assertEqual((c["c_1", d0]["sessions"], c["c_1", d0]["revenue_cents"]), (1, 60))
+        self.assertEqual((c["c_2", d0]["sessions"], c["c_2", d0]["assisted_sessions"]), (0, 1))
+        self.assertEqual(c["c_1", d1]["sessions"], 1)
+        self.assertEqual(c["c_3", d0]["sessions"], 1)
+
+
 class CsvDialect(unittest.TestCase):
     def test_unreadable_part_listing_fails(self):
         # ENOTDIR is deterministic even under root; a glob used to swallow it.

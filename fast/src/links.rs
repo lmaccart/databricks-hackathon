@@ -1,6 +1,6 @@
 //! Build the canonical-name lookup in parallel, including transitive paths
 //! that span input files. Canonical node indexes also serve as exact sort ranks.
-use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows};
+use super::{Chunk, Codec, NS, for_rows, shard};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -62,15 +62,28 @@ pub(super) struct People<'a> {
     pub(super) count: usize,
 }
 
-// This bit is disjoint from the packed routing shard and the canonical node
-// index. It is internal to the link table, not reserved in arbitrary person keys.
+// Internal to the link table, not reserved in arbitrary person keys.
 const LINKED: u64 = 1 << 63;
-const _: () = assert!(SHARD_SHIFT >= 32 && ((NS as u64 - 1) << SHARD_SHIFT) & LINKED == 0);
 
 #[derive(Clone, Copy)]
 pub(super) enum Identity {
-    Linked(u64), // shard bits at their normal position, root node index in low bits
+    Linked(u32),
     Standalone(u64),
+}
+
+#[inline]
+pub(super) fn linked_shard(rank: u32) -> usize {
+    rank as usize % NS
+}
+
+impl Identity {
+    #[inline]
+    pub(super) fn shard(self) -> usize {
+        match self {
+            Self::Linked(rank) => linked_shard(rank),
+            Self::Standalone(person) => shard(person),
+        }
+    }
 }
 
 impl<'a> People<'a> {
@@ -79,7 +92,7 @@ impl<'a> People<'a> {
         let lane = &self.lanes[h as usize & (LANES - 1)];
         let s = lane.slots[lane.find(key, h)];
         if s.value & LINKED != 0 {
-            Identity::Linked(s.value ^ LINKED)
+            Identity::Linked(s.value as u32)
         } else {
             Identity::Standalone(h)
         }
@@ -233,8 +246,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         for slot in &mut lane.slots {
             if slot.key != 0 {
                 let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
-                let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
-                slot.value = LINKED | routing | u64::from(rank);
+                slot.value = LINKED | u64::from(rank);
             }
         }
     });

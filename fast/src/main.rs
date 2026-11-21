@@ -26,14 +26,14 @@ mod person;
 mod stream;
 use links::{Identity, People, person_names};
 use person::Codec;
-use stream::{Packing, Payload, Stream, Temporal};
+use stream::{Packing, Payload, Stream, Temporal, scatter_linked};
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const BAD: i64 = i64::MIN;
 const MAX_PRICE: i64 = 10_000_000;
-const NS: usize = 256; // shards for every hash partition
+const NS: usize = 256;
 const SHARD_SHIFT: u32 = 40;
 const CHUNK: usize = 8 << 20; // bytes per parse task
 const ORGANIC: u32 = u32::MAX;
@@ -238,10 +238,12 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<
         camp: u32,
     }
     let mut emit = |row: PendingClick| {
-        let (dest, person) = match names.lookup(row.uid, row.hash) {
-            Identity::Linked(p) if packed => (&mut b[shard(p)].packed, u64::from(p as u32)),
-            Identity::Linked(p) => (&mut b[shard(p)].wide, names.original(p as u32)),
-            Identity::Standalone(p) => (&mut b[shard(p)].wide, p),
+        let identity = names.lookup(row.uid, row.hash);
+        let bucket = &mut b[identity.shard()];
+        let (dest, person) = match identity {
+            Identity::Linked(rank) if packed => (&mut bucket.packed, u64::from(rank)),
+            Identity::Linked(rank) => (&mut bucket.wide, names.original(rank)),
+            Identity::Standalone(p) => (&mut bucket.wide, p),
         };
         dest.push(PCl {
             person,
@@ -323,11 +325,11 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
 
 fn process_stream<T: Temporal>(
     pieces: Vec<Stream<T>>,
-    mut cls: Vec<PCl>,
+    cls: Vec<PCl>,
     sm: &Small,
     people: &People,
     layout: T::Layout,
-    ShardOut { users, camps }: &mut ShardOut,
+    out: &mut ShardOut,
 ) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
     let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
@@ -342,6 +344,41 @@ fn process_stream<T: Temporal>(
         purchases.extend_from_slice(&s.purchases);
     }
     evs.sort_unstable();
+    scan_stream(&evs, purchases, cls, sm, people, layout, None, out);
+}
+
+fn process_linked(
+    pieces: Vec<Stream<u64>>,
+    cls: Vec<PCl>,
+    sm: &Small,
+    people: &People,
+    pack: Packing,
+    shard: usize,
+    out: &mut ShardOut,
+) {
+    let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
+    let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
+    let slots = people.count.div_ceil(NS);
+    // Skip the dense scan and random cursor accesses when too few keys
+    // amortize them, or when offsets cannot fit in the compact cursor array.
+    if ne < 256 || slots > ne / 4 || ne > u32::MAX as usize {
+        process_stream(pieces, cls, sm, people, pack, out);
+        return;
+    }
+    let (times, purchases, ends) = scatter_linked(pieces, pack, slots, ne, np);
+    scan_stream(&times, purchases, cls, sm, people, pack, Some((shard, &ends)), out);
+}
+
+fn scan_stream<T: Temporal>(
+    evs: &[T],
+    mut purchases: Vec<stream::Purchase<T>>,
+    mut cls: Vec<PCl>,
+    sm: &Small,
+    people: &People,
+    layout: T::Layout,
+    direct: Option<(usize, &[u32])>,
+    ShardOut { users, camps }: &mut ShardOut,
+) {
     purchases.sort_unstable_by_key(|p| p.key);
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
     let ncamp = sm.camp_names.len();
@@ -353,13 +390,26 @@ fn process_stream<T: Temporal>(
     let mut ci = 0usize;
     let mut i = 0usize;
     let mut pi = 0usize;
+    let mut local = 0;
+    let np = purchases.len();
     while i < evs.len() {
-        let rank = evs[i].person(layout);
+        let (rank, j) = if let Some((shard, ends)) = direct {
+            while ends[local] as usize == i {
+                local += 1;
+            }
+            let rank = (local * NS + shard) as u64;
+            let end = ends[local] as usize;
+            local += 1;
+            (rank, end)
+        } else {
+            let rank = evs[i].person(layout);
+            let mut j = i + 1;
+            while j < evs.len() && evs[j].person(layout) == rank {
+                j += 1;
+            }
+            (rank, j)
+        };
         let person = T::name(rank, people);
-        let mut j = i;
-        while j < evs.len() && evs[j].person(layout) == rank {
-            j += 1;
-        }
         while ci < cls.len() && cls[ci].person < rank {
             ci += 1;
         }
@@ -404,8 +454,12 @@ fn process_stream<T: Temporal>(
             // before the sort. Sessions end on inclusive, disjoint key ranges:
             // consume ALL purchases at the last instant, including exact ties.
             let p0 = pi;
-            let end = evs[m - 1];
-            debug_assert!(purchases.get(pi).is_none_or(|p| p.key >= evs[k]));
+            let end = evs[m - 1].with_person(rank, layout);
+            debug_assert!(
+                purchases
+                    .get(pi)
+                    .is_none_or(|p| p.key >= evs[k].with_person(rank, layout))
+            );
             while pi < np && purchases[pi].key <= end {
                 let e = &purchases[pi];
                 rev += e.price as i64;
@@ -477,6 +531,7 @@ fn process_stream<T: Temporal>(
 }
 
 fn process_shard(
+    shard: usize,
     evs: Vec<Payload>,
     cls: Vec<Clicks>,
     sm: &Small,
@@ -490,7 +545,7 @@ fn process_shard(
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        process_linked(packed, gather(pc), sm, people, pack, shard, &mut out);
     }
     process_stream(wide, gather(wc), sm, people, (), &mut out);
     out
@@ -568,15 +623,16 @@ fn main() {
         .zip(by_destination(cl_by_person, |c| {
             !c.packed.is_empty() || !c.wide.is_empty()
         }))
+        .enumerate()
         .collect();
-    jobs.sort_unstable_by_key(|(e, c)| {
+    jobs.sort_unstable_by_key(|(_, (e, c))| {
         std::cmp::Reverse(
             e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
         )
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(shard, (e, c))| process_shard(shard, e, c, &sm, &names, packing))
         .collect();
     log("sessions done");
 

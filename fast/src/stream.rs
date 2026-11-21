@@ -1,6 +1,6 @@
 //! Most events carry only a temporal key. Purchases carry their own full
 //! payload until dedup, then contribute a key to the temporal stream as well.
-use super::{Identity, People};
+use super::{Identity, NS, People};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Wide {
@@ -44,6 +44,7 @@ pub(super) trait Temporal: Copy + Ord {
     // Only compared within one person's ordered keys.
     fn gap(self, prev: Self) -> u64;
     fn name(person: u64, people: &People) -> u64;
+    fn with_person(self, person: u64, layout: Self::Layout) -> Self;
 }
 
 impl Temporal for Wide {
@@ -68,6 +69,11 @@ impl Temporal for Wide {
     fn name(person: u64, _: &People) -> u64 {
         person
     }
+
+    #[inline]
+    fn with_person(self, _: u64, (): ()) -> Self {
+        self
+    }
 }
 
 impl Temporal for u64 {
@@ -91,6 +97,11 @@ impl Temporal for u64 {
     #[inline]
     fn name(rank: u64, people: &People) -> u64 {
         people.original(rank as u32)
+    }
+
+    #[inline]
+    fn with_person(self, rank: u64, pack: Packing) -> Self {
+        self | (rank << pack.bits)
     }
 }
 
@@ -149,8 +160,7 @@ impl Payload {
     ) -> usize {
         let purchase = usize::from(price != 0);
         let person = match identity {
-            Identity::Linked(routed) => {
-                let rank = routed as u32;
+            Identity::Linked(rank) => {
                 if let Some(p) = packing {
                     return self.packed.push(p.encode(rank, ts), price, cat) * 4 + purchase;
                 }
@@ -162,9 +172,97 @@ impl Payload {
     }
 }
 
+// In this physical shard no two global root ranks can have the same quotient.
+// The counts become start cursors after the prefix pass, and end offsets after
+// scatter. Only the timestamps are stored in the resulting person ranges.
+pub(super) fn scatter_linked(
+    pieces: Vec<Stream<u64>>,
+    pack: Packing,
+    slots: usize,
+    ne: usize,
+    np: usize,
+) -> (Vec<u64>, Vec<Purchase<u64>>, Vec<u32>) {
+    let local = |key: u64| (key >> pack.bits) as usize / NS;
+    let mut ends = vec![0u32; slots];
+    for s in &pieces {
+        for &key in &s.times {
+            ends[local(key)] += 1;
+        }
+        for p in &s.purchases {
+            ends[local(p.key)] += 1;
+        }
+    }
+    let mut sum = 0;
+    for n in &mut ends {
+        sum += *n;
+        *n = sum - *n;
+    }
+    debug_assert_eq!(sum as usize, ne);
+    let mut times = vec![0; ne];
+    let mut purchases = Vec::with_capacity(np);
+    let mut put = |key: u64| {
+        let cursor = &mut ends[local(key)];
+        times[*cursor as usize] = key & pack.mask;
+        *cursor += 1;
+    };
+    for s in pieces {
+        for key in s.times {
+            put(key);
+        }
+        for p in s.purchases {
+            put(p.key);
+            purchases.push(p);
+        }
+    }
+    let mut start = 0;
+    for &end in &ends {
+        let end = end as usize;
+        if end - start > 1 {
+            times[start..end].sort_unstable();
+        }
+        start = end;
+    }
+    (times, purchases, ends)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::links::linked_shard;
+
+    #[test]
+    fn direct_scatter_keeps_rank_ranges_and_sorts_only_offsets() {
+        let rank = 5;
+        let other = rank + NS as u32 * 2;
+        assert_eq!(linked_shard(rank), linked_shard(other));
+        assert_ne!(linked_shard(rank), linked_shard(rank + 1));
+        let pack = Packing::new(-2, 10, other as usize + 1).unwrap();
+        let pieces = vec![
+            Stream {
+                times: vec![pack.encode(other, 1), pack.encode(rank, 4)],
+                purchases: vec![Purchase {
+                    key: pack.encode(rank, -2),
+                    price: 1,
+                    cat: 2,
+                }],
+            },
+            Stream {
+                times: vec![pack.encode(other, 0), pack.encode(rank, 4)],
+                purchases: vec![Purchase {
+                    key: pack.encode(other, 0),
+                    price: 3,
+                    cat: 4,
+                }],
+            },
+        ];
+        let (times, purchases, ends) = scatter_linked(pieces, pack, 3, 6, 2);
+        assert_eq!(ends, [3, 3, 6]);
+        assert_eq!(times, [0, 6, 6, 2, 2, 3]);
+        assert_eq!(
+            purchases.iter().map(|p| p.key).collect::<Vec<_>>(),
+            [pack.encode(rank, -2), pack.encode(other, 0)]
+        );
+    }
 
     #[test]
     fn packing_checks_total_width_and_preserves_signed_millisecond_order() {

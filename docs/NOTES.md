@@ -1,5 +1,18 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 2 candidate: direct linked-person ranges — 2026-11-20
+
+Physical routing uses the canonical root rank modulo the shard count. The
+quotient identifies an exact person inside that shard, so a small table of
+counts and cursors can place retained timestamps into person ranges. Only
+timestamps are sorted inside each range; purchases and clicks retain their
+sparse sort/merge paths. Small or sparse packed shards use the previous
+comparison sort, and wide layouts still use exact name tokens. The paired
+20M performance comparison against `012174f` is delegated to the parent run.
+Validation: 17 Rust tests, 35 Python cases and 36 official fixtures against
+both implementations, 10 kit seeds, and an exact official dev match in both
+checkers.
+
 ## Round 2 integration: compact streams, exact catalog index and click prefetch — 2026-11-20
 
 The link graph already assigns each exact ID a node. Reuse its canonical root
