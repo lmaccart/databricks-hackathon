@@ -8,7 +8,7 @@ const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
 const EXTERNAL: u64 = 1 << 63;
 const LANES: usize = 64;
 
-#[inline]
+#[inline(always)]
 pub fn inline(bytes: &[u8]) -> Option<u64> {
     // A final NUL would be ambiguous with right padding. Keep such IDs in
     // the interner. Internal NULs are representable and significant.
@@ -55,7 +55,7 @@ impl<'a> Codec<'a> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn key(&self, bytes: &'a [u8]) -> u64 {
         inline(bytes).unwrap_or_else(|| self.intern(bytes))
     }

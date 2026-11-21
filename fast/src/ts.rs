@@ -171,9 +171,17 @@ pub fn parse_ts(s: &[u8]) -> i64 {
 
 /// `ingest_ts`, which rules.md guarantees is valid F1. A bad one sorts last
 /// (i64::MAX), so such a copy can only lose the dedup or be late.
-#[inline]
+#[inline(always)]
 pub fn parse_ingest(s: &[u8]) -> i64 {
-    match parse_ts(s) {
+    #[cold]
+    fn other(s: &[u8]) -> i64 {
+        parse_ts(s)
+    }
+    match if s.len() == 20 && s[4] == b'-' {
+        iso::<false>(s)
+    } else {
+        other(s)
+    } {
         BAD => i64::MAX,
         t => t,
     }

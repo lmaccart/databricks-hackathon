@@ -44,66 +44,73 @@ fn parse<'a>(
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Vec<PEv>> = (0..NS).map(|_| Vec::with_capacity(reserve)).collect();
     let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
-    let mut emit = |e: Pending| {
-        let mut target = NONE;
-        if e.uid != 0 {
-            let person = people.lookup(e.uid, e.hash);
-            let p = shard(person);
-            target = (payload[p].len() * NS + p) as u32;
-            payload[p].push(PEv {
-                person,
-                ts: e.ts,
-                price: e.price,
-                cat: e.cat,
+    let mut emit = std::convert::identity(
+        #[inline(always)]
+        |e: Pending| {
+            let mut target = NONE;
+            if e.uid != 0 {
+                let person = people.lookup(e.uid, e.hash);
+                let p = shard(person);
+                target = (payload[p].len() * NS + p) as u32;
+                payload[p].push(PEv {
+                    person,
+                    ts: e.ts,
+                    price: e.price,
+                    cat: e.cat,
+                });
+            }
+            claims[shard(hs.hash_one(e.id))].push(Claim {
+                id: e.id,
+                ingest: e.ingest,
+                target,
             });
-        }
-        claims[shard(hs.hash_one(e.id))].push(Claim {
-            id: e.id,
-            ingest: e.ingest,
-            target,
-        });
-    };
+        },
+    );
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
-    for_rows(c, |r| {
-        if r[0].is_empty() {
-            return;
-        }
-        let id = people.codec.key(r[0]);
-        let ingest = parse_ingest(r[3]);
-        let ts = parse_ts(r[2]);
-        let mut next = Pending {
-            id,
-            ts,
-            ingest,
-            ..Default::default()
-        };
-        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
-            let purchase = match r[4] {
-                b"purchase" => parse_price(r[6]),
-                b"view" | b"cart" => Some(0),
-                _ => None,
-            };
-            if let Some(price) = purchase {
-                let cat = if price == 0 {
-                    0
-                } else {
-                    *sm.product_cat.get(r[5]).unwrap_or(&sm.unknown_cat)
-                };
-                next.uid = people.codec.key(r[1]);
-                next.hash = links::mix(next.uid);
-                people.prefetch(next.hash);
-                next.price = price;
-                next.cat = cat;
+    for_rows(
+        c,
+        #[inline(always)]
+        |r| {
+            if r[0].is_empty() {
+                return;
             }
-        }
-        let i = n % ring.len();
-        if n >= ring.len() {
-            emit(ring[i]);
-        }
-        ring[i] = next;
-        n += 1;
-    });
+            let id = people.codec.key(r[0]);
+            let ingest = parse_ingest(r[3]);
+            let ts = parse_ts(r[2]);
+            let mut next = Pending {
+                id,
+                ts,
+                ingest,
+                ..Default::default()
+            };
+            if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
+                let purchase = match r[4] {
+                    b"purchase" => parse_price(r[6]),
+                    b"view" | b"cart" => Some(0),
+                    _ => None,
+                };
+                if let Some(price) = purchase {
+                    let cat = if price == 0 {
+                        0
+                    } else {
+                        *sm.product_cat.get(r[5]).unwrap_or(&sm.unknown_cat)
+                    };
+                    next.uid = people.codec.key(r[1]);
+                    next.hash = links::mix(next.uid);
+                    people.prefetch(next.hash);
+                    next.price = price;
+                    next.cat = cat;
+                }
+            }
+            let i = n % ring.len();
+            if n >= ring.len() {
+                emit(ring[i]);
+            }
+            ring[i] = next;
+            n += 1;
+        },
+    );
     for i in n.saturating_sub(ring.len())..n {
         emit(ring[i % ring.len()]);
     }

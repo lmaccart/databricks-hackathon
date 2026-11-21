@@ -42,7 +42,7 @@ struct Lane {
 }
 
 impl Lane {
-    #[inline]
+    #[inline(always)]
     fn find(&self, key: u64, hash: u64) -> usize {
         let mut i = (hash >> LANES.trailing_zeros()) as usize & self.mask;
         loop {
@@ -69,14 +69,14 @@ impl<'a> People<'a> {
         self.lookup(key, h)
     }
 
-    #[inline]
+    #[inline(always)]
     pub(super) fn lookup(&self, key: u64, h: u64) -> u64 {
         let lane = &self.lanes[h as usize & (LANES - 1)];
         let s = lane.slots[lane.find(key, h)];
         if s.key != 0 { s.value } else { h }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(super) fn prefetch(&self, h: u64) {
         let lane = &self.lanes[h as usize & (LANES - 1)];
         let i = (h >> LANES.trailing_zeros()) as usize & lane.mask;
