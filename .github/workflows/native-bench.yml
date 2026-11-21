@@ -34,6 +34,10 @@ on:
         description: Also time three paired full 60M container runs under the 14 GiB no-swap cap
         type: boolean
         default: false
+      oracle:
+        description: Compare 20 seeds at 10k, 100k and 1M events against the independent Python implementation
+        type: boolean
+        default: false
   push:
     branches: [bench/native-amd64, bench/container, bench/scale]
 
@@ -194,7 +198,7 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Compare one versus two workers per available logical CPU
-        if: ${{ !inputs.challenge && !inputs.profile }}
+        if: ${{ !inputs.challenge && !inputs.profile && !inputs.oracle }}
         shell: bash
         run: |
           set -euo pipefail
@@ -206,6 +210,16 @@ jobs:
               --threads "$t" --candidate-threads "$((2*t))" --tmpdir "$RUNNER_TEMP"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Verify 60 official-generator cases against the Python oracle
+        if: ${{ inputs.oracle }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The script locates the reference and comparer relative to tools/.
+          git show "$GITHUB_SHA:tools/official_diff.py" >tools/ci_oracle_diff.py
+          RAYON_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 "$RUNNER_TEMP/venv/bin/python" tools/ci_oracle_diff.py \
+            --generator "$RUNNER_TEMP/generator/target/release/generate" --binary "$RUNNER_TEMP/candidate" --jobs 2
+          echo '### Python oracle: all 60 generated cases matched on native amd64' >>"$GITHUB_STEP_SUMMARY"
       - name: Compare the actual scorer images on native Linux
         if: ${{ inputs.containers || github.ref_name == 'bench/container' || github.ref_name == 'bench/scale' }}
         shell: bash

@@ -2,7 +2,7 @@
 
 A native Rust entry for the [Databricks Shopping Sessions buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). It reads the mounted CSVs, resolves linked identities, deduplicates events, sessionizes, attributes clicks and assists, and writes `user_daily/` and `campaign_daily/` as Parquet. [Official rules](docs/rules.md) · [architecture](ARCHITECTURE.md) · [review, measurements and open checks](docs/NOTES.md).
 
-**Official practice:** the rebuild scored **1.78 s**, down from **5.03 s** on `cc9f33e` (2.83× faster). In separate paired 20M-event Linux runs with four workers, it took **2.078 s vs 6.112 s on Intel** and **2.635 s vs 7.708 s on AMD**. The independent dev answer, all 36 official fixtures, 60 generator comparisons, and a row-for-row 60M comparison passed.
+**Official practice:** **1.78 s**, down from **5.03 s** on `cc9f33e` (2.83× faster). The newer compact-event build is not yet officially scored. In [paired Intel runs](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870672021) it cut a further **10.1% and 10.4%** from the 1.78 s build's control on two 20M seeds. Both dev checkers, all 36 official fixtures, 60 independent Python comparisons and every output row on a [60M restricted Docker run](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870718540) matched. [Full timing ledger](docs/PERF_178.md).
 
 ## Build and run
 
@@ -35,7 +35,7 @@ make check-dev OUT=out
 
 `make fixtures` checks the Rust binary and the independent Python oracle against the starter's hand-written answers. `make check-dev` uses both the official comparer and a second per-key diff. `tools/official_diff.py` runs differential checks on other official seeds. `python tools/bench_pair.py BASELINE CANDIDATE DATA_DIR` compares five alternating-order pairs, with fresh output directories and one warmup per binary. The competition clock also includes container startup.
 
-The **Native amd64 performance check** workflow accepts `revision` and `baseline` commit SHAs. Use `challenge` for all-row comparisons and timing on two 20M seeds, `containers` for five paired practice-size Docker runs, and `scale` for an exact 60M check. `scale_pairs` adds three paired 60M Docker runs, each under a 14 GiB no-swap cap. The default baseline is the 5.03 s entry; use `4f75f526cef27623e406d2ec1008b40eb1935f23` for the 1.78 s rebuild control. All inputs are generated on the runner.
+The **Native amd64 performance check** workflow accepts `revision` and `baseline` commit SHAs. Use `challenge` for all-row comparisons and timing on two 20M seeds, `containers` for five paired practice-size Docker runs, and `scale` for an exact 60M check. `scale_pairs` adds three paired 60M Docker runs, each under a 14 GiB no-swap cap. `oracle` checks all 60 generated cases against Python on amd64. The default baseline is the 5.03 s entry; use `4f75f526cef27623e406d2ec1008b40eb1935f23` for the 1.78 s rebuild control. All inputs are generated on the runner.
 
 ## Credits
 
