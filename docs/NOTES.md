@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round-three head-to-head decision — 2026-11-21 07:05 UTC
+
+Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).
+
 ## Full-container verified event parser — 2026-11-21 06:50 UTC
 
 `7fd1b76` beat the scored `9758471` by **6.3% / 7.1%** on the two 20M seeds and by **5.7%** at each of 20M and 60M in [full Docker](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876665326). All 60 generated Python comparisons, the mixed grammar corpus, 36 official fixtures, dev output, and 6,615,971 final-scale rows matched. Another 60M seed on ARM64 matched all 6,671,518 rows. The local eight-worker **native** medians were 0.570 s and 0.601 s; the latest organizer time remains **1.57 s** for the previous build.

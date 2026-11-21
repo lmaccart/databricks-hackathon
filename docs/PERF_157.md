@@ -4,6 +4,8 @@ The official time reported by Leif is **1.57 s** on the build with production so
 
 **First verified release:** [`7fd1b76`](https://github.com/lmaccart/databricks-hackathon/commit/7fd1b7602280cfce05ac97b6afb703fa42c0b6ba) won **18/18** pairs in its [release run](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876665326), including all eight full-Docker pairs. It decodes common event fields from the original bytes in one pass and keeps the strict fallback.
 
+In that release run, the individual full-container savings ranged from **5.0% to 6.5%** on the five 20M pairs and **4.7% to 7.4%** on the three 60M pairs. The 5.7% headline at each scale is the ratio of the two medians.
+
 ## Where the time goes
 
 An [identical-build comparison and fresh Intel profile](https://github.com/lmaccart/databricks-hackathon/actions/runs/44874878855) gave **1.813 vs 1.817 s** on seed 7. Median phase intervals in the control were 0.099 s for the link graph and startup, 0.853 s for event parsing/routing, 0.119 s for event deduplication, 0.141 s for clicks, 0.461 s for sessions, and 0.096 s for output. The clock outside these phases contributed 0.041 s. Profiles include inlined work: the event scanner accounted for 15.2% of CPU samples, the two event closures for 15.3% together, identity prefetch for 6.9%, and fast F1 clock decoding for 5.5%.
@@ -98,6 +100,7 @@ Times below are seconds, **control → candidate**. The control is `9758471` unl
 | [Add typed clicks/links to the event parser, direct Docker follow-up](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) | 1.722 → 1.688 | 1.712 → 1.667 |
 | [Typed clicks/links and shared clocks vs typed events plus the same partition-local join](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877863522) | 1.640 → 1.643 | 1.616 → 1.617 |
 | [Time-ordered joint sweep over events and clicks vs typed event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44878038865) | 1.665 → 1.766 | 1.608 → 1.708 |
+| [Split events into time slabs, then stitch exact boundary sessions, vs typed event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44878292767) | 2.119 → 2.153 | 2.091 → 2.106 |
 | [Partition-local join and paired clocks vs independent-clock three-input parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877860881) | 1.693 → 1.674 | 1.675 → 1.646 |
 | [Same partition-local join with independent clocks, vs the independent-clock three-input parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44878084470) | 2.078 → 2.085 | 2.053 → 2.034 |
 
@@ -133,6 +136,7 @@ The 60M timing comparisons below use the same workload (seed 13, 15M clicks, 14 
 | [Packaged typed parser `7fd1b76` with independent oracle and grammar checks](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876665326) | 1.942 → 1.831 s | 6.065 → 5.722 s |
 | [Three-input parser with shared event/ingest clock fields](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877352490) | 1.874 → 1.816 s | 5.777 → 5.628 s |
 | [Packaged three-input shared-clock parser `6852f23`, AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877520113) | 2.429 → 2.242 s | 7.434 → 6.782 s |
+| [Three-input parser with independent clocks, AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639) | 2.457 → 2.241 s | 7.440 → 6.790 s |
 | [Partition-local identity join](https://github.com/lmaccart/databricks-hackathon/actions/runs/44875630980) | 2.402 → 2.334 s | 7.285 → 6.856 s |
 | [Typed event grammar plus partition-local join](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876241143) | 1.900 → 1.758 s | 5.879 → 5.284 s |
 
