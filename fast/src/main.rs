@@ -27,7 +27,9 @@ use std::sync::Arc;
 use std::time::Instant;
 mod person;
 mod events;
+mod links;
 use person::Codec;
+use links::{People, person_names};
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
@@ -330,80 +332,6 @@ fn read_small<'a>(prod: &'a [u8], camp: &'a [u8], pp: &Path, cp: &Path) -> Small
     Small { product_cat, cat_names, cat_rank, unknown_cat, camp_idx, camp_names, camp_channel }
 }
 
-// ------------------------------------------------------------------ links
-
-fn find(parent: &mut [u32], mut x: u32) -> u32 {
-    while parent[x as usize] != x {
-        let p = parent[x as usize];
-        parent[x as usize] = parent[p as usize]; // path halving
-        x = parent[x as usize];
-    }
-    x
-}
-
-/// Map every linked ID to its person's name (the byte-wise smallest ID of the
-/// person). IDs missing from the map are their own person.
-struct People<'a> {
-    codec: Codec<'a>,
-    aliases: Map<u64, u64>,
-}
-
-impl<'a> People<'a> {
-    #[inline]
-    fn resolve(&self, uid: &'a [u8]) -> u64 {
-        let key = self.codec.key(uid);
-        self.aliases.get(&key).copied().unwrap_or(key)
-    }
-}
-
-fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
-    let pairs: Vec<Vec<(&'a [u8], &'a [u8])>> = chunks
-        .par_iter()
-        .map(|c| {
-            let mut v = Vec::new();
-            for_rows(c, |r| {
-                if !r[0].is_empty() && !r[1].is_empty() {
-                    v.push((r[0], r[1]));
-                }
-            });
-            v
-        })
-        .collect();
-    let codec = Codec::new();
-    let mut ids: Map<u64, u32> = Map::with_hasher(rs());
-    let mut names: Vec<&'a [u8]> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
-    for v in pairs {
-        for (a, b) in v {
-            let mut ix = [0u32; 2];
-            for (k, s) in [a, b].into_iter().enumerate() {
-                ix[k] = *ids.entry(codec.key(s)).or_insert_with(|| {
-                    names.push(s);
-                    parent.push(parent.len() as u32);
-                    (names.len() - 1) as u32
-                });
-            }
-            let (ra, rb) = (find(&mut parent, ix[0]), find(&mut parent, ix[1]));
-            if ra != rb {
-                // keep the byte-wise smallest name as root, so a root names its person
-                if names[rb as usize] < names[ra as usize] {
-                    parent[ra as usize] = rb;
-                } else {
-                    parent[rb as usize] = ra;
-                }
-            }
-        }
-    }
-    let mut aliases = Map::with_capacity_and_hasher(names.len(), rs());
-    for (key, i) in ids {
-        let r = find(&mut parent, i);
-        if r != i {
-            aliases.insert(key, codec.key(names[r as usize]));
-        }
-    }
-    People { codec, aliases }
-}
-
 // ------------------------------------------------------------------ events & clicks
 
 #[derive(Clone, Copy)]
@@ -671,7 +599,7 @@ fn main() {
     let hs = rs();
 
     let names = person_names(&link_chunks);
-    log(&format!("links: {} linked ids", names.aliases.len()));
+    log(&format!("links: {} linked ids", names.count));
 
     let ev_by_person = events::by_person(&ev_chunks, &sm, &names, ws, we, &hs, &log);
     log("events deduped");

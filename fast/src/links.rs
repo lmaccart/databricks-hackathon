@@ -1,0 +1,188 @@
+//! Build the canonical-name lookup in parallel, including transitive paths
+//! that span input files. Node indexes are temporary; only exact keys escape.
+use super::{Chunk, Codec, for_rows};
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+const LANES: usize = 64;
+
+#[inline]
+pub(super) fn mix(key: u64) -> u64 {
+    let x = (key ^ (key >> 27)).wrapping_mul(0xa24b_aed4_963e_e407);
+    x ^ (x >> 33)
+}
+
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    key: u64,
+    value: u64,
+}
+
+struct Lane {
+    slots: Vec<Slot>,
+    mask: usize,
+}
+
+impl Lane {
+    #[inline]
+    fn find(&self, key: u64, hash: u64) -> usize {
+        let mut i = (hash >> LANES.trailing_zeros()) as usize & self.mask;
+        loop {
+            let k = self.slots[i].key;
+            if k == key || k == 0 {
+                return i;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
+pub(super) struct People<'a> {
+    pub(super) codec: Codec<'a>,
+    lanes: Vec<Lane>,
+    pub(super) count: usize,
+}
+
+impl<'a> People<'a> {
+    #[inline]
+    pub(super) fn resolve(&self, uid: &'a [u8]) -> u64 {
+        let key = self.codec.key(uid);
+        let h = mix(key);
+        let lane = &self.lanes[h as usize & (LANES - 1)];
+        let s = lane.slots[lane.find(key, h)];
+        if s.key != 0 { s.value } else { key }
+    }
+}
+
+#[inline]
+fn root(parent: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let node = &parent[x as usize];
+        let p = node.load(Relaxed);
+        if p == x {
+            return x;
+        }
+        let gp = parent[p as usize].load(Relaxed);
+        if p == gp {
+            return p;
+        }
+        let _ = node.compare_exchange_weak(p, gp, Relaxed, Relaxed);
+        x = gp;
+    }
+}
+
+pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
+    let codec = Codec::new();
+    let parsed: Vec<_> = chunks
+        .par_iter()
+        .map(|c| {
+            let mut edges = Vec::new();
+            let mut keys: Vec<Vec<u64>> = (0..LANES).map(|_| Vec::new()).collect();
+            for_rows(c, |r| {
+                if r[0].is_empty() || r[1].is_empty() {
+                    return;
+                }
+                let a = codec.key(r[0]);
+                let b = codec.key(r[1]);
+                edges.push((a, b));
+                for k in [a, b] {
+                    keys[mix(k) as usize & (LANES - 1)].push(k);
+                }
+            });
+            (edges, keys)
+        })
+        .collect();
+    let (edges, key_parts): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
+    let built: Vec<_> = (0..LANES)
+        .into_par_iter()
+        .map(|s| {
+            let n = key_parts.iter().map(|p| p[s].len()).sum::<usize>();
+            let mut keys = Vec::with_capacity(n);
+            for p in &key_parts {
+                keys.extend_from_slice(&p[s]);
+            }
+            keys.sort_unstable();
+            keys.dedup();
+            let cap = (keys.len() * 2 + 1).next_power_of_two();
+            let mut lane = Lane {
+                slots: vec![Slot::default(); cap],
+                mask: cap - 1,
+            };
+            for (j, &k) in keys.iter().enumerate() {
+                let i = lane.find(k, mix(k));
+                lane.slots[i] = Slot {
+                    key: k,
+                    value: j as u64,
+                };
+            }
+            (lane, keys)
+        })
+        .collect();
+    drop(key_parts);
+    let (mut lanes, groups): (Vec<_>, Vec<_>) = built.into_iter().unzip();
+    let mut offsets = [0; LANES];
+    let mut count = 0usize;
+    for (s, g) in groups.iter().enumerate() {
+        offsets[s] = count;
+        count += g.len();
+    }
+    assert!(
+        u32::try_from(count).is_ok(),
+        "too many linked IDs for addressable memory"
+    );
+    let keys: Vec<u64> = groups.into_iter().flatten().collect();
+    let parent: Vec<_> = (0..count as u32).map(AtomicU32::new).collect();
+    let index = |key| {
+        let hash = mix(key);
+        let s = hash as usize & (LANES - 1);
+        (offsets[s] + lanes[s].slots[lanes[s].find(key, hash)].value as usize) as u32
+    };
+    edges
+        .par_iter()
+        .flat_map(|part| part.par_chunks(8192))
+        .for_each(|part| {
+            for &(a, b) in part {
+                let (mut a, mut b) = (index(a), index(b));
+                loop {
+                    a = root(&parent, a);
+                    b = root(&parent, b);
+                    if a == b {
+                        break;
+                    }
+                    let ka = keys[a as usize];
+                    let kb = keys[b as usize];
+                    // The ASCII encoding is order preserving for its domain.
+                    // Spill numbers are not; compare their original bytes.
+                    let swap = if (ka | kb) >> 63 == 0 {
+                        ka > kb
+                    } else {
+                        codec.bytes(ka, &mut [0; 9]) > codec.bytes(kb, &mut [0; 9])
+                    };
+                    if swap {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    // Every successful edge points to a strictly smaller name.
+                    // A concurrent union can change either root, never form a cycle.
+                    if parent[b as usize]
+                        .compare_exchange(b, a, Relaxed, Relaxed)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+    lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
+        for slot in &mut lane.slots {
+            if slot.key != 0 {
+                slot.value =
+                    keys[root(&parent, (offsets[s] + slot.value as usize) as u32) as usize];
+            }
+        }
+    });
+    People {
+        codec,
+        lanes,
+        count,
+    }
+}

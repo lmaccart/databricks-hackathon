@@ -14,3 +14,15 @@ class PersonKeys(unittest.TestCase):
                                    "ß,Ω"])
         self.assertEqual({name for name, _ in users}, set(names))
         self.assertTrue(all(row["events"] == 1 for row in users.values()))
+
+    def test_parallel_link_components_take_byte_minimum(self):
+        # Each part crosses the others. The minimum is a long, unused name;
+        # choosing an arbitrary union root would produce the wrong user_id.
+        nodes = [f"node{i}" for i in range(2500)] + ["AA long canonical name"]
+        extra = {f"links/shard-{s}.csv": [
+            f"{nodes[i+1]},{nodes[i]}" for i in range(s, len(nodes)-1, 16)
+        ] for s in range(16)}
+        users, _ = run_case(events=[ev("one", "node0", WS), ev("two", "node2499", WS)],
+                            links=["node0,node0", "node45,node44"], extra=extra)
+        self.assertEqual([(r["user_id"], r["events"]) for r in users.values()],
+                         [("AA long canonical name", 2)])
