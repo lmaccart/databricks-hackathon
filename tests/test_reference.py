@@ -354,13 +354,15 @@ class ByteDistinctIds(unittest.TestCase):
         minimum = "A\0"
         u, c = run_case(
             events=[ev("one", names[0], t), ev("two", names[-1], t)]
-                   + [ev(f"e{i}", uid, t) for i, uid in enumerate(separate)],
+                   + [ev(f"e{i}", uid, t) for i, uid in enumerate(separate)]
+                   + [ev(f"alias{i}", names[-1], t) for i in range(40)]
+                   + [ev(f"absent{i}", separate[-1], t) for i in range(40)],
             clicks=[f"c1,{names[1]},c_1,{t}", f"c2,{separate[1]},c_2,{t}"],
             links=[f'{name},{names[0]}' for name in names]
                   + [f'"{minimum}",{names[-1]}'],
         )
         self.assertEqual({key[0]: row["events"] for key, row in u.items()},
-                         {minimum: 2, **dict.fromkeys(separate, 1)})
+                         {minimum: 42, **dict.fromkeys(separate, 1), separate[-1]: 41})
         self.assertEqual(c[("c_1", "2026-10-02")]["sessions"], 1)
         self.assertEqual(c[("c_2", "2026-10-02")]["sessions"], 1)
 

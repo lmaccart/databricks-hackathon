@@ -219,6 +219,7 @@ fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
 fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<'a>) -> Vec<Vec<PCl>> {
     let hint = reserve_per_shard(c.data);
     let mut b: Vec<Vec<PCl>> = (0..NS).map(|_| Vec::with_capacity(hint)).collect();
+    let mut hot = links::Hot::new();
     for_rows(c, |r| {
         // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
         let (cid, uid, camp) = (r[0], r[1], r[2]);
@@ -230,7 +231,8 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<
         if ts == BAD || ts < lo || ts >= we {
             return;
         }
-        let person = names.resolve(uid);
+        let probe = hot.prepare(names, uid);
+        let person = hot.finish(names, probe);
         b[shard(person)].push(PCl {
             person,
             ts,

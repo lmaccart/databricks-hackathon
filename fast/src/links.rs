@@ -69,14 +69,55 @@ pub(super) enum Probe {
     None,
     Exact(u64, u64),
     Structural(u64, usize),
+    Cached(u64),
+}
+
+const HOT_LEN: usize = 256;
+const RAW_TAG: u64 = 1 << 63;
+
+/// An exact, bounded cache local to one parse task. Cache resolved misses too:
+/// a frequently seen UID need not occur in any link.
+pub(super) struct Hot([(u64, u64); HOT_LEN]);
+
+impl Hot {
+    pub(super) fn new() -> Self {
+        Self([(0, 0); HOT_LEN])
+    }
+
+    #[inline]
+    fn slot(probe: Probe) -> Option<(usize, u64)> {
+        let (hash, tag) = match probe {
+            // Spill IDs use the high bit, so leave them on the exact path.
+            Probe::Exact(key, h) if key & RAW_TAG == 0 => (h as usize, key),
+            Probe::Structural(raw, index) => (index, raw | RAW_TAG),
+            _ => return None,
+        };
+        Some((hash & (HOT_LEN - 1), tag))
+    }
+
+    #[inline]
+    pub(super) fn prepare<'a>(&self, people: &People<'a>, uid: &'a [u8]) -> Probe {
+        let probe = people.prepare(uid);
+        if let Some((i, tag)) = Self::slot(probe) {
+            let (saved, person) = self.0[i];
+            if saved == tag {
+                return Probe::Cached(person);
+            }
+        }
+        probe
+    }
+
+    #[inline]
+    pub(super) fn finish(&mut self, people: &People<'_>, probe: Probe) -> u64 {
+        let person = people.lookup(probe);
+        if let Some((i, tag)) = Self::slot(probe) {
+            self.0[i] = (tag, person);
+        }
+        person
+    }
 }
 
 impl<'a> People<'a> {
-    #[inline]
-    pub(super) fn resolve(&self, uid: &'a [u8]) -> u64 {
-        self.lookup(self.prepare(uid))
-    }
-
     #[inline]
     pub(super) fn prepare(&self, uid: &'a [u8]) -> Probe {
         if let Some(family) = &self.family {
@@ -93,6 +134,7 @@ impl<'a> People<'a> {
         match probe {
             Probe::None => 0,
             Probe::Exact(key, h) => self.lookup_exact(key, h),
+            Probe::Cached(person) => person,
             Probe::Structural(raw, index) => {
                 let family = self.family.as_ref().unwrap();
                 match family.lookup(index, raw) {
@@ -123,7 +165,7 @@ impl<'a> People<'a> {
                 (&lane.slots[i] as *const Slot).cast::<u8>()
             }
             Probe::Structural(_, index) => self.family.as_ref().unwrap().address(index),
-            Probe::None => return,
+            Probe::None | Probe::Cached(_) => return,
         };
         // Only an in-bounds address in an immutable, live table; prefetch is
         // a hint, never an actual read used for a decision.
@@ -218,7 +260,11 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         u32::try_from(count).is_ok(),
         "too many linked IDs for addressable memory"
     );
-    let shape = Shape::learn(&groups);
+    let shape = if std::env::var_os("SS_IDENTITY_FLAT").is_some_and(|value| value == "1") {
+        None
+    } else {
+        Shape::learn(&groups)
+    };
     let keys: Vec<u64> = groups.into_iter().flatten().collect();
     let parent: Vec<_> = (0..count as u32).map(AtomicU32::new).collect();
     let index = |key| {
@@ -287,5 +333,39 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         lanes,
         family,
         count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hot_cache_confirms_full_tag_after_same_slot_and_handles_self() {
+        let keys: Vec<_> = (0..=HOT_LEN).map(|n| format!("some{n}")).collect();
+        let people = person_names(&[]);
+        let mut hot = Hot::new();
+        let mut old = None;
+        let mut pair = None;
+        let mut seen = [None; HOT_LEN];
+        for (n, name) in keys.iter().enumerate() {
+            let (i, _) = Hot::slot(people.prepare(name.as_bytes())).unwrap();
+            if let Some(previous) = seen[i].replace(n) {
+                old = Some(keys[previous].as_bytes());
+                pair = Some(name.as_bytes());
+                break;
+            }
+        }
+        let (old, pair) = (old.unwrap(), pair.unwrap());
+        let old_probe = hot.prepare(&people, old);
+        let first = hot.finish(&people, old_probe);
+        assert!(matches!(hot.prepare(&people, old), Probe::Cached(value) if value == first));
+        let pair_probe = hot.prepare(&people, pair);
+        assert!(matches!(pair_probe, Probe::Exact(..)));
+        let second = hot.finish(&people, pair_probe);
+        assert_ne!(first, second);
+        assert!(matches!(hot.prepare(&people, old), Probe::Exact(..)));
+        assert!(matches!(hot.prepare(&people, pair), Probe::Cached(value) if value == second));
+        assert!(matches!(hot.prepare(&people, b"abc\0"), Probe::Exact(..)));
     }
 }

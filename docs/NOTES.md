@@ -8,8 +8,17 @@ alphanumeric suffixes: the index is just a hash, never proof of equality.
 Store only aliases whose name changes; a miss in a non-overflowed bucket is
 therefore the original ID. Other shapes, non-ASCII, trailing NUL, and
 overflowed-bucket misses retain the old exact lookup. Person tokens and the
-union-find naming rule are unchanged. No large timing run in this worktree;
-native timing is delegated to the parent session.
+union-find naming rule are unchanged. Validation: 16 Rust tests, 32 Python
+cases against each implementation, 36 official fixtures against each,
+10 kit-generated 20k-event diffs, three official 10k-event diffs (seeds 3,
+7, 15), and an exact dev match (117,038 user rows and 27,400 campaign rows,
+zero stdout).
+
+The follow-up tries a 4 KiB parse-task-local direct-mapped cache ahead of the
+immutable tables, including repeated unlinked IDs. Every hit checks the full
+exact tag. Events retain their existing delayed lookup and only fill the cache
+once that lookup completes. Use `SS_IDENTITY_FLAT=1` with the follow-up to
+disable buckets and measure the cache over the old flat table separately.
 
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 

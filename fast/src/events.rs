@@ -43,9 +43,9 @@ fn parse<'a>(
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Vec<PEv>> = (0..NS).map(|_| Vec::with_capacity(reserve)).collect();
     let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
-    let mut emit = |e: Pending| {
+    let mut emit = |e: Pending, hot: &mut links::Hot| {
         let mut target = NONE;
-        let person = people.lookup(e.lookup);
+        let person = hot.finish(people, e.lookup);
         if person != 0 {
             let p = shard(person);
             target = (payload[p].len() * NS + p) as u32;
@@ -62,6 +62,7 @@ fn parse<'a>(
             target,
         });
     };
+    let mut hot = links::Hot::new();
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
     for_rows(c, |r| {
@@ -89,7 +90,7 @@ fn parse<'a>(
                 } else {
                     *sm.product_cat.get(r[5]).unwrap_or(&sm.unknown_cat)
                 };
-                next.lookup = people.prepare(r[1]);
+                next.lookup = hot.prepare(people, r[1]);
                 people.prefetch(next.lookup);
                 next.price = price;
                 next.cat = cat;
@@ -97,13 +98,13 @@ fn parse<'a>(
         }
         let i = n % ring.len();
         if n >= ring.len() {
-            emit(ring[i]);
+            emit(ring[i], &mut hot);
         }
         ring[i] = next;
         n += 1;
     });
     for i in n.saturating_sub(ring.len())..n {
-        emit(ring[i % ring.len()]);
+        emit(ring[i % ring.len()], &mut hot);
     }
     (payload, claims)
 }
