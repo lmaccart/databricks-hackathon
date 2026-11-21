@@ -329,6 +329,31 @@ class EventsOrder(unittest.TestCase):
 
 
 class LinkedIds(unittest.TestCase):
+    def test_self_links_and_unrelated_graph_nodes_preserve_both_tables(self):
+        # "A line ... may link an ID to itself; neither changes anything."
+        # The same rows must agree when all, some, or none of their owners
+        # receive a link-node rank, including on a window too wide to pack.
+        names = ["u", "U", "u\0", "u ", " ü", "a very long person ID"] + [f"id{i}" for i in range(32)]
+        at = ms("2026-10-05T23:45:00Z")
+        events, clicks = [], []
+        for i, uid in enumerate(names):
+            start = at + 1000 * i
+            events.extend([ev(f"e{i}", uid, str(start)),
+                           ev(f"p{i}", uid, str(start + 30 * MIN), "purchase", "p1", "11"),
+                           ev(f"p{i}b", uid, str(start + 30 * MIN), "purchase", "p2", "11"),
+                           ev(f"next{i}", uid, str(start + 60 * MIN + 1))])
+            clicks.extend([f"z{i},{uid},c_1,{start}", f"a{i},{uid},c_2,{start}"])
+        expected = run_case(events=events, clicks=clicks)
+        self.assertEqual(len(expected[0]), 2 * len(names))
+        self.assertEqual(expected[1][("c_2", "2026-10-05")]["revenue_cents"], 22 * len(names))
+        self.assertEqual(expected[1][("c_1", "2026-10-06")]["assisted_sessions"], len(names))
+        self_links = [f'"{uid}",{uid}' for uid in names]
+        for edges in (self_links[::2], self_links):
+            self.assertEqual(run_case(events=events, clicks=clicks, links=edges), expected)
+        inactive = [f"absent{i},absent{i}" for i in range(16_384)]
+        self.assertEqual(run_case(events=events, clicks=clicks, links=self_links + inactive,
+                                 window=("0001-01-01T00:00:00Z", "9999-01-01T00:00:00Z")), expected)
+
     def test_chain_naming(self):
         t1, t2 = "2026-10-02T10:00:00Z", "2026-10-02T10:20:00Z"
         u, _ = run_case(

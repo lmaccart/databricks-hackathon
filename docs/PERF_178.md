@@ -35,8 +35,16 @@ A [native sampling profile](https://github.com/lmaccart/databricks-hackathon/act
 | [Dispatch AVX-512 compressed separator positions](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870496496) | 2.021 → 2.032 | 2.033 → 2.021 |
 | [Optimistic typed CSV decoding with one-line fallback](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870521940) | 2.188 → 2.179 | 2.166 → 2.178 |
 | [Linked ranks, sparse purchases, exact catalogs and click prefetch](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870672021) | 2.087 → **1.876** | 2.074 → **1.859** |
+| [Combined build vs linked ranks alone, on AMD](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870718540) | 2.502 → **2.399** | 2.476 → **2.378** |
 | [Local ranks for standalone shoppers, vs linked ranks alone](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870760171) | 1.936 → 1.919 | 1.920 → 1.908 |
+| [Cache paired event dates, vs the combined build](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870852357) | 1.902 → 1.871 | 1.869 → 1.820 |
+| [Full-width bin sweep with the date cache and click prefetch, vs the combined build](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870935382) | 1.874 → 1.828 | 1.828 → 1.793 |
+| [Contiguous identity lanes with direct-address prefetch](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870935655) | 2.093 → 2.096 | 2.073 → 2.054 |
+| [Reuse partition buffers across CSV chunks](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871004196) | 2.094 → 2.126 | 2.124 → 2.065 |
+| [Chronological sweep of compact keys, vs the combined build](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871013465) | 2.435 → 2.482 | 2.436 → 2.477 |
 
 The duplicate census roughly halved the time spent resolving claims, but the extra full-input scan cost more than it saved. The deferred-ingest variant had a similar tradeoff: reading the original input again on suspect IDs made duplicate resolution more expensive. The dimension/click change worked on both seeds: the median click phase fell from 0.218 to 0.154 s and from 0.221 to 0.156 s. Its direct table accepts only canonical, unpadded decimal suffixes after an exact learned prefix; all other spellings still use the original byte map.
 
 Two different session representations also helped. The linked-rank sort reuses the node index from the union-find as an exact person ID; a compact event carries only rank and time unless it is a purchase. The chronological sweep counts events in bins no wider than the session gap and merges each person's extrema across adjacent occupied bins. It falls back to exact sorting if aggregation does not compress the input sufficiently. Neither optimization changes which events join a session or the UTC start day credited.
+
+**Other platforms and rejected prototypes.** On a working M2 Pro (eight workers) the combined `8e3525e` had mixed five-pair medians against `4f75f52`: 0.767 → 0.835 s and 0.759 → 0.708 s. The seed-7 candidate writer interval was 0.145 s vs 0.072 s, despite unchanged writer code. Use the native amd64 pairs to judge the target. A shared atomic first-witness table was 16% slower on Mac dev, and a two-field CSV shape cache was 5–7% slower. Both prototypes passed fixtures and dev but were not promoted to 20M CI.
