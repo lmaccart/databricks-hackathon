@@ -155,47 +155,73 @@ fn parse<'a>(
     packing: Option<Packing>,
 ) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
     let reserve = reserve_per_shard(c.data);
-    let mut payload: Vec<Payload> = (0..NS)
-        .map(|_| {
-            let mut p = Payload::default();
-            p.wide
-                .times
-                .reserve(if packing.is_some() { reserve / 2 } else { reserve });
-            if packing.is_some() {
-                p.packed.times.reserve(reserve / 2);
-            }
-            p
-        })
-        .collect();
+    let mut payload: Vec<Payload> = (0..NS).map(|_| Payload::default()).collect();
     let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
     let mut spill = Vec::new();
-    let mut emit = |e: Pending| {
-        let mut target = NONE;
-        if e.uid != 0 {
-            let person = people.lookup(e.uid, e.hash);
-            let p = person.owner();
-            let slot = payload[p].push(person, e.ts, e.price, e.cat, packing, people);
-            target = (slot * NS + p) as u32;
+    let mut segment = |c: &Chunk<'a>, payload: &mut [Payload]| {
+        let mut emit = |e: Pending| {
+            let mut target = NONE;
+            if e.uid != 0 {
+                let person = people.lookup(e.uid, e.hash);
+                let p = person.owner();
+                let slot = payload[p].push(person, e.ts, e.price, e.cat, packing, people);
+                target = (slot * NS + p) as u32;
+            }
+            // This shard supplies the omitted high bits; within it equality of
+            // the stored low bits is equality of the full byte-exact ID token.
+            claims[(e.claim_key >> KEY_BITS) as usize].push(Claim::new(e.claim_key, target, e.claim_order));
+        };
+        let mut ring = [Pending::default(); 16];
+        let mut n = 0usize;
+        word::for_events(c, sm, &people.codec, window, &mut spill, |next| {
+            if next.uid != 0 {
+                people.prefetch(next.hash);
+            }
+            let i = n % ring.len();
+            if n >= ring.len() {
+                emit(ring[i]);
+            }
+            ring[i] = next;
+            n += 1;
+        });
+        for i in n.saturating_sub(ring.len())..n {
+            emit(ring[i % ring.len()]);
         }
-        // This shard supplies the omitted high bits; within it equality of
-        // the stored low bits is equality of the full byte-exact ID token.
-        claims[(e.claim_key >> KEY_BITS) as usize].push(Claim::new(e.claim_key, target, e.claim_order));
     };
-    let mut ring = [Pending::default(); 16];
-    let mut n = 0usize;
-    word::for_events(c, sm, &people.codec, window, &mut spill, |next| {
-        if next.uid != 0 {
-            people.prefetch(next.hash);
+    // Close the prefix at a physical LF: a malformed or oversized line
+    // cannot change the next line's dialect state or the parent chunk index.
+    let at = (c.data.len() / 64).clamp(8192, 128 << 10);
+    if c.data.len() >= (1 << 18)
+        && let Some(end) = memchr::memchr(b'\n', &c.data[at..]).map(|v| v + at + 1)
+        && end < c.data.len() / 4
+    {
+        let (first, rest) = c.data.split_at(end);
+        let mut part = *c;
+        part.data = first;
+        segment(&part, &mut payload);
+        let populations: Vec<_> = payload
+            .iter()
+            .map(|p| {
+                [
+                    p.packed.times.len(),
+                    p.packed.purchases.len(),
+                    p.wide.times.len(),
+                    p.wide.purchases.len(),
+                ]
+            })
+            .collect();
+        for (p, [a, b, c0, d]) in payload.iter_mut().zip(route_sizes(&populations, end, c.data.len())) {
+            p.packed.times.reserve_exact(a.saturating_sub(p.packed.times.len()));
+            p.packed
+                .purchases
+                .reserve_exact(b.saturating_sub(p.packed.purchases.len()));
+            p.wide.times.reserve_exact(c0.saturating_sub(p.wide.times.len()));
+            p.wide.purchases.reserve_exact(d.saturating_sub(p.wide.purchases.len()));
         }
-        let i = n % ring.len();
-        if n >= ring.len() {
-            emit(ring[i]);
-        }
-        ring[i] = next;
-        n += 1;
-    });
-    for i in n.saturating_sub(ring.len())..n {
-        emit(ring[i % ring.len()]);
+        part.data = rest;
+        segment(&part, &mut payload);
+    } else {
+        segment(c, &mut payload);
     }
     (payload, claims, spill)
 }
