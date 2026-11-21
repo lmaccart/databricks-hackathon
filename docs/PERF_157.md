@@ -115,6 +115,8 @@ Five alternating process start-to-exit pairs on an Apple M2 Pro, native arm64, w
 
 The trial with typed clicks/links and shared F1 fields (`03cd84c`) measured **0.667 → 0.612 s** and **0.622 → 0.572 s** in a different paired Mac run. The independent-clock click/link trial measured **3.301 → 3.233 s** and **1.466 → 1.381 s** immediately after a 60M comparison on this workstation. Its seed-7 paired savings ranged from −25% to +48%; those absolute Mac times cannot rank the implementations across runs.
 
+To resolve that discrepancy, we ran the scored binary, event-only parser and independent-clock three-input parser **in the same six blocks**, rotating through all six execution orders per seed after warmup. Medians in that order were **0.638 / 0.589 / 0.596 s** (seed 7) and **0.585 / 0.544 / 0.542 s** (seed 15). Each candidate beat the scored executable in all 12 blocks, but neither candidate won on both seeds relative to the other.
+
 ## Exactness and reproduction
 
 The independent Python oracle checks 20 seeds each at 10k, 100k and 1M events. The added grammar corpus mutates timestamps, quoted fields, IDs and ignored prices on real physical lines. Each mutant competes with a later valid event for a different shopper, and valid lines follow malformed ones. This catches the difference between *invalid earliest* (suppresses the event) and *malformed earliest* (never enters dedup). As a negative control, deliberately dropping invalid claims before dedup produced **2,658 extra user-day rows** and a differing campaign row; the new verifier rejected it.
@@ -130,6 +132,7 @@ The 60M timing comparisons below use the same workload (seed 13, 15M clicks, 14 
 | [Typed event grammar](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876117068) | 1.868 → 1.766 s | 5.546 → 5.358 s |
 | [Packaged typed parser `7fd1b76` with independent oracle and grammar checks](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876665326) | 1.942 → 1.831 s | 6.065 → 5.722 s |
 | [Three-input parser with shared event/ingest clock fields](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877352490) | 1.874 → 1.816 s | 5.777 → 5.628 s |
+| [Packaged three-input shared-clock parser `6852f23`, AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877520113) | 2.429 → 2.242 s | 7.434 → 6.782 s |
 | [Partition-local identity join](https://github.com/lmaccart/databricks-hackathon/actions/runs/44875630980) | 2.402 → 2.334 s | 7.285 → 6.856 s |
 | [Typed event grammar plus partition-local join](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876241143) | 1.900 → 1.758 s | 5.879 → 5.284 s |
 
