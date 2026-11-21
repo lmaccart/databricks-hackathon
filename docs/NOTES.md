@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Adaptive campaign-lifetime assist batching — 2026-11-21
+
+For people whose active campaign/day hash updates accumulate, the session scan now switches after four sessions and 16 direct assist updates to campaign lifetime ranges. A campaign opens at the first covered session index and closes when its last qualifying click expires; exact session-start-day run boundaries convert each range into dense local campaign/day counts. Existing per-session attribution remains the path for light people, and batching is disabled when the checked campaign × manifest-day grid exceeds 131,072 cells. This preserves sparse handling for huge windows and dimensions. Credit selection, including byte-wise click-ID ties, is unchanged.
+
+The official rule remains: “A session is assisted by every campaign with at least one of the person's valid clicks with `session_start - 7 days <= click.ts <= session_start`: the same clicks step 4 chooses from, including the one it chose. Each such campaign assists the session once, however many of its clicks qualify. `organic` never assists.” Targeted coverage exercises cross-day intervals, the exact seven-day edge, duplicate campaign touches, latest-click ties, expiry and re-entry. Reference and binary tests, all 36 official fixtures, ten 30k dirty seeds and the 1M dev answer pass. No large local timing was run, so this is an unmeasured candidate, not a verified speed win.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).

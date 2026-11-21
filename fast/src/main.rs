@@ -116,9 +116,11 @@ struct Small<'a> {
     camp_idx: dims::Dimension<'a>,
     camp_names: Vec<&'a [u8]>,
     camp_channel: Vec<&'a [u8]>,
+    assist_day0: i32,
+    assist_days: usize,
 }
 
-fn read_small<'a>(prod: &'a [u8], camp: &'a [u8], pp: &Path, cp: &Path) -> Small<'a> {
+fn read_small<'a>(prod: &'a [u8], camp: &'a [u8], pp: &Path, cp: &Path, ws: i64, we: i64) -> Small<'a> {
     let mut cat_id: HashMap<Vec<u8>, u32> = HashMap::new();
     let mut cat_names: Vec<Vec<u8>> = Vec::new();
     let mut product_cat = Map::with_hasher(rs());
@@ -162,6 +164,12 @@ fn read_small<'a>(prod: &'a [u8], camp: &'a [u8], pp: &Path, cp: &Path) -> Small
         camp_idx: dims::Dimension::new(camp_idx, first_campaign),
         camp_names,
         camp_channel,
+        assist_day0: ws.div_euclid(DAY) as i32,
+        assist_days: we
+            .checked_sub(1)
+            .map(|last| last.div_euclid(DAY) - ws.div_euclid(DAY) + 1)
+            .and_then(|days| usize::try_from(days).ok())
+            .unwrap_or(0),
     }
 }
 
@@ -313,6 +321,62 @@ fn ckey(camp: u32, day: i32) -> u64 {
     ((camp as u64) << 32) | (day as u32 as u64)
 }
 
+// Rules §Clicks 7 counts each qualifying campaign once per session. A contiguous
+// active lifetime is a session-index range; keep its day grid dense only when
+// the checked manifest × campaign size is small.
+struct AssistGrid {
+    day0: i32,
+    days: usize,
+    counts: Vec<i64>,
+    touched: Vec<usize>,
+}
+
+impl AssistGrid {
+    fn new(day0: i32, days: usize, campaigns: usize) -> Option<Self> {
+        let cells = days.checked_mul(campaigns)?;
+        (cells > 0 && cells <= 131_072).then(|| Self {
+            day0,
+            days,
+            counts: vec![0; cells],
+            touched: Vec::new(),
+        })
+    }
+
+    fn add_range(&mut self, camp: u32, first: usize, end: usize, day_runs: &[(i32, usize)]) {
+        if first >= end {
+            return;
+        }
+        let mut run = day_runs.partition_point(|&(_, index)| index <= first).saturating_sub(1);
+        while run < day_runs.len() {
+            let (day, start) = day_runs[run];
+            if start >= end {
+                break;
+            }
+            let stop = day_runs.get(run + 1).map_or(end, |next| next.1.min(end));
+            let count = stop.saturating_sub(start.max(first));
+            if count > 0 {
+                let d = usize::try_from(i64::from(day) - i64::from(self.day0)).unwrap();
+                debug_assert!(d < self.days);
+                let index = camp as usize * self.days + d;
+                if self.counts[index] == 0 {
+                    self.touched.push(index);
+                }
+                self.counts[index] += count as i64;
+            }
+            run += 1;
+        }
+    }
+
+    fn flush(&mut self, camps: &mut Map<u64, [i64; 4]>) {
+        for index in self.touched.drain(..) {
+            let count = std::mem::take(&mut self.counts[index]);
+            let camp = (index / self.days) as u32;
+            let day = self.day0 + (index % self.days) as i32;
+            camps.entry(ckey(camp, day)).or_insert([0; 4])[3] += count;
+        }
+    }
+}
+
 fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
     let mut best: Option<usize> = None;
     for c in 0..catsum.len() {
@@ -355,11 +419,18 @@ fn process_stream<T: Temporal>(
     let mut cnt = vec![0usize; ncamp]; // copies enter and leave the window together
     let mut active: Vec<u32> = Vec::new(); // campaigns with cnt > 0
     let mut pos = vec![0u32; ncamp]; // index of a campaign inside `active`
+    let mut open_at = vec![usize::MAX; ncamp];
     let mut catsum = vec![0i64; sm.cat_names.len()];
 
+    let can_batch_assists = sm
+        .assist_days
+        .checked_mul(ncamp)
+        .is_some_and(|cells| cells > 0 && cells <= 131_072);
+    let mut assist_grid: Option<AssistGrid> = None;
     let mut ci = 0usize;
     let mut i = 0usize;
     let mut pi = 0usize;
+    let mut day_runs: Vec<(i32, usize)> = Vec::new();
     while i < evs.len() {
         let rank = evs[i].person(layout);
         let person = T::name(rank, people);
@@ -377,6 +448,10 @@ fn process_stream<T: Temporal>(
         let clicks = &cls[c0..ci];
         let (mut lo, mut hi) = (0usize, 0usize);
         let mut latest = 0;
+        let mut sessions_seen = 0usize;
+        let mut direct_assist_work = 0usize;
+        let mut lazy_assists = false;
+        day_runs.clear();
 
         let mut cur_day: i32 = i32::MIN;
         let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
@@ -390,6 +465,9 @@ fn process_stream<T: Temporal>(
                 m += 1;
             }
             let day = start.div_euclid(DAY) as i32;
+            if can_batch_assists && day != cur_day {
+                day_runs.push((day, sessions_seen));
+            }
             if day != cur_day {
                 if cur_day != i32::MIN {
                     let top = top_category(&catsum, &sm.cat_rank);
@@ -435,6 +513,9 @@ fn process_stream<T: Temporal>(
                 if cnt[c] == 0 {
                     pos[c] = active.len() as u32;
                     active.push(c as u32);
+                    if lazy_assists {
+                        open_at[c] = sessions_seen;
+                    }
                 }
                 cnt[c] += 1;
                 hi += 1;
@@ -443,6 +524,13 @@ fn process_stream<T: Temporal>(
                 let c = clicks[lo].camp as usize;
                 cnt[c] -= 1;
                 if cnt[c] == 0 {
+                    if lazy_assists {
+                        assist_grid
+                            .as_mut()
+                            .unwrap()
+                            .add_range(c as u32, open_at[c], sessions_seen, &day_runs);
+                        open_at[c] = usize::MAX;
+                    }
                     let p = pos[c] as usize;
                     let last = active.pop().unwrap();
                     if last as usize != c {
@@ -459,10 +547,35 @@ fn process_stream<T: Temporal>(
             e[0] += 1;
             e[1] += (pi != p0) as i64;
             e[2] += rev;
-            for &a in &active {
-                camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
+            if !lazy_assists {
+                direct_assist_work += active.len();
+                for &a in &active {
+                    camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
+                }
             }
             k = m;
+            sessions_seen += 1;
+            if !lazy_assists
+                && can_batch_assists
+                && sessions_seen >= 4
+                && direct_assist_work >= 16
+                && !active.is_empty()
+            {
+                assist_grid.get_or_insert_with(|| AssistGrid::new(sm.assist_day0, sm.assist_days, ncamp).unwrap());
+                for &a in &active {
+                    open_at[a as usize] = sessions_seen;
+                }
+                lazy_assists = true;
+            }
+        }
+        if lazy_assists {
+            for &a in &active {
+                assist_grid
+                    .as_mut()
+                    .unwrap()
+                    .add_range(a, open_at[a as usize], sessions_seen, &day_runs);
+                open_at[a as usize] = usize::MAX;
+            }
         }
         let top = top_category(&catsum, &sm.cat_rank);
         users.push(UserRow {
@@ -481,6 +594,9 @@ fn process_stream<T: Temporal>(
         i = j;
     }
     debug_assert_eq!(pi, np);
+    if let Some(grid) = &mut assist_grid {
+        grid.flush(camps);
+    }
 }
 
 fn process_shard(
@@ -535,7 +651,14 @@ fn main() {
     let cf = File::open(data.join("campaigns.csv")).expect("campaigns.csv");
     let pm = unsafe { Mmap::map(&pf).unwrap() };
     let cm = unsafe { Mmap::map(&cf).unwrap() };
-    let sm = read_small(&pm, &cm, &data.join("products.csv"), &data.join("campaigns.csv"));
+    let sm = read_small(
+        &pm,
+        &cm,
+        &data.join("products.csv"),
+        &data.join("campaigns.csv"),
+        ws,
+        we,
+    );
 
     let link_files = mmap_files(&data.join("links"));
     let event_files = mmap_files(&data.join("events"));

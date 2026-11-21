@@ -452,6 +452,38 @@ class LinkedIds(unittest.TestCase):
 
 
 class Clicks(unittest.TestCase):
+    def test_many_session_assists_batch_campaign_lifetimes_by_day(self):
+        starts = [WS_MS + (day - 1) * DAY + 12 * HOUR for day in range(1, 11)]
+        events = [ev(f"e{day}", "u1", str(start)) for day, start in enumerate(starts, 1)]
+        clicks = [
+            f"a,u1,c_1,{starts[0]}",  # byte-wise tie winner at the first session
+            f"z,u1,c_1,{starts[0]}",  # another touch, but one assist per campaign
+            f"b,u1,c_2,{starts[0]}",
+            f"c,u1,c_3,{starts[0]}",
+            f"d,u1,c_4,{starts[0]}",
+            f"c1-reopen,u1,c_1,{starts[1]}",  # extends the lifetime through day 9
+            f"c5-late,u1,c_5,{starts[4] + HOUR}",  # begins assisting on day 6
+            f"c2-reentry,u1,c_2,{starts[9]}",  # expired, then active again
+        ]
+        _, camps = run_case(events=events, clicks=clicks,
+                            campaigns=tuple(f"c_{i},channel{i}" for i in range(1, 6)))
+        assisted_days = {
+            "c_1": set(range(1, 10)),  # overlapping touches form one continuous range
+            "c_2": {*range(1, 9), 10},  # days 1–8, then re-enters on day 10
+            "c_3": set(range(1, 9)),  # exactly through the 7-day boundary
+            "c_4": set(range(1, 9)),
+            "c_5": set(range(6, 11)),  # after day 5's start; assists days 6–10
+        }
+        for campaign, expected_days in assisted_days.items():
+            for day in range(1, 11):
+                date = (dt.date(2026, 10, 1) + dt.timedelta(days=day - 1)).isoformat()
+                row = camps.get((campaign, date))
+                self.assertEqual(row["assisted_sessions"] if row else 0, int(day in expected_days),
+                                 (campaign, date))
+        self.assertEqual(camps[("c_1", "2026-10-01")]["sessions"], 1)
+        self.assertEqual(camps[("c_5", "2026-10-09")]["sessions"], 1)
+        self.assertEqual(camps[("c_2", "2026-10-10")]["sessions"], 1)
+
     def test_credit_boundaries(self):
         s = ms("2026-10-09T12:00:00Z")
         events = [ev(f"e{i}", f"u{i}", str(s)) for i in range(1, 7)]

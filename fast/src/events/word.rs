@@ -311,6 +311,8 @@ mod tests {
             b"campaign_id,channel\n",
             path,
             path,
+            parse_ts(b"2026-10-01T00:00:00Z"),
+            parse_ts(b"2026-10-15T00:00:00Z"),
         );
         let ws = parse_ts(b"2026-10-01T00:00:00Z");
         let we = parse_ts(b"2026-10-15T00:00:00Z");
