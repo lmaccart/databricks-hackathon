@@ -622,6 +622,16 @@ fn main() {
     rayon::join(
         || output::campaign_daily(&cd.join("part-0.parquet"), &camp_rows),
         || {
+            #[cfg(target_arch = "x86_64")]
+            if let Some(mode) = person::IdMode::detect() {
+                return output::user_daily(
+                    &ud,
+                    &shards,
+                    parts,
+                    &|p, out| out.extend_from_slice(names.codec.bytes_with(mode, links::unmix(p), &mut [0; 9])),
+                    &sm.cat_names,
+                );
+            }
             output::user_daily(
                 &ud,
                 &shards,

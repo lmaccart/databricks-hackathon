@@ -23,7 +23,7 @@ fn comma(s: &[u8], q: bool) -> Option<&[u8]> {
 /// inline token. `'-'..=127` excludes all three CSV structural bytes and NUL;
 /// IDs with any other spelling are still handled by the ordinary codec.
 #[inline(always)]
-fn id(s: &[u8]) -> Option<(u64, &[u8])> {
+fn id<const BMI2: bool>(mode: person::IdMode<BMI2>, s: &[u8]) -> Option<(u64, &[u8])> {
     let (q, b) = quoted(s);
     let b11 = b.first_chunk::<11>()?;
     let w = u64::from_le_bytes(b11[..8].try_into().unwrap());
@@ -33,7 +33,7 @@ fn id(s: &[u8]) -> Option<(u64, &[u8])> {
         if ((w.wrapping_sub(FLOOR) | w) & HIGH) != 0 || (q && b11[10] != b',') {
             return None;
         }
-        return Some((person::pack_inline(w.swap_bytes(), tail), &b[10 + usize::from(q)..]));
+        return Some((mode.pack_inline(w.swap_bytes(), tail), &b[10 + usize::from(q)..]));
     }
     // Search the two shorter boundary positions. The subtract-based
     // zero mask can have borrow artifacts after a match, never before it.
@@ -53,7 +53,7 @@ fn id(s: &[u8]) -> Option<(u64, &[u8])> {
     if ((w.wrapping_sub(FLOOR) | w) & HIGH & active) != 0 {
         return None;
     }
-    Some((person::pack_inline((w & active).swap_bytes(), 0), &b[more..]))
+    Some((mode.pack_inline((w & active).swap_bytes(), 0), &b[more..]))
 }
 
 #[inline(always)]
@@ -220,9 +220,18 @@ mod tests {
                             input.push(b'"');
                         }
                         input.extend_from_slice(b",following-field");
-                        let (key, rest) = id(&input).expect("ASCII ID must use the fast path");
-                        assert_eq!(Some(key), person::inline(&value), "{value:?}");
-                        assert_eq!(rest, b"following-field");
+                        let check = |mode| {
+                            let (key, rest) = id(mode, &input).expect("ASCII ID must use the fast path");
+                            assert_eq!(Some(key), person::inline(&value), "{value:?}");
+                            assert_eq!(rest, b"following-field");
+                        };
+                        check(person::IdMode::SCALAR);
+                        #[cfg(target_arch = "x86_64")]
+                        if let Some(mode) = person::IdMode::supported_for_test() {
+                            let (key, rest) = id(mode, &input).unwrap();
+                            assert_eq!(Some(key), person::inline(&value), "{value:?}");
+                            assert_eq!(rest, b"following-field");
+                        }
                     }
                 }
             }
@@ -260,11 +269,27 @@ mod tests {
                 let (mut want, mut got) = (vec![], vec![]);
                 let (mut want_spill, mut got_spill) = (vec![], vec![]);
                 for_rows(&c, |r| {
-                    want.extend(decode_fields(r, &sm, &codec, window, &mut want_spill))
+                    want.extend(decode_fields(
+                        r,
+                        &sm,
+                        &codec,
+                        person::IdMode::SCALAR,
+                        window,
+                        &mut want_spill,
+                    ))
                 });
-                for_events(&c, &sm, &codec, window, &mut got_spill, |e| got.push(e));
+                for_events_with(person::IdMode::SCALAR, &c, &sm, &codec, window, &mut got_spill, |e| {
+                    got.push(e)
+                });
                 assert_eq!(got, want, "{row:?}, {after:?}");
                 assert_eq!(got_spill, want_spill);
+                #[cfg(target_arch = "x86_64")]
+                if let Some(mode) = person::IdMode::supported_for_test() {
+                    let (mut forced, mut forced_spill) = (vec![], vec![]);
+                    for_events_with(mode, &c, &sm, &codec, window, &mut forced_spill, |e| forced.push(e));
+                    assert_eq!(forced, want, "{row:?}, {after:?}");
+                    assert_eq!(forced_spill, want_spill);
+                }
             }
         };
         let followed = [&b"\n"[..], following].concat();
@@ -274,7 +299,7 @@ mod tests {
             b"opaque009,\"USER_07\",\"2026-10-03T10:30:00+00:30\",\"2026-10-03T10:00:00Z\",\"purchase\",\"item-7\",\"0123\"",
         ] {
             let file = [row, &followed].concat();
-            let (event, rest) = decode(&file, &sm, window).unwrap_or_else(|| panic!("must exercise the word path: {row:?}"));
+            let (event, rest) = decode(person::IdMode::SCALAR, &file, &sm, window).unwrap_or_else(|| panic!("must exercise the word path: {row:?}"));
             assert_ne!(event.uid, 0);
             assert_eq!(rest, following);
             check(row, b"");
@@ -295,9 +320,14 @@ mod tests {
 }
 
 #[inline(always)]
-fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestClock)) -> Option<(Pending, &'a [u8])> {
-    let (eid, s) = id(s)?;
-    let (uid, s) = id(s)?;
+fn decode<'a, const BMI2: bool>(
+    mode: person::IdMode<BMI2>,
+    s: &'a [u8],
+    sm: &Small,
+    (ws, we, clock): (i64, i64, &ManifestClock),
+) -> Option<(Pending, &'a [u8])> {
+    let (eid, s) = id(mode, s)?;
+    let (uid, s) = id(mode, s)?;
     let (ts, seconds, s) = timestamps(s, clock)?;
     let (purchase, s) = event_type(s)?;
     let (payload, rest) = suffix(s, purchase, sm)?;
@@ -323,17 +353,18 @@ fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestCloc
 
 #[cold]
 #[inline(never)]
-fn fallback<'a>(
+fn fallback<'a, const BMI2: bool>(
     s: &'a [u8],
     sm: &Small,
     codec: &Codec<'a>,
+    mode: person::IdMode<BMI2>,
     window: (i64, i64, &ManifestClock),
     spill: &mut Vec<i64>,
 ) -> (Option<Pending>, &'a [u8]) {
     let end = memchr::memchr(b'\n', s).map_or(s.len(), |i| i + 1);
     let (line, rest) = s.split_at(end);
     let mut row = None;
-    csv::identity_row::<7>(line, &mut |r| row = decode_fields(r, sm, codec, window, spill));
+    csv::identity_row::<7>(line, &mut |r| row = decode_fields(r, sm, codec, mode, window, spill));
     (row, rest)
 }
 
@@ -344,22 +375,39 @@ pub(super) fn for_events<'a>(
     codec: &Codec<'a>,
     window: (i64, i64, &ManifestClock),
     spill: &mut Vec<i64>,
+    emit: impl FnMut(Pending),
+) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(mode) = person::IdMode::detect() {
+        return for_events_with(mode, c, sm, codec, window, spill, emit);
+    }
+    for_events_with(person::IdMode::SCALAR, c, sm, codec, window, spill, emit);
+}
+
+#[inline]
+fn for_events_with<'a, const BMI2: bool>(
+    mode: person::IdMode<BMI2>,
+    c: &Chunk<'a>,
+    sm: &Small,
+    codec: &Codec<'a>,
+    window: (i64, i64, &ManifestClock),
+    spill: &mut Vec<i64>,
     mut emit: impl FnMut(Pending),
 ) {
     if !c.identity_order(7) {
         return for_rows(c, |r| {
-            if let Some(e) = decode_fields(r, sm, codec, window, spill) {
+            if let Some(e) = decode_fields(r, sm, codec, mode, window, spill) {
                 emit(e);
             }
         });
     }
     let mut rest = c.data;
     while !rest.is_empty() {
-        if let Some((e, tail)) = decode(rest, sm, window) {
+        if let Some((e, tail)) = decode(mode, rest, sm, window) {
             emit(e);
             rest = tail;
         } else {
-            let (e, tail) = fallback(rest, sm, codec, window, spill);
+            let (e, tail) = fallback(rest, sm, codec, mode, window, spill);
             if let Some(e) = e {
                 emit(e);
             }

@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Typed word grammar + BMI2 experiment — 2026-11-21
+
+On top of `f4ac682`, select the codec once per event chunk: PEXT is in the typed ID grammar and generic event fallback, while the generic scalar codec uses bounded short loads. User output selects PDEP without changing the writer API. Old AMD (before family 19h), Hygon and unknown vendors retain SWAR; other architectures remain scalar. The 7-bit lanes and opaque interner are unchanged.
+
+ARM: 22 Rust tests, 40 reference and 40 binary tests, 36/36 official fixtures for each implementation, 10 dirty seeds, and both dev comparers passed. Official Rust 1.100 cross-checks Linux/amd64 including tests; x86 Darwin under Rosetta passed 23 Rust tests. x86 release assembly places four PEXT instructions directly in `events::parse`, two in generic `decode_fields`, and PDEP in the existing output loop. Rosetta does not advertise BMI2, so actual hardware-instruction execution and AMD A/B timing remain pending; no timing performed in this experiment.
+
 ## Experimental word-offset event parser — 2026-11-21 UTC
 
 For the seven-column canonical header, validate and pack 7–9 byte ASCII IDs

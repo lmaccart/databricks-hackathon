@@ -108,17 +108,18 @@ struct Pending {
 }
 
 #[inline]
-fn decode_fields<'a>(
+fn decode_fields<'a, const BMI2: bool>(
     r: &[&'a [u8]; 8],
     sm: &Small,
     codec: &Codec<'a>,
+    mode: person::IdMode<BMI2>,
     (ws, we, clock): (i64, i64, &ManifestClock),
     spill: &mut Vec<i64>,
 ) -> Option<Pending> {
     if r[0].is_empty() {
         return None;
     }
-    let claim_key = links::mix(codec.key(r[0]));
+    let claim_key = links::mix(codec.key_with(mode, r[0]));
     let (ingest, seconds) = clock.ingest_for_claim(r[3]);
     let ts = clock.parse_ts(r[2]);
     let mut next = Pending {
@@ -134,7 +135,7 @@ fn decode_fields<'a>(
             _ => None,
         };
         if let Some(price) = purchase {
-            next.uid = codec.key(r[1]);
+            next.uid = codec.key_with(mode, r[1]);
             next.hash = links::mix(next.uid);
             next.price = price;
             next.cat = if price == 0 {
