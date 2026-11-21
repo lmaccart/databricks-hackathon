@@ -16,6 +16,64 @@ const _: () = assert!(NS.is_power_of_two() && (CHUNK + 1) * NS < u32::MAX as usi
 const NONE: u32 = u32::MAX;
 const KILLED: u32 = u32::MAX; // never a valid purchase price
 
+// Buffer a few rows per destination before writing the much larger destination
+// vectors. This turns random writes into short contiguous bursts while keeping
+// the logical per-destination index stable for duplicate-claim locators.
+const BLOCK: usize = 8;
+
+struct Stage<T: Copy> {
+    rows: [std::mem::MaybeUninit<T>; BLOCK],
+    len: usize,
+}
+
+struct Buffered<T: Copy> {
+    buckets: Vec<Vec<T>>,
+    stages: Vec<Stage<T>>,
+}
+
+impl<T: Copy> Buffered<T> {
+    fn new(reserve: usize) -> Self {
+        Self {
+            buckets: (0..NS).map(|_| Vec::with_capacity(reserve)).collect(),
+            stages: (0..NS)
+                .map(|_| Stage {
+                    rows: [std::mem::MaybeUninit::uninit(); BLOCK],
+                    len: 0,
+                })
+                .collect(),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, dest: usize, row: T) -> usize {
+        let bucket = &mut self.buckets[dest];
+        let stage = &mut self.stages[dest];
+        let index = bucket.len() + stage.len;
+        stage.rows[stage.len].write(row);
+        stage.len += 1;
+        if stage.len == BLOCK {
+            Self::flush(bucket, stage);
+        }
+        index
+    }
+
+    #[inline]
+    fn flush(bucket: &mut Vec<T>, stage: &mut Stage<T>) {
+        // SAFETY: exactly the first len slots have been initialized by push;
+        // T is Copy and the source remains alive during extend_from_slice.
+        let rows = unsafe { std::slice::from_raw_parts(stage.rows.as_ptr().cast::<T>(), stage.len) };
+        bucket.extend_from_slice(rows);
+        stage.len = 0;
+    }
+
+    fn finish(mut self) -> Vec<Vec<T>> {
+        for (bucket, stage) in self.buckets.iter_mut().zip(&mut self.stages) {
+            Self::flush(bucket, stage);
+        }
+        self.buckets
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Location {
     batch: usize,
@@ -42,26 +100,32 @@ fn parse<'a>(
     hs: &RandomState,
 ) -> (Vec<Vec<PEv>>, Vec<Vec<Claim>>) {
     let reserve = reserve_per_shard(c.data);
-    let mut payload: Vec<Vec<PEv>> = (0..NS).map(|_| Vec::with_capacity(reserve)).collect();
-    let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
+    let mut payload = Buffered::new(reserve);
+    let mut claims = Buffered::new(reserve + reserve / 8);
     let mut emit = |e: Pending| {
         let mut target = NONE;
         if e.uid != 0 {
             let person = people.lookup(e.uid, e.hash);
             let p = shard(person);
-            target = (payload[p].len() * NS + p) as u32;
-            payload[p].push(PEv {
-                person,
-                ts: e.ts,
-                price: e.price,
-                cat: e.cat,
-            });
+            let index = payload.push(
+                p,
+                PEv {
+                    person,
+                    ts: e.ts,
+                    price: e.price,
+                    cat: e.cat,
+                },
+            );
+            target = (index * NS + p) as u32;
         }
-        claims[shard(hs.hash_one(e.id))].push(Claim {
-            id: e.id,
-            ingest: e.ingest,
-            target,
-        });
+        claims.push(
+            shard(hs.hash_one(e.id)),
+            Claim {
+                id: e.id,
+                ingest: e.ingest,
+                target,
+            },
+        );
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
@@ -107,7 +171,7 @@ fn parse<'a>(
     for i in n.saturating_sub(ring.len())..n {
         emit(ring[i % ring.len()]);
     }
-    (payload, claims)
+    (payload.finish(), claims.finish())
 }
 
 #[inline]
@@ -217,6 +281,20 @@ pub(super) fn by_person<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_indices_survive_partial_and_full_flushes() {
+        let mut buffered = Buffered::new(0);
+        let mut expected: Vec<Vec<usize>> = (0..NS).map(|_| Vec::new()).collect();
+        for n in 0..5000 {
+            let dest = if n % 3 == 0 { NS - 1 } else { n % NS };
+            let index = buffered.push(dest, n);
+            assert_eq!(index, expected[dest].len());
+            expected[dest].push(n);
+        }
+        assert_eq!(buffered.finish(), expected);
+        assert!(Buffered::<u64>::new(0).finish().iter().all(Vec::is_empty));
+    }
 
     #[test]
     fn bloom_alias_keeps_distinct_id_and_invalid_winner_kills_valid_loser() {

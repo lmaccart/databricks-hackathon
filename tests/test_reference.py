@@ -189,6 +189,32 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_staged_routing_skew_and_cross_file_invalid_winners(self):
+        t = "2026-10-02T10:00:00Z"
+        later = "2026-10-02T10:00:05Z"
+        whale = "whale-" + "x" * 300
+        events = [ev(f"id{i}", whale, t, "purchase", price="2", ingest=later)
+                  for i in range(513)]
+        # Distinct shard destinations, plus winners arriving in another batch.
+        events += [ev(f"other{i}", f"person-{i}", t) for i in range(150)]
+        early = [ev(f"id{i}", "", t, ingest=t) for i in range(0, 513, 3)]
+        early += [ev(f"id{i}", "winner", t, "purchase", price="7", ingest=t)
+                  for i in range(1, 513, 3)]
+        u, _ = run_case(events=events, extra={"events/part-1.csv": early})
+        d = "2026-10-02"
+        self.assertEqual((u[(whale, d)]["events"], u[(whale, d)]["revenue_cents"]), (171, 342))
+        self.assertEqual((u[("winner", d)]["events"], u[("winner", d)]["revenue_cents"]), (171, 1197))
+        self.assertEqual(len(u), 152)
+
+    def test_routing_line_longer_than_chunk_keeps_invalid_winner(self):
+        t = "2026-10-02T10:00:00Z"
+        huge = "event-" + "x" * (8 * 1024 * 1024)
+        u, _ = run_case(events=[
+            ev(huge, "lost", t, ingest="2026-10-02T10:00:05Z"),
+            ev("keep", "survivor", t),
+        ], extra={"events/part-1.csv": [ev(huge, "", t, ingest=t)]})
+        self.assertEqual(set(u), {("survivor", "2026-10-02")})
+
     def test_no_survivors_still_writes_both_empty_tables(self):
         u, c = run_case(events=[ev("e", "", WS)], clicks=[f"k,u,c_1,{WS}"])
         self.assertEqual((u, c), ({}, {}))

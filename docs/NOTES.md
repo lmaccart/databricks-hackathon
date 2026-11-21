@@ -1,5 +1,22 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Staged event routing experiment — 2026-11-20
+
+Experimental isolated candidate: buffer eight claims and eight payloads per
+destination before sequentially appending to the existing destination vectors.
+The logical payload locator includes staged rows, so invalid earliest claims
+still eliminate the right payload across batches. Empty and partial stages
+flush normally; vector growth handles skew and whales. This adds about 100 KiB
+of per-chunk staging and an extra copy, so a speedup is not assumed.
+
+Validation: both implementations pass 33 local tests and 36 official fixtures;
+Rust passes 14 tests and clippy. Both dev-answer comparers match. Ten 20k dirty
+kit seeds and official seeds 2, 7, 15 at 10k and 100k all match the oracle;
+seed 15 covers leap day. Adversarial cases cover a whale, cross-file invalid
+earliest winners, staged partial/full blocks and lines over 8 MiB.
+No 20M timing was run in this worktree, per delegation; paired timing and
+the required >3% acceptance decision are pending the parent session.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.
