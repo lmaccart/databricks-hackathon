@@ -22,7 +22,7 @@ Across those runs, the candidate won **30/30 native pairs**, **14/15 practice Do
 
 **Correctness:** both 20M inputs, 60 independent Python comparisons, the official dev answer, all 36 official fixtures, opaque IDs, malformed CSV, and colliding/transitive identity graphs matched. The restricted image matched every row against `7fd1b76` on two 60M inputs: **6,615,971** rows on seed 13 and **6,629,430** on seed 948307. With 14 GiB and no swap, Linux `wait4` reported **7.80 and 7.76 GiB peak RSS** respectively; the corresponding cgroup charges were 3.20 and 3.11 GiB. Shared mapped input can be resident without being charged to this cgroup. Timings and memory were taken in separate runs.
 
-On the oracle runner the first unpaired 60M container after data generation took **9.704 s**; the paired candidate median was **4.627 s**. The first run did not time the control under the same conditions. Use the paired numbers for the measured speedup; the organizers' input-cache state and eight pinned hyperthreads may produce different times.
+On the oracle runner the first unpaired 60M container after data generation took **9.704 s**; the paired candidate median was **4.627 s**. That discrepancy motivated the [controlled input-cache comparison](#input-page-cache) below. The organizers' cache state and eight pinned hyperthreads may produce different times.
 
 For this exact source on the M2 Pro (system allocator, native arm64, eight workers), medians against `7fd1b76` fell **0.673 → 0.553 s** and **0.622 → 0.513 s** on the two 20M seeds, and **1.625 → 1.356 s** on the 60M holdout. It won 15/15 pairs. The holdout's peak process RSS was 8.00 GiB with four workers. The official dev checkers and 36 fixtures both passed locally; six independent Python holdouts at 250k and 1M events also matched.
 
@@ -48,6 +48,19 @@ Both 20M outputs and every one of the 6,615,971 60M rows matched. The same job p
 A second 60M input, seed **948307** with 15M clicks, matched the scored control on all **6,601,416 user-days + 28,014 campaign-days** on ARM64. The candidate used 9.29 GiB peak RSS and wrote no stdout. On an eight-worker M2 Pro the two 20M process medians against `7fd1b76` were 0.670 → 0.627 s and 0.621 → 0.617 s, with nine of ten pairs faster. These process-only numbers and the hosted Docker numbers are not practice scores.
 
 ## What the clocks measure
+
+### Input page cache
+
+On a [four-worker Intel Xeon 6975P-C](https://github.com/lmaccart/databricks-hackathon/actions/runs/44938542381), the only variable between the two sets of pairs was the residency of the generated `/data` files. Full Docker medians, `7fd1b76` → `14ccc10`:
+
+| Input | 100% resident in Linux page cache | 0% resident in Linux page cache |
+|---|---:|---:|
+| 20M events, 5M clicks (seed 7) | 1.788 → **1.300 s** (−27.3%) | 3.773 → **3.465 s** (−8.2%) |
+| 60M events, 15M clicks (seed 13) | 5.532 → **3.959 s** (−28.4%) | 12.955 → **12.054 s** (−7.0%) |
+
+The release won all three alternating pairs in each cell; every output matched the control. The [harness](https://github.com/lmaccart/databricks-hackathon/blob/161fd41/tools/coldcheck_terra.py) flushed and evicted just the generated input files, verified residency with `mincore` before each run, then started the timer. It measured 0 of 469,253 input pages resident at 20M and 0 of 1,393,407 at 60M; the warm runs had all of them resident. Device and storage-service caches were not controlled. A first job that failed the residency check produced no cold timing.
+
+### Container launch and parsing
 
 On a [four-worker Intel Xeon 6975P-C](https://github.com/lmaccart/databricks-hackathon/actions/runs/44933674959), two builds with identical production sources differed by 0.3% or less on both practice seeds. The host CLI includes Docker creation and removal; the Engine interval is `StartedAt` to `FinishedAt`; `written` is the pipeline's internal timer through closing its Parquet files. Five-run medians:
 

@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Verified cold-input comparison — 2026-11-21
+
+Keep `1a3d0fd` for practice. On the same four-worker Intel machine the change saved **27.3% / 28.4%** with fully resident inputs and **8.2% / 7.0%** with no input pages resident (20M / 60M). It won all six cold pairs and all six warm pairs. Outputs matched after every timed run. [Timing and cache verification](PERF_154.md#input-page-cache).
+
 ## Next practice build: link mimalloc 3 to the worker-local campaign pipeline — 2026-11-21
 
 Practice SHA: [`1a3d0fd`](https://github.com/lmaccart/databricks-hackathon/commit/1a3d0fdf38c14e858a92ba53bfa29da2f0f9b94a), production-identical to `14ccc10`. Direct comparisons against the scored source won **53 of 54 pairs** across the [oracle run](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937040474), [two-60M-seed run](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937344723) and [EPYC 7763 repeat](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937264092). Full Docker medians improved **28.7–34.2% at 20M** and **29.5–33.6% at 60M**. The packaged entry matched the 60-case Python matrix and every row on both 60M seeds, with peak RSS below 7.82 GiB. Extra reservation logic and allocator tunables missed the practice threshold head-to-head. [Release evidence and reproduction](PERF_154.md#allocator-selection). Latest official practice: **1.54 s**.

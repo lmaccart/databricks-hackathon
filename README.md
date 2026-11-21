@@ -2,7 +2,7 @@
 
 A native Rust entry for the [Databricks Shopping Sessions buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). It reads the mounted CSVs, resolves linked identities, deduplicates events, sessionizes, attributes clicks and assists, and writes `user_daily/` and `campaign_daily/` as Parquet. [Official rules](docs/rules.md) · [architecture](ARCHITECTURE.md) · [review, measurements and open checks](docs/NOTES.md).
 
-**Official practice: 1.54 s**, down from 5.03 → 1.78 → 1.57 s. The reported leaderboard best is **0.30 s**. The [next practice build](docs/PERF_154.md#allocator-selection) cut full Docker time by about **30%** at both 20M and 60M against the [1.54 s production source](https://github.com/lmaccart/databricks-hackathon/commit/7fd1b7602280cfce05ac97b6afb703fa42c0b6ba) in direct four-worker Linux comparisons. It matched every output row on two 60M seeds. [All current trials](docs/PERF_154_RUNS.md) · [previous release benchmarks](docs/PERF_157.md).
+**Official practice: 1.54 s**, down from 5.03 → 1.78 → 1.57 s. The reported leaderboard best is **0.30 s**. Against the [1.54 s production source](https://github.com/lmaccart/databricks-hackathon/commit/7fd1b7602280cfce05ac97b6afb703fa42c0b6ba), the [next practice build](docs/PERF_154.md#allocator-selection) cut full Docker time by about **30%** with warmed inputs on four-worker Linux runners. With the [input page cache verified empty](docs/PERF_154.md#input-page-cache), it saved **8.2% at 20M and 7.0% at 60M**. Every output row matched on two 60M seeds. [All current trials](docs/PERF_154_RUNS.md) · [previous release benchmarks](docs/PERF_157.md).
 
 ## Build and run
 
