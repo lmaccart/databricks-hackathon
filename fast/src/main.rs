@@ -797,6 +797,7 @@ fn main() {
     let threshold = std::env::var("SS_PAR_SORT_THRESHOLD")
         .ok()
         .and_then(|x| x.parse::<usize>().ok())
+        .or(Some(65_536))
         .filter(|&x| x > 0);
     let epoch = timing.then(Instant::now);
     let cpu_start = timing.then(process_cpu).flatten();
