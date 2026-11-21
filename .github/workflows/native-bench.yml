@@ -86,7 +86,22 @@ jobs:
                 echo "LD_LIBRARY_PATH=$RUNNER_TEMP/ss-libs" >>"$GITHUB_ENV"
               fi
               docker rm "$cid" >/dev/null
+              docker image inspect "$image" | jq -r '.[0].Config.Env[] |
+                select(test("^MIMALLOC_(PURGE_DELAY|ALLOW_THP)=-?[0-9]+$"))' >"$RUNNER_TEMP/$exe.allocator-env"
             done
+            if [[ -s "$RUNNER_TEMP/scored.allocator-env" || -s "$RUNNER_TEMP/candidate.allocator-env" ]]; then
+              # Wrap both sides if either image configures its allocator. Keep
+              # DATA_DIR/OUTPUT_DIR from the native test, not the Docker mounts.
+              for exe in scored candidate; do
+                mv "$RUNNER_TEMP/$exe" "$RUNNER_TEMP/$exe.bin"
+                {
+                  echo '#!/bin/sh'
+                  sed 's/^/export /' "$RUNNER_TEMP/$exe.allocator-env"
+                  echo 'exec "$0.bin" "$@"'
+                } >"$RUNNER_TEMP/$exe"
+                chmod +x "$RUNNER_TEMP/$exe"
+              done
+            fi
             exit 0
           fi
           cargo +1.100.0 build --release --locked --manifest-path "$RUNNER_TEMP/control/fast/Cargo.toml"
