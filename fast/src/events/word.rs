@@ -204,6 +204,64 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "read a real dataset and report field-level fast-path coverage"]
+    fn report_word_coverage() {
+        let data = PathBuf::from(std::env::var_os("DATA_DIR").unwrap());
+        let m: serde_json::Value = serde_json::from_slice(&std::fs::read(data.join("manifest.json")).unwrap()).unwrap();
+        let ws = parse_ts(m["window_start"].as_str().unwrap().as_bytes());
+        let we = parse_ts(m["window_end"].as_str().unwrap().as_bytes());
+        let clock = ManifestClock::new(ws, we);
+        let p = std::fs::read(data.join("products.csv")).unwrap();
+        let ca = std::fs::read(data.join("campaigns.csv")).unwrap();
+        let sm = read_small(&p, &ca, &data.join("products.csv"), &data.join("campaigns.csv"));
+        let files = mmap_files(&data.join("events"));
+        let chunks = chunks_for(
+            &files,
+            &[
+                "event_id",
+                "user_id",
+                "ts",
+                "ingest_ts",
+                "event_type",
+                "product_id",
+                "price_cents",
+            ],
+        );
+        let counts = chunks
+            .par_iter()
+            .map(|c| {
+                let mut n = [0usize; 7];
+                let mut rest = c.data;
+                while !rest.is_empty() {
+                    if let Some((_, tail)) = decode(rest, &sm, (ws, we, &clock)) {
+                        n[0] += 1;
+                        rest = tail;
+                        continue;
+                    }
+                    let reason = (|| -> Result<(), i32> {
+                        let (_, r) = id(rest).ok_or(1)?;
+                        let (_, r) = id(r).ok_or(2)?;
+                        let (_, _, r) = timestamps(r, &clock).ok_or(3)?;
+                        let (purchase, r) = event_type(r).ok_or(4)?;
+                        suffix(r, purchase, &sm).ok_or(5)?;
+                        Ok(())
+                    })()
+                    .unwrap_err();
+                    n[reason as usize] += 1;
+                    let tail = memchr::memchr(b'\n', rest).map_or(rest.len(), |x| x + 1);
+                    n[6] += tail;
+                    rest = &rest[tail..];
+                }
+                n
+            })
+            .reduce(|| [0; 7], |a, b| std::array::from_fn(|i| a[i] + b[i]));
+        println!(
+            "coverage: {:?} [hits, eid, uid, time, type, product/price, fallback bytes]",
+            counts
+        );
+    }
+
+    #[test]
     fn inline_ids_match_codec_for_every_accepted_byte_and_boundary() {
         for len in 7..=9 {
             for pos in 0..len {
