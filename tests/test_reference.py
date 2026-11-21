@@ -590,6 +590,66 @@ class DedupMalformedVsInvalid(unittest.TestCase):
 
 
 class CrossFilePeople(unittest.TestCase):
+    def test_raw_partition_cache_collision_does_not_merge_people(self):
+        # Find two distinct inline IDs sharing both the raw partition and
+        # direct-mapped lookup-cache index; one is linked, one standalone.
+        mask = (1 << 64) - 1
+        seen = {}
+        for i in range(100_000):
+            name = f"u{i}"
+            key = 0
+            for b in name.encode().ljust(9, b"\0"):
+                key = (key << 7) | b
+            h = ((key ^ (key >> 27)) * 0xa24baed4963ee407) & mask
+            h ^= h >> 33
+            index = ((h >> 40) & 255, h & 4095)
+            if index in seen:
+                a, b = seen[index], name
+                break
+            seen[index] = name
+        else:
+            self.fail("could not find a cache collision")
+        t = "2026-10-09T12:00:00Z"
+        events = [ev(f"e{i}", a if i % 2 else b, t) for i in range(40)]
+        users, camps = run_case(events=events, links=[f"A,{a}"],
+                                clicks=[f"k,{a},c_1,{t}"])
+        day = "2026-10-09"
+        self.assertEqual(set(users), {("A", day), (b, day)})
+        self.assertEqual(users[("A", day)]["events"], 20)
+        self.assertEqual(users[(b, day)]["events"], 20)
+        self.assertEqual(camps[("c_1", day)]["sessions"], 1)
+        self.assertEqual(camps[("organic", day)]["sessions"], 1)
+
+    def test_partitioned_join_duplicate_movers_and_unused_bridge(self):
+        t = "2026-10-09T12:00:00Z"
+        later = "2026-10-09T12:00:05Z"
+        users, camps = run_case(
+            events=[
+                ev("move", "lonely", t, "purchase", "p1", "999", ingest=later),
+                ev("kill", "z device", t, "purchase", "p2", "999", ingest=later),
+                ev("kept", "z device", t, "purchase", "p1", "7"),
+                ev("standalone", "lonely", t),
+            ],
+            clicks=[f"k1,z device,c_1,{t}"],
+            links=["z device,inactive bridge"],
+            extra={
+                "links/part-1.csv": ["A canonical,inactive bridge", "independent,independent"],
+                "events/part-1.csv": [
+                    ev("move", "A canonical", t, "purchase", "p2", "13", ingest=t),
+                    ev("kill", "independent", "bad", ingest=t),
+                    ev("cross", "inactive bridge", t),
+                ],
+                "clicks/part-1.csv": [f"k0,inactive bridge,c_2,{t}"],
+            },
+        )
+        day = "2026-10-09"
+        self.assertEqual(set(users), {("A canonical", day), ("lonely", day)})
+        self.assertEqual((users[("A canonical", day)]["events"],
+                          users[("A canonical", day)]["revenue_cents"]), (3, 20))
+        self.assertEqual(users[("lonely", day)]["events"], 1)
+        self.assertEqual(camps[("c_2", day)]["revenue_cents"], 20)
+        self.assertEqual(camps[("c_1", day)]["assisted_sessions"], 1)
+
     def test_links_events_clicks_and_dups_across_files(self):
         s = ms("2026-10-09T12:00:00Z")
         k = s - HOUR

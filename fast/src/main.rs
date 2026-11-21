@@ -5,10 +5,10 @@
 //! Phases (see ARCHITECTURE.md):
 //!   0. small tables (manifest, products, campaigns)
 //!   1. links  -> union-find -> id -> person name
-//!   2. events -> payloads by person, claims by event ID
+//!   2. events -> raw-user payload partitions, claims by event ID
 //!   3. reject losing payloads after exact minimum-ingest selection on suspect IDs
-//!   4. clicks -> parse, validate and bucket directly by person (identical copies are idempotent)
-//!   5. per person shard: sort, sessionize, credit, assists, aggregate
+//!   4. clicks -> raw-user partitions (identical copies are idempotent)
+//!   5. cache-local identity join, then per-owner sort, sessionize and aggregate
 //!   6. write Parquet in parallel
 
 use ahash::RandomState;
@@ -221,44 +221,15 @@ struct Clicks {
     wide: Vec<PCl>,
 }
 
-fn parse_clicks<'a>(
-    c: &Chunk<'a>,
-    sm: &Small,
-    window: (i64, i64, &ManifestClock),
-    names: &People<'a>,
-    packed: bool,
-) -> Vec<Clicks> {
+fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, window: (i64, i64, &ManifestClock), names: &People<'a>) -> Vec<Clicks> {
     let (lo, we, clock) = window;
     let hint = reserve_per_shard(c.data);
     let mut b: Vec<_> = (0..NS)
         .map(|_| Clicks {
-            wide: Vec::with_capacity(if packed { hint / 2 } else { hint }),
-            packed: Vec::with_capacity(if packed { hint / 2 } else { 0 }),
+            wide: Vec::with_capacity(hint),
+            packed: Vec::new(),
         })
         .collect();
-    #[derive(Clone, Copy, Default)]
-    struct PendingClick {
-        uid: u64,
-        hash: u64,
-        cid: u64,
-        ts: i64,
-        camp: u32,
-    }
-    let mut emit = |row: PendingClick| {
-        let (dest, person) = match names.lookup(row.uid, row.hash) {
-            Identity::Linked(p) if packed => (&mut b[shard(p)].packed, u64::from(p as u32)),
-            Identity::Linked(p) => (&mut b[shard(p)].wide, names.original(p as u32)),
-            Identity::Standalone(p) => (&mut b[shard(p)].wide, p),
-        };
-        dest.push(PCl {
-            person,
-            ts: row.ts,
-            cid: row.cid,
-            camp: row.camp,
-        });
-    };
-    let mut ring = [PendingClick::default(); 16];
-    let mut n = 0usize;
     for_rows(c, |r| {
         // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
         let (cid, uid, camp) = (r[0], r[1], r[2]);
@@ -272,24 +243,115 @@ fn parse_clicks<'a>(
         }
         let key = names.codec.key(uid);
         let hash = links::mix(key);
-        names.prefetch(hash);
-        let i = n % ring.len();
-        if n >= ring.len() {
-            emit(ring[i]);
-        }
-        ring[i] = PendingClick {
-            uid: key,
-            hash,
+        b[shard(hash)].wide.push(PCl {
+            person: hash,
             ts,
             cid: names.codec.key(cid),
             camp: ci,
-        };
-        n += 1;
+        });
     });
-    for i in n.saturating_sub(ring.len())..n {
-        emit(ring[i % ring.len()]);
-    }
     b
+}
+
+// Each task probes just one raw-user partition of the exact link table.
+// A small direct-mapped cache resolves repeated hot IDs without another probe.
+struct JoinCache<'a, 'b> {
+    people: &'a People<'b>,
+    keys: Vec<u64>,
+    values: Vec<Identity>,
+}
+
+impl<'a, 'b> JoinCache<'a, 'b> {
+    fn new(people: &'a People<'b>) -> Self {
+        Self {
+            people,
+            keys: vec![0; 4096],
+            values: vec![Identity::Standalone(0); 4096],
+        }
+    }
+
+    #[inline]
+    fn resolve(&mut self, hash: u64) -> Identity {
+        let i = hash as usize & (self.keys.len() - 1);
+        if self.keys[i] != hash {
+            self.keys[i] = hash;
+            self.values[i] = self.people.lookup(links::unmix(hash), hash);
+        }
+        self.values[i]
+    }
+}
+
+type JoinJobs = Vec<(Vec<Payload>, Vec<Clicks>)>;
+
+fn join_raw(
+    events: Vec<Vec<Payload>>,
+    clicks: Vec<Vec<Clicks>>,
+    people: &People,
+    packing: Option<Packing>,
+) -> JoinJobs {
+    let raw_events = by_destination(events, |p| !p.wide.times.is_empty() || !p.wide.purchases.is_empty());
+    let raw_clicks = by_destination(clicks, |p| !p.wide.is_empty());
+    let joined: Vec<_> = raw_events
+        .into_par_iter()
+        .zip(raw_clicks.into_par_iter())
+        .map(|(mut evs, mut cls)| {
+            let mut cache = JoinCache::new(people);
+            let mut moved_e: Vec<Payload> = (0..NS).map(|_| Payload::default()).collect();
+            let mut moved_c: Vec<Clicks> = (0..NS).map(|_| Clicks::default()).collect();
+            for part in &mut evs {
+                part.wide.times.retain(|row| match cache.resolve(row.person) {
+                    Identity::Standalone(_) => true,
+                    id @ Identity::Linked(p) => {
+                        moved_e[shard(p)].push(id, row.ts, 0, 0, packing, people);
+                        false
+                    }
+                });
+                part.wide.purchases.retain(|row| match cache.resolve(row.key.person) {
+                    Identity::Standalone(_) => true,
+                    id @ Identity::Linked(p) => {
+                        moved_e[shard(p)].push(id, row.key.ts, row.price, row.cat, packing, people);
+                        false
+                    }
+                });
+            }
+            for part in &mut cls {
+                part.wide.retain(|row| match cache.resolve(row.person) {
+                    Identity::Standalone(_) => true,
+                    Identity::Linked(p) => {
+                        let dest = &mut moved_c[shard(p)];
+                        let mut row = *row;
+                        if packing.is_some() {
+                            row.person = u64::from(p as u32);
+                            dest.packed.push(row);
+                        } else {
+                            row.person = people.original(p as u32);
+                            dest.wide.push(row);
+                        }
+                        false
+                    }
+                });
+            }
+            (evs, cls, moved_e, moved_c)
+        })
+        .collect();
+    let mut jobs: JoinJobs = (0..NS).map(|_| (Vec::new(), Vec::new())).collect();
+    for (raw, (evs, cls, moved_e, moved_c)) in joined.into_iter().enumerate() {
+        jobs[raw].0.extend(evs);
+        jobs[raw].1.extend(cls);
+        for (dest, (e, c)) in moved_e.into_iter().zip(moved_c).enumerate() {
+            if !e.packed.times.is_empty()
+                || !e.packed.purchases.is_empty()
+                || !e.wide.times.is_empty()
+                || !e.wide.purchases.is_empty()
+            {
+                jobs[dest].0.push(e);
+            }
+            if !c.packed.is_empty() || !c.wide.is_empty() {
+                jobs[dest].1.push(c);
+            }
+        }
+    }
+    jobs
 }
 
 // ------------------------------------------------------------------ sessions
@@ -558,23 +620,19 @@ fn main() {
     let packing = Packing::new(ws, we, names.count);
     log(&format!("links: {} linked ids", names.count));
 
-    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, &log);
+    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), &log);
     log("events deduped");
 
     let cl_by_person = cl_chunks
         .par_iter()
-        .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names, packing.is_some()))
+        .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names))
         .collect();
-    log("clicks routed");
+    log("clicks parsed");
 
     let len =
         |e: &Payload| e.packed.times.len() + e.packed.purchases.len() + e.wide.times.len() + e.wide.purchases.len();
-    let mut jobs: Vec<_> = by_destination(ev_by_person, |e| len(e) > 0)
-        .into_iter()
-        .zip(by_destination(cl_by_person, |c| {
-            !c.packed.is_empty() || !c.wide.is_empty()
-        }))
-        .collect();
+    let mut jobs = join_raw(ev_by_person, cl_by_person, &names, packing);
+    log("identity join");
     jobs.sort_unstable_by_key(|(e, c)| {
         std::cmp::Reverse(
             e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),

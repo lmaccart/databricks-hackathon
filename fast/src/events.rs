@@ -1,6 +1,5 @@
-//! Send payloads directly to the session partition. A separate, smaller
-//! stream of claims (ID, ingest time, payload location) decides which payloads
-//! must be removed. In particular, an invalid copy has a claim but no payload.
+//! Partition payloads by raw identity before the exact, cache-local join.
+//! Claims target raw slots; invalid copies still participate in dedup.
 use super::*;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -109,19 +108,13 @@ fn parse<'a>(
     sm: &Small,
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
-    packing: Option<Packing>,
 ) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
     let (ws, we, clock) = window;
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Payload> = (0..NS)
         .map(|_| {
             let mut p = Payload::default();
-            p.wide
-                .times
-                .reserve(if packing.is_some() { reserve / 2 } else { reserve });
-            if packing.is_some() {
-                p.packed.times.reserve(reserve / 2);
-            }
+            p.wide.times.reserve(reserve);
             p
         })
         .collect();
@@ -130,19 +123,14 @@ fn parse<'a>(
     let mut emit = |e: Pending| {
         let mut target = NONE;
         if e.uid != 0 {
-            let person = people.lookup(e.uid, e.hash);
-            let p = shard(match person {
-                Identity::Linked(routed) | Identity::Standalone(routed) => routed,
-            });
-            let slot = payload[p].push(person, e.ts, e.price, e.cat, packing, people);
+            let p = shard(e.hash);
+            let slot = payload[p].push(Identity::Standalone(e.hash), e.ts, e.price, e.cat, None, people);
             target = (slot * NS + p) as u32;
         }
         // This shard supplies the omitted high bits; within it equality of
         // the stored low bits is equality of the full byte-exact ID token.
         claims[(e.claim_key >> KEY_BITS) as usize].push(Claim::new(e.claim_key, target, e.claim_order));
     };
-    let mut ring = [Pending::default(); 16];
-    let mut n = 0usize;
     for_rows(c, |r| {
         if r[0].is_empty() {
             return;
@@ -170,21 +158,12 @@ fn parse<'a>(
                 };
                 next.uid = people.codec.key(r[1]);
                 next.hash = links::mix(next.uid);
-                people.prefetch(next.hash);
                 next.price = price;
                 next.cat = cat;
             }
         }
-        let i = n % ring.len();
-        if n >= ring.len() {
-            emit(ring[i]);
-        }
-        ring[i] = next;
-        n += 1;
+        emit(next);
     });
-    for i in n.saturating_sub(ring.len())..n {
-        emit(ring[i % ring.len()]);
-    }
     (payload, claims, spill)
 }
 
@@ -287,13 +266,9 @@ pub(super) fn by_person<'a>(
     sm: &Small,
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
-    packing: Option<Packing>,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Payload>> {
-    let parsed: Vec<_> = chunks
-        .par_iter()
-        .map(|c| parse(c, sm, people, window, packing))
-        .collect();
+    let parsed: Vec<_> = chunks.par_iter().map(|c| parse(c, sm, people, window)).collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
     let mut spills = Vec::with_capacity(parsed.len());

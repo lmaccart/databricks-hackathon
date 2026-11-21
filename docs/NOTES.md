@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Raw-user partitioned identity join experiment — 2026-11-21
+
+Parse typed event and click payloads by raw-user shard, dedup events against those raw slot locations, and join each shard against its own exact link-table lane. A direct-mapped exact-token cache avoids repeated probes for hot IDs. Standalone events/clicks stay in their original buffers; linked rows move to canonical-owner shards. Link graph construction remains complete and precedes parsing. This increases interim event width and linked-row copying, so performance and 60M peak RSS need parent-side measurement; no 20M/60M benchmark was run here.
+
+Checks: 40 reference and binary cases including conflicting-user duplicates, an unused cross-file bridge and a forced raw/cache collision; 19 Rust tests; 36 official fixtures; public dev answer matched both comparers; 10 mini dirty seeds at 30k; 10 official-generator/oracle comparisons at 10k/100k, including leap-day seed 15; opaque transformed 10k data matched the oracle with one and eight workers. No claim of speedup.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

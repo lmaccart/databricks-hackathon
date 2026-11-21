@@ -1,10 +1,11 @@
 //! Build the canonical-name lookup in parallel, including transitive paths
 //! that span input files. Canonical node indexes also serve as exact sort ranks.
-use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows};
+use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows, shard};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
-const LANES: usize = 64;
+// The raw-user partition and the eventual singleton owner use the same bits.
+const LANES: usize = NS;
 
 #[inline]
 pub(super) fn mix(key: u64) -> u64 {
@@ -44,7 +45,7 @@ struct Lane {
 impl Lane {
     #[inline]
     fn find(&self, key: u64, hash: u64) -> usize {
-        let mut i = (hash >> LANES.trailing_zeros()) as usize & self.mask;
+        let mut i = hash as usize & self.mask;
         loop {
             let k = self.slots[i].key;
             if k == key || k == 0 {
@@ -76,7 +77,7 @@ pub(super) enum Identity {
 impl<'a> People<'a> {
     #[inline]
     pub(super) fn lookup(&self, key: u64, h: u64) -> Identity {
-        let lane = &self.lanes[h as usize & (LANES - 1)];
+        let lane = &self.lanes[shard(h)];
         let s = lane.slots[lane.find(key, h)];
         if s.value & LINKED != 0 {
             Identity::Linked(s.value ^ LINKED)
@@ -88,27 +89,6 @@ impl<'a> People<'a> {
     #[inline]
     pub(super) fn original(&self, rank: u32) -> u64 {
         self.roots[rank as usize]
-    }
-
-    #[inline]
-    pub(super) fn prefetch(&self, h: u64) {
-        let lane = &self.lanes[h as usize & (LANES - 1)];
-        let i = (h >> LANES.trailing_zeros()) as usize & lane.mask;
-        let addr = &lane.slots[i] as *const Slot;
-        // Only an in-bounds address in an immutable, live table; prefetch is
-        // a hint, never an actual read used for a decision.
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            _mm_prefetch(addr.cast(), _MM_HINT_T0);
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            std::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) addr,
-                            options(readonly, nostack, preserves_flags));
-        }
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let _ = addr;
     }
 }
 
@@ -144,7 +124,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
                 let b = codec.key(r[1]);
                 edges.push((a, b));
                 for k in [a, b] {
-                    keys[mix(k) as usize & (LANES - 1)].push(k);
+                    keys[shard(mix(k))].push(k);
                 }
             });
             (edges, keys)
@@ -192,7 +172,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
     let parent: Vec<_> = (0..count as u32).map(AtomicU32::new).collect();
     let index = |key| {
         let hash = mix(key);
-        let s = hash as usize & (LANES - 1);
+        let s = shard(hash);
         (offsets[s] + lanes[s].slots[lanes[s].find(key, hash)].value as usize) as u32
     };
     edges
