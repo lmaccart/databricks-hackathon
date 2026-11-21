@@ -17,7 +17,9 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+mod campaign;
 mod dims;
 mod events;
 mod links;
@@ -49,6 +51,7 @@ fn rs() -> RandomState {
 mod csv;
 mod ts;
 
+use campaign::{CampaignSink, DenseCampaigns, MapCampaigns};
 use csv::{Chunk, chunks_of, for_rows};
 use ts::{ManifestClock, parse_ts};
 
@@ -204,18 +207,6 @@ fn by_destination<T>(batches: Vec<Vec<T>>, nonempty: impl Fn(&T) -> bool) -> Vec
     jobs
 }
 
-fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
-    if pieces.len() <= 1 {
-        return pieces.pop().unwrap_or_default();
-    }
-    let size: usize = pieces.iter().map(Vec::len).sum();
-    let mut rows = Vec::with_capacity(size);
-    for piece in pieces {
-        rows.extend_from_slice(&piece);
-    }
-    rows
-}
-
 #[derive(Default)]
 struct Clicks {
     packed: Vec<PCl>,
@@ -295,16 +286,6 @@ fn parse_clicks<'a>(
 
 // ------------------------------------------------------------------ sessions
 
-struct ShardOut {
-    users: output::UserColumns,
-    camps: Map<u64, [i64; 4]>, // (camp << 32 | day) -> sessions, purchasing, revenue, assisted
-}
-
-#[inline]
-fn ckey(camp: u32, day: i32) -> u64 {
-    ((camp as u64) << 32) | (day as u32 as u64)
-}
-
 fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
     let mut best: Option<usize> = None;
     for c in 0..catsum.len() {
@@ -341,13 +322,14 @@ fn finish_user_day(
     users.push_day(day, sessions, events, revenue, top);
 }
 
-fn process_stream<T: Temporal>(
-    pieces: Vec<Stream<T>>,
+fn process_stream<T: Temporal, S: CampaignSink>(
+    pieces: &[&Stream<T>],
     mut cls: Vec<PCl>,
     sm: &Small,
     people: &People,
     layout: T::Layout,
-    ShardOut { users, camps }: &mut ShardOut,
+    users: &mut output::UserColumns,
+    camps: &mut S,
 ) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
     let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
@@ -459,12 +441,9 @@ fn process_stream<T: Temporal>(
             // The entire latest timestamp run expires together. Identical
             // copies change neither the tie winner nor campaign membership.
             let credit = if lo < hi { clicks[latest].camp } else { ORGANIC };
-            let e = camps.entry(ckey(credit, day)).or_insert([0; 4]);
-            e[0] += 1;
-            e[1] += (pi != p0) as i64;
-            e[2] += rev;
+            camps.credit(credit, day, pi != p0, rev);
             for &a in &active {
-                camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
+                camps.assist(a, day);
             }
             k = m;
         }
@@ -479,24 +458,24 @@ fn process_stream<T: Temporal>(
     debug_assert_eq!(pi, np);
 }
 
-fn process_shard(
-    evs: Vec<Payload>,
-    cls: Vec<Clicks>,
+fn process_shard<S: CampaignSink>(
+    evs: &[Payload],
+    cls: &[Clicks],
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
-) -> ShardOut {
-    let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
-    let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
-    let mut out = ShardOut {
-        users: output::UserColumns::default(),
-        camps: Map::with_hasher(rs()),
-    };
+    camps: &mut S,
+) -> output::UserColumns {
+    let mut users = output::UserColumns::default();
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        let clicks = cls.iter().flat_map(|c| c.packed.iter().copied()).collect();
+        let pieces: Vec<_> = evs.iter().map(|e| &e.packed).collect();
+        process_stream(&pieces, clicks, sm, people, pack, &mut users, camps);
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
-    out
+    let clicks = cls.iter().flat_map(|c| c.wide.iter().copied()).collect();
+    let pieces: Vec<_> = evs.iter().map(|e| &e.wide).collect();
+    process_stream(&pieces, clicks, sm, people, (), &mut users, camps);
+    users
 }
 
 // ------------------------------------------------------------------ output
@@ -576,30 +555,61 @@ fn main() {
             e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
         )
     });
-    let outs: Vec<_> = jobs
-        .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
-        .collect();
-    log("sessions done");
-
-    let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
-    for o in &outs {
-        for (k, v) in &o.camps {
-            let e = camps.entry(*k).or_insert([0; 4]);
-            for q in 0..4 {
-                e[q] += v[q];
+    let workers = rayon::current_num_threads();
+    let dense_span = campaign::dense_span(sm.camp_names.len(), ws, we, workers);
+    let (user_columns, campaign_counts) = if jobs.is_empty() {
+        (Vec::new(), Vec::new())
+    } else if let Some((day_min, days)) = dense_span {
+        // Broadcast creates exactly one accumulator per Rayon worker. Heavy
+        // shards are already first, and the atomic queue keeps the folds busy.
+        let next = AtomicUsize::new(0);
+        let worker_outs = rayon::broadcast(|_| {
+            let mut campaigns =
+                DenseCampaigns::new(sm.camp_names.len(), day_min, days).expect("validated dense campaign dimensions");
+            let mut users = Vec::new();
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some((evs, cls)) = jobs.get(index) else { break };
+                users.push(process_shard(evs, cls, &sm, &names, packing, &mut campaigns));
             }
+            (users, campaigns)
+        });
+        let mut totals =
+            DenseCampaigns::new(sm.camp_names.len(), day_min, days).expect("validated dense campaign dimensions");
+        let mut users = Vec::new();
+        for (mut worker_users, worker_campaigns) in worker_outs {
+            totals.merge(&worker_campaigns);
+            users.append(&mut worker_users);
         }
-    }
+        (users, totals.rows())
+    } else {
+        // Unusually wide windows or very large campaign tables retain the
+        // exact hash-based path rather than allocating an unbounded dense grid.
+        let outs: Vec<_> = jobs
+            .into_par_iter()
+            .map(|(evs, cls)| {
+                let mut campaigns = MapCampaigns::new();
+                let users = process_shard(&evs, &cls, &sm, &names, packing, &mut campaigns);
+                (users, campaigns)
+            })
+            .collect();
+        let mut totals = MapCampaigns::new();
+        let mut users = Vec::with_capacity(outs.len());
+        for (user, campaigns) in outs {
+            users.push(user);
+            totals.merge(&campaigns);
+        }
+        (users, totals.rows())
+    };
+    log("sessions done");
     let ud = outd.join("user_daily");
     let cd = outd.join("campaign_daily");
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
 
-    let camp_rows: Vec<output::CampRow> = camps
-        .iter()
-        .map(|(k, v)| {
-            let c = (*k >> 32) as u32;
+    let camp_rows: Vec<output::CampRow> = campaign_counts
+        .into_iter()
+        .map(|(c, day, counts)| {
             let (campaign, channel) = if c == ORGANIC {
                 (&b"organic"[..], &b"organic"[..])
             } else {
@@ -608,12 +618,12 @@ fn main() {
             output::CampRow {
                 campaign,
                 channel,
-                day: *k as u32 as i32,
-                counts: *v,
+                day,
+                counts,
             }
         })
         .collect();
-    let shards: Vec<_> = outs.iter().map(|o| &o.users).collect();
+    let shards: Vec<_> = user_columns.iter().collect();
     let parts = rayon::current_num_threads().clamp(1, 16);
     rayon::join(
         || output::campaign_daily(&cd.join("part-0.parquet"), &camp_rows),
