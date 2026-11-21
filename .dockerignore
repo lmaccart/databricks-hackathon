@@ -4,3 +4,6 @@
 !fast/Cargo.lock
 !fast/src/
 !fast/src/**
+!tools/
+!tools/pgo_build.sh
+!tools/pgo_generate.rs

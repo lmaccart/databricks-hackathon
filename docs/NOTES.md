@@ -1,5 +1,18 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Optional typed-parser PGO experiment — 2026-11-21
+
+Add an **opt-in**, synthetic-only instrumentation PGO build; the default
+Docker build remains the baseline. See `docs/PGO_TRIAL.md` for corpus design,
+matching-profdata requirements and a two-seed packaged-executable comparison.
+No 20M timing, amd64 Docker build-time measurement or performance claim yet;
+the older dirty-kit PGO loss is not evidence for this new training mixture.
+On macOS/aarch64 with Rust/LLVM 23.1.6, the final PGO build completed and
+passed 40 Python cases, all 36 official fixtures, and ten small dirty-kit
+differentials (1,500 events each); 21 Rust unit tests passed on the control.
+The release PGO binary did not write a raw profile when `LLVM_PROFILE_FILE`
+was set. These are smoke checks, not a Linux or full-scale correctness gate.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).
