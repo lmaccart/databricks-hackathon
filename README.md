@@ -31,8 +31,8 @@ DATA_DIR=vendor/dev OUTPUT_DIR=out RAYON_NUM_THREADS=8 fast/target/release/shopp
 make check-dev OUT=out
 ```
 
-`make fixtures` checks the Rust binary and the independent Python oracle against the starter's hand-written answers. `make check-dev` uses both the official comparer and a second per-key diff. `tools/official_diff.py` runs differential checks on other official seeds. `python tools/bench.py DATA_DIR` reports five native start-to-exit times and their median; the competition clock also includes container startup.
+`make fixtures` checks the Rust binary and the independent Python oracle against the starter's hand-written answers. `make check-dev` uses both the official comparer and a second per-key diff. `tools/official_diff.py` runs differential checks on other official seeds. `python tools/bench_pair.py BASELINE CANDIDATE DATA_DIR` compares five alternating-order pairs, with fresh output directories and one warmup per binary. The competition clock also includes container startup. The optional **Native amd64 performance check** GitHub workflow runs the same comparison against the 5.03 s scored revision on a Linux runner and reports its actual worker count.
 
 ## Credits
 
-Rust: Rayon, memchr, memmap2, aHash, serde_json and Apache Arrow Rust (arrow-array, arrow-schema, parquet). Python: PyArrow; Polars in the organizers’ test harness. The official generator, fixtures and dev answer are distributed by the organizers and are not checked in. Entry code: [MIT](LICENSE).
+Rust: Rayon, memchr, memmap2, aHash, serde_json, bytes, and the Apache Arrow project's Parquet crate. Python: PyArrow; Polars in the organizers’ test harness. The official generator, fixtures and dev answer are distributed by the organizers and are not checked in. Entry code: [MIT](LICENSE).

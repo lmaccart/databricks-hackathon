@@ -1,18 +1,17 @@
-//! Shopping Sessions fast pipeline (v1): parallel, hash-partitioned, Rust.
+//! Shopping Sessions: parallel, exact, hash-partitioned Rust pipeline.
 //!
 //! Reads $DATA_DIR (default /data), writes $OUTPUT_DIR (default /output).
 //! Every rule is implemented to match rules.md and reference/pipeline.py.
 //! Phases (see ARCHITECTURE.md):
 //!   0. small tables (manifest, products, campaigns)
 //!   1. links  -> union-find -> id -> person name
-//!   2. events -> parse in parallel chunks, bucket by hash(event_id)
-//!   3. per event shard: dedup (min ingest_ts) -> keep if valid -> bucket by hash(person)
+//!   2. events -> payloads by person, claims by event ID
+//!   3. reject losing payloads after exact minimum-ingest selection on suspect IDs
 //!   4. clicks -> parse, validate, bucket by hash(click_id) -> dedup -> bucket by hash(person)
 //!   5. per person shard: sort, sessionize, credit, assists, aggregate
 //!   6. write Parquet in parallel
 
 use ahash::RandomState;
-use memchr::memchr;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -41,123 +40,15 @@ fn rs() -> RandomState {
     RandomState::with_seeds(0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F)
 }
 
-// ------------------------------------------------------------------ CSV dialect
+// ------------------------------------------------------------------ CSV dialect, timestamps
 
-#[inline]
-fn unquote(f: &[u8]) -> Option<&[u8]> {
-    if memchr(b'"', f).is_none() {
-        return Some(f);
-    }
-    let n = f.len();
-    if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' && memchr(b'"', &f[1..n - 1]).is_none() {
-        Some(&f[1..n - 1])
-    } else {
-        None
-    }
-}
+mod csv;
+mod ts;
 
-/// Split a line into at most 8 unquoted fields. None = malformed (empty line,
-/// bad quoting, or more than 8 fields). The caller checks the field count.
-#[inline]
-fn split_fields<'a>(line: &'a [u8], out: &mut [&'a [u8]; 8]) -> Option<usize> {
-    if line.is_empty() {
-        return None;
-    }
-    let mut n = 0;
-    let mut start = 0;
-    loop {
-        let end = match memchr(b',', &line[start..]) {
-            Some(p) => start + p,
-            None => line.len(),
-        };
-        if n == 8 {
-            return None;
-        }
-        out[n] = unquote(&line[start..end])?;
-        n += 1;
-        if end == line.len() {
-            return Some(n);
-        }
-        start = end + 1;
-    }
-}
+use csv::{Chunk, chunks_of, for_rows};
+use ts::{parse_ingest, parse_ts};
 
-#[inline]
-fn for_lines<'a>(data: &'a [u8], mut f: impl FnMut(&'a [u8])) {
-    let mut start = 0;
-    while start < data.len() {
-        match memchr(b'\n', &data[start..]) {
-            Some(p) => {
-                f(&data[start..start + p]);
-                start += p + 1;
-            }
-            None => {
-                f(&data[start..]);
-                break;
-            }
-        }
-    }
-}
-
-/// A slice of one CSV file's body (whole lines only) plus that file's column map.
-#[derive(Clone, Copy)]
-struct Chunk<'a> {
-    data: &'a [u8],
-    nfields: usize,
-    idx: [usize; 8],
-}
-
-fn chunks_of<'a>(file: &'a [u8], cols: &[&str], path: &Path) -> Vec<Chunk<'a>> {
-    let mut out = Vec::new();
-    if file.is_empty() {
-        return out;
-    }
-    let hdr_end = memchr(b'\n', file).unwrap_or(file.len());
-    let header: Vec<&[u8]> = file[..hdr_end]
-        .split(|&c| c == b',')
-        .map(|h| unquote(h).unwrap_or(h))
-        .collect();
-    let mut idx = [0usize; 8];
-    for (k, c) in cols.iter().enumerate() {
-        idx[k] = header
-            .iter()
-            .position(|h| *h == c.as_bytes())
-            .unwrap_or_else(|| panic!("{}: header lacks column {c}", path.display()));
-    }
-    let body = if hdr_end < file.len() { &file[hdr_end + 1..] } else { &file[file.len()..] };
-    let mut start = 0;
-    while start < body.len() {
-        let mut end = (start + CHUNK).min(body.len());
-        if end < body.len() {
-            end = match memchr(b'\n', &body[end..]) {
-                Some(p) => end + p + 1,
-                None => body.len(),
-            };
-        }
-        out.push(Chunk { data: &body[start..end], nfields: header.len(), idx });
-        start = end;
-    }
-    out
-}
-
-/// Call f with the selected columns of every well-formed line of a chunk.
-#[inline]
-fn for_rows<'a>(c: &Chunk<'a>, mut f: impl FnMut(&[&'a [u8]; 8])) {
-    let mut raw: [&[u8]; 8] = [&[]; 8];
-    let mut sel: [&[u8]; 8] = [&[]; 8];
-    for_lines(c.data, |line| {
-        if let Some(n) = split_fields(line, &mut raw) {
-            if n == c.nfields {
-                for k in 0..8 {
-                    sel[k] = raw[c.idx[k].min(7)];
-                }
-                f(&sel);
-            }
-        }
-    });
-}
-
-// ------------------------------------------------------------------ timestamps
+// ------------------------------------------------------------------ prices
 
 #[inline]
 fn digits(b: &[u8]) -> bool {
@@ -167,76 +58,6 @@ fn digits(b: &[u8]) -> bool {
 #[inline]
 fn num(b: &[u8]) -> i64 {
     b.iter().fold(0i64, |a, &c| a * 10 + (c - b'0') as i64)
-}
-
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-fn is_leap(y: i64) -> bool {
-    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
-}
-
-/// Epoch ms, or BAD. Mirrors reference/pipeline.py::parse_ts.
-fn parse_ts(s: &[u8]) -> i64 {
-    if s.is_empty() {
-        return BAD;
-    }
-    if digits(s) {
-        // F3: any length; a value too big for i64 is simply outside every window
-        let mut v: i64 = 0;
-        for &c in s {
-            v = match v.checked_mul(10).and_then(|x| x.checked_add((c - b'0') as i64)) {
-                Some(x) => x,
-                None => return BAD,
-            };
-        }
-        return v;
-    }
-    if s.len() != 20 && s.len() != 25 {
-        return BAD;
-    }
-    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
-        return BAD;
-    }
-    let parts = [&s[0..4], &s[5..7], &s[8..10], &s[11..13], &s[14..16], &s[17..19]];
-    if !parts.iter().all(|p| digits(p)) {
-        return BAD;
-    }
-    let (y, mo, d, h, mi, se) =
-        (num(parts[0]), num(parts[1]), num(parts[2]), num(parts[3]), num(parts[4]), num(parts[5]));
-    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 {
-        return BAD;
-    }
-    const MD: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mdays = if mo == 2 && is_leap(y) { 29 } else { MD[mo as usize] };
-    if d < 1 || d > mdays {
-        return BAD;
-    }
-    let tail = &s[19..];
-    let off_min = if tail == b"Z" {
-        0
-    } else if tail.len() == 6 && (tail[0] == b'+' || tail[0] == b'-') && tail[3] == b':' {
-        let (oh, om) = (&tail[1..3], &tail[4..6]);
-        if !digits(oh) || !digits(om) {
-            return BAD;
-        }
-        let (oh, om) = (num(oh), num(om));
-        if oh > 23 || om > 59 {
-            return BAD;
-        }
-        let o = oh * 60 + om;
-        if tail[0] == b'-' { -o } else { o }
-    } else {
-        return BAD;
-    };
-    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se;
-    (secs - off_min * 60) * 1000
 }
 
 /// price_cents for a purchase: digits only, value 1..=10,000,000 (leading zeros allowed).

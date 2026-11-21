@@ -72,10 +72,7 @@ fn parse<'a>(
             return;
         }
         let id = people.codec.key(r[0]);
-        let ingest = match parse_ts(r[3]) {
-            BAD => i64::MAX,
-            t => t,
-        };
+        let ingest = parse_ingest(r[3]);
         let ts = parse_ts(r[2]);
         let mut next = Pending {
             id,

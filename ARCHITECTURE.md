@@ -1,48 +1,26 @@
-# Architecture
+# Where one input row goes
 
+The scored v1 (`cc9f33e`, 5.03 s) sent every parsed event through an event-ID hash table and **then** copied the winner to a person partition. The rebuilt pipeline sends a valid event's payload directly to the person partition. A much smaller, independent stream of claims tells it which payloads to throw away.
+
+```text
+manifest, products, campaigns ────────────────► windows and dimension lookups
+links ─► exact ID keys ─► parallel union-find ─► immutable ID → canonical person
+events ─► strict CSV ┬─ valid payload ─────────────────► person bucket
+                    └─ claim, including invalid copies ► event-ID bucket
+                                                            │
+                                          duplicate filter + exact earliest copy
+                                                            │
+                                      remove losing payloads from person buckets
+clicks ─► validate and resolve identities ──────────────────► person buckets
+                 │
+        gather by person partition ─► time ordering ─► sessions, credit, assists
+                 │
+        user/day rows and campaign/day counters ─► Parquet
 ```
-/data ──mmap──> chunks (8 MB, line-aligned, per-file column map)
-   links  ──parse ║──> pairs ──union-find (seq)──> id → person name (smallest ID)
-   events ──parse ║──> EvRow buckets by hash(event_id) [256 shards]
-                      └─ per shard ║: dedup (min ingest_ts) → keep if kept copy valid
-                                     → map uid → person → PEv buckets by hash(person)
-   clicks ──parse+validate ║──> buckets by hash(click_id)
-                      └─ per shard ║: dedup → map uid → person → PCl buckets by hash(person)
-   per person shard ║: gather PEv + PCl, sort by (hash, name, ts[, click_id])
-                      walk persons: sessionize → day → credit/assist via sliding 7-day window
-                      → user rows + (campaign, day) counters
-   merge campaign counters → write campaign_daily/part-0.parquet
-   user rows ║──> user_daily/part-N.parquet (one file per shard group)
-(║ = parallel with rayon)
-```
 
-## Files
-- `fast/src/main.rs`: the whole v1 pipeline (~700 lines).
-- `fast/Cargo.toml`: rayon, memchr, memmap2, ahash, serde_json, arrow-array, arrow-schema, parquet (no compression codecs).
-- `Dockerfile`: root two-stage build (Rust slim → Debian slim), runs as uid 1000.
-- `reference/pipeline.py`: slow, literal oracle. Any disagreement = a bug in one of them; rules.md decides which.
-- `tools/compare_outputs.py`: missing / extra / differing rows, schema check, rules.md self-check.
-- `tools/mini_gen.py`: kit-made dirty data for quick diffs (the official generator is the real test).
-- `tools/diff_impls.sh`: reference vs binary over many seeds.
-- `tests/test_reference.py`: 15 edge cases; `SS_BIN=path` runs them against a binary instead.
+- **Identity (`person.rs`, `links.rs`).** Up to nine nonempty ASCII bytes fit losslessly in 63 bits if the final byte is nonzero. Other spellings are interned using the **entire** ID as key. Leading zeroes, NULs, Unicode, spaces and case remain significant. Parallel link unions always attach the larger root name to the smaller using atomic compare-and-exchange. Unknown IDs map to themselves. A reversible permutation spreads person keys across shards, so a sort key also serves as the routing key. Reversing it recovers the exact ID for output.
+- **Events (`events.rs`).** Even a well-formed but invalid event can suppress a later valid copy. It emits an ingest claim and no payload. Malformed lines and empty event IDs emit neither. A per-shard blocked Bloom filter identifies IDs that *might* repeat. False positives send extra claims to the exact table; they never suppress a row. Actual duplicates mark their repeated bits on the second occurrence, so the exact pass includes the first occurrence too. A winning invalid copy has no payload; all losing valid copies are removed. Category lookup only runs for valid purchases.
+- **Sessions (`main.rs`).** Gather person shards into exact-sized vectors and sort survivors by exact person key and timestamp. A gap strictly greater than 1,800,000 ms starts a new session. All counters, including purchases after midnight, use its start day. Click credit uses the latest qualifying timestamp and lexicographically smallest click ID at a tie. A per-person sliding window implements inclusive seven-day attribution and distinct assisting campaigns.
+- **Output (`output.rs`).** Blocked, typed column writes use the Parquet crate's page and footer encoders without building Arrow record batches. `day` is DATE, counts are integers, only `top_category` is nullable. Both tables always have a readable file, including on empty input. Files are explicitly closed before exit.
 
-## Key decisions
-| Decision | Why |
-| --- | --- |
-| Byte slices into the mmap, never `String` | Byte-wise comparison is the rule; zero copies. |
-| Validity computed per copy at parse time, applied after dedup | Dedup-before-validation is exact: the winning copy's own flag decides. |
-| Bad `ingest_ts` treated as +∞ | rules.md says it is always valid F1; this only makes such a copy lose dedup or be late. |
-| Union-find root = smallest name | The root is the person's name with no second pass. |
-| Sort clicks by (ts, click_id) | Latest-ts tie → the first of the equal-ts run is the smallest click_id. |
-| Sliding window with per-campaign counts + active list | Assists cost O(active campaigns) per session, and the window only moves forward. Shared-device "mega persons" stay linear. |
-| Gap check `ts[m] − ts[m−1] ≤ 30 min` on sorted events | Equal timestamps give gap 0, so "distinct timestamps" falls out for free. |
-| `day = start.div_euclid(86_400_000)` → Date32 | UTC date; correct for any epoch. |
-| No `-C target-cpu=native` | The scoring CPU is unknown; an illegal instruction is a crash. |
-
-## Data shapes (for memory planning at 60M events)
-- On a 64-bit target, `EvRow` has two fat slices, two i64s, two u32s and two one-byte fields: 64 bytes including alignment. At 64M records its payload alone is ~4.1 GB, before spare capacity or the dedup table.
-- `PEv` is 48 bytes and `PCl` is 56 bytes on that layout. The original per-person buckets can coexist with the gathered sort vectors. See [measured RSS and its limitations](docs/NOTES.md) rather than adding only the compact payload sizes.
-
-## Where the time goes (v1, 2M kit events, 4 threads: 0.59 s total)
-links 0.04 s · parse events 0.18 s · dedup 0.10 s · clicks 0.05 s · sessions 0.16 s · write 0.03 s.
-The sessions phase includes two big comparison sorts; parse+dedup is the next target. See `docs/PERF_PLAYBOOK.md`.
+The independent slow oracle is `reference/pipeline.py`. `make fixtures` compares both implementations to the official hand-written cases. `tools/bench_pair.py` alternates baseline/candidate order in five pairs and times whole processes with fresh output directories. See [measurements and rejected experiments](docs/NOTES.md).

@@ -41,7 +41,7 @@ Each task is sized for one agent session. Do them in order; T1 to T4 decide whet
 Measure every change on the 20M official dataset, 5 runs, report the median. Keep a table in `docs/NOTES.md`: commit, change, median, delta. Revert anything that does not help by > 3%.
 
 - [x] **T8. Profile.** Sampled all native threads at 1 ms on the scored 20M seed-7 binary with macOS `sample -mayDie` (platform equivalent of a sampling profile). Five busiest non-wait leaves and phase timings in `docs/NOTES.md`.
-- [ ] **T9. Faster parse.** Single-pass scanner for `,` `"` `\n` per line; avoid `[&[u8]; 8]` copies; parse F1/F2/F3 with fixed-offset digit math. Keep `parse_ts` tests green.
+- [x] **T9. Faster parse.** Runtime AVX2/SSE2, NEON and portable classifiers; the strict scanner fills selected columns without a copy. Word-based F1/F2/F3 checks and conversion. Integrated 20M median 0.949 → 0.774 s (-18.5%); differential scanner/timestamp tests and dev parity green.
 - [ ] **T10. Shrink rows.** Store event_id / user / click_id as (u64 hash, offset, len) into the mmap; compare bytes only on hash ties. Target EvRow ≤ 32 bytes.
 - [ ] **T11. Fewer passes.** Fuse dedup-shard and person-shard work where possible; avoid the `flat_map` gather copy by pre-sizing per-shard vectors.
 - [ ] **T12. Radix sort** person shards by (hash, ts) instead of `sort_unstable_by`.
