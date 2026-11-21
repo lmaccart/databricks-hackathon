@@ -25,6 +25,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+mod person;
+use person::Codec;
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
@@ -344,7 +346,20 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 
 /// Map every linked ID to its person's name (the byte-wise smallest ID of the
 /// person). IDs missing from the map are their own person.
-fn person_names<'a>(chunks: &[Chunk<'a>]) -> Map<&'a [u8], &'a [u8]> {
+struct People<'a> {
+    codec: Codec<'a>,
+    aliases: Map<u64, u64>,
+}
+
+impl<'a> People<'a> {
+    #[inline]
+    fn resolve(&self, uid: &'a [u8]) -> u64 {
+        let key = self.codec.key(uid);
+        self.aliases.get(&key).copied().unwrap_or(key)
+    }
+}
+
+fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
     let pairs: Vec<Vec<(&'a [u8], &'a [u8])>> = chunks
         .par_iter()
         .map(|c| {
@@ -357,14 +372,15 @@ fn person_names<'a>(chunks: &[Chunk<'a>]) -> Map<&'a [u8], &'a [u8]> {
             v
         })
         .collect();
-    let mut ids: Map<&'a [u8], u32> = Map::with_hasher(rs());
+    let codec = Codec::new();
+    let mut ids: Map<u64, u32> = Map::with_hasher(rs());
     let mut names: Vec<&'a [u8]> = Vec::new();
     let mut parent: Vec<u32> = Vec::new();
-    for v in &pairs {
-        for &(a, b) in v {
+    for v in pairs {
+        for (a, b) in v {
             let mut ix = [0u32; 2];
             for (k, s) in [a, b].into_iter().enumerate() {
-                ix[k] = *ids.entry(s).or_insert_with(|| {
+                ix[k] = *ids.entry(codec.key(s)).or_insert_with(|| {
                     names.push(s);
                     parent.push(parent.len() as u32);
                     (names.len() - 1) as u32
@@ -381,14 +397,14 @@ fn person_names<'a>(chunks: &[Chunk<'a>]) -> Map<&'a [u8], &'a [u8]> {
             }
         }
     }
-    let mut out: Map<&'a [u8], &'a [u8]> = Map::with_capacity_and_hasher(names.len(), rs());
-    for i in 0..names.len() as u32 {
+    let mut aliases = Map::with_capacity_and_hasher(names.len(), rs());
+    for (key, i) in ids {
         let r = find(&mut parent, i);
         if r != i {
-            out.insert(names[i as usize], names[r as usize]);
+            aliases.insert(key, codec.key(names[r as usize]));
         }
     }
-    out
+    People { codec, aliases }
 }
 
 // ------------------------------------------------------------------ events & clicks
@@ -406,19 +422,16 @@ struct EvRow<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct PEv<'a> {
-    name: &'a [u8],
-    h: u64,
+struct PEv {
+    person: u64,
     ts: i64,
     price: u32,
     cat: u32,
-    etype: u8,
 }
 
 #[derive(Clone, Copy)]
 struct PCl<'a> {
-    name: &'a [u8],
-    h: u64,
+    person: u64,
     ts: i64,
     cid: &'a [u8],
     camp: u32,
@@ -473,9 +486,9 @@ fn parse_events<'a>(c: &Chunk<'a>, sm: &Small, ws: i64, we: i64, hs: &RandomStat
 fn dedup_events<'a>(
     parsed: &[Vec<Vec<EvRow<'a>>>],
     s: usize,
-    names: &Map<&'a [u8], &'a [u8]>,
+    names: &People<'a>,
     hs: &RandomState,
-) -> Vec<Vec<PEv<'a>>> {
+) -> Vec<Vec<PEv>> {
     let n: usize = parsed.iter().map(|p| p[s].len()).sum();
     let mut best: Map<&'a [u8], EvRow<'a>> = Map::with_capacity_and_hasher(n, rs());
     for p in parsed {
@@ -494,9 +507,8 @@ fn dedup_events<'a>(
         if !r.ok {
             continue;
         }
-        let name = *names.get(r.uid).unwrap_or(&r.uid);
-        let h = hs.hash_one(name);
-        out[shard(h)].push(PEv { name, h, ts: r.ts, price: r.price, cat: r.cat, etype: r.etype });
+        let person = names.resolve(r.uid);
+        out[shard(hs.hash_one(person))].push(PEv { person, ts: r.ts, price: r.price, cat: r.cat });
     }
     out
 }
@@ -522,7 +534,7 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, hs: &RandomStat
 fn dedup_clicks<'a>(
     parsed: &[Vec<Vec<ClRow<'a>>>],
     s: usize,
-    names: &Map<&'a [u8], &'a [u8]>,
+    names: &People<'a>,
     hs: &RandomState,
 ) -> Vec<Vec<PCl<'a>>> {
     let n: usize = parsed.iter().map(|p| p[s].len()).sum();
@@ -533,9 +545,8 @@ fn dedup_clicks<'a>(
             if seen.insert(cid, ()).is_some() {
                 continue;
             }
-            let name = *names.get(uid).unwrap_or(&uid);
-            let h = hs.hash_one(name);
-            out[shard(h)].push(PCl { name, h, ts, cid, camp });
+            let person = names.resolve(uid);
+            out[shard(hs.hash_one(person))].push(PCl { person, ts, cid, camp });
         }
     }
     out
@@ -543,8 +554,8 @@ fn dedup_clicks<'a>(
 
 // ------------------------------------------------------------------ sessions
 
-struct UserRow<'a> {
-    name: &'a [u8],
+struct UserRow {
+    person: u64,
     day: i32,
     sessions: i64,
     events: i64,
@@ -552,8 +563,8 @@ struct UserRow<'a> {
     top: Option<u32>,
 }
 
-struct ShardOut<'a> {
-    users: Vec<UserRow<'a>>,
+struct ShardOut {
+    users: Vec<UserRow>,
     camps: Map<u64, [i64; 4]>, // (camp << 32 | day) -> sessions, purchasing, revenue, assisted
 }
 
@@ -577,10 +588,10 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
     best.map(|b| b as u32)
 }
 
-fn process_shard<'a>(mut evs: Vec<PEv<'a>>, mut cls: Vec<PCl<'a>>, sm: &Small) -> ShardOut<'a> {
-    evs.sort_unstable_by(|a, b| a.h.cmp(&b.h).then_with(|| a.name.cmp(b.name)).then(a.ts.cmp(&b.ts)));
+fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small) -> ShardOut {
+    evs.sort_unstable_by_key(|e| (e.person, e.ts));
     cls.sort_unstable_by(|a, b| {
-        a.h.cmp(&b.h).then_with(|| a.name.cmp(b.name)).then(a.ts.cmp(&b.ts)).then_with(|| a.cid.cmp(b.cid))
+        a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| a.cid.cmp(b.cid))
     });
     let ncamp = sm.camp_names.len();
     let mut users = Vec::new();
@@ -593,16 +604,16 @@ fn process_shard<'a>(mut evs: Vec<PEv<'a>>, mut cls: Vec<PCl<'a>>, sm: &Small) -
     let mut ci = 0usize;
     let mut i = 0usize;
     while i < evs.len() {
-        let (h, name) = (evs[i].h, evs[i].name);
+        let person = evs[i].person;
         let mut j = i;
-        while j < evs.len() && evs[j].h == h && evs[j].name == name {
+        while j < evs.len() && evs[j].person == person {
             j += 1;
         }
-        while ci < cls.len() && (cls[ci].h, cls[ci].name) < (h, name) {
+        while ci < cls.len() && cls[ci].person < person {
             ci += 1;
         }
         let c0 = ci;
-        while ci < cls.len() && cls[ci].h == h && cls[ci].name == name {
+        while ci < cls.len() && cls[ci].person == person {
             ci += 1;
         }
         let clicks = &cls[c0..ci];
@@ -623,7 +634,7 @@ fn process_shard<'a>(mut evs: Vec<PEv<'a>>, mut cls: Vec<PCl<'a>>, sm: &Small) -
             if day != cur_day {
                 if cur_day != i32::MIN {
                     let top = top_category(&catsum, &sm.cat_rank);
-                    users.push(UserRow { name, day: cur_day, sessions: d_sess, events: d_ev, revenue: d_rev, top });
+                    users.push(UserRow { person, day: cur_day, sessions: d_sess, events: d_ev, revenue: d_rev, top });
                     catsum.iter_mut().for_each(|x| *x = 0);
                 }
                 cur_day = day;
@@ -632,7 +643,7 @@ fn process_shard<'a>(mut evs: Vec<PEv<'a>>, mut cls: Vec<PCl<'a>>, sm: &Small) -
             let mut rev = 0i64;
             let mut purch = false;
             for e in &evs[k..m] {
-                if e.etype == T_PURCHASE {
+                if e.price != 0 {
                     purch = true;
                     rev += e.price as i64;
                     catsum[e.cat as usize] += e.price as i64;
@@ -686,7 +697,7 @@ fn process_shard<'a>(mut evs: Vec<PEv<'a>>, mut cls: Vec<PCl<'a>>, sm: &Small) -
             k = m;
         }
         let top = top_category(&catsum, &sm.cat_rank);
-        users.push(UserRow { name, day: cur_day, sessions: d_sess, events: d_ev, revenue: d_rev, top });
+        users.push(UserRow { person, day: cur_day, sessions: d_sess, events: d_ev, revenue: d_rev, top });
         catsum.iter_mut().for_each(|x| *x = 0);
         for &a in &active {
             cnt[a as usize] = 0;
@@ -744,7 +755,7 @@ fn main() {
     let hs = rs();
 
     let names = person_names(&link_chunks);
-    log(&format!("links: {} linked ids", names.len()));
+    log(&format!("links: {} linked ids", names.aliases.len()));
 
     let ev_parsed: Vec<_> = ev_chunks.par_iter().map(|c| parse_events(c, &sm, ws, we, &hs)).collect();
     log("events parsed");
@@ -824,8 +835,12 @@ fn main() {
         || {
             outs.par_chunks(per).enumerate().for_each(|(pi, group)| {
                 let rows: Vec<&UserRow> = group.iter().flat_map(|o| o.users.iter()).collect();
+                let mut keys = arrow_array::builder::StringBuilder::with_capacity(rows.len(), 9 * rows.len());
+                for r in &rows {
+                    keys.append_value(s(names.codec.bytes(r.person, &mut [0; 9])));
+                }
                 let cols: Vec<ArrayRef> = vec![
-                    Arc::new(StringArray::from_iter_values(rows.iter().map(|r| s(r.name)))),
+                    Arc::new(keys.finish()),
                     Arc::new(Date32Array::from_iter_values(rows.iter().map(|r| r.day))),
                     Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.sessions))),
                     Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.events))),

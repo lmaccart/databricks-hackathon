@@ -4,6 +4,18 @@
 
 Leif reports **5.03 s** for `cc9f33e`. At the user-reported 0.68 s lead that is a 7.40× gap on the practice clock. The 2.45 s native baseline below is a different measurement; use interleaved local runs to rank changes and a fresh organizer run to evaluate rank.
 
+`sample PID 8 1 -mayDie`, all eight worker threads, scored binary on seed 7 / 20M. Top non-blocked leaves (sample counts, **not** percentages of wall time): event-shard `main` worker closure 2,520; system `memcmp` 1,097; `split_fields` 926; event `quicksort` 910; `unquote` 785. `parse_ts` accounted for another 479 leaf samples. The profiled run reached `written` at 2.348 s; differences between consecutive logs were 0.220 setup, 0.556 event parsing, 0.613 event dedup, 0.233 clicks, 0.591 sessions and 0.135 s writing. Compiler inlining means a worker-closure sample cannot be attributed to one statement.
+
+### Controlled 20M experiments
+
+`tools/bench_pair.py BASE CANDIDATE vendor/practice` on the M2 Pro, seed 7, 20M events / 5M clicks, eight Rayon workers, identical input, a fresh output/scratch directory per process, one untimed warmup per build, then five alternating-order pairs. These medians compare **code versions**, unlike inter-machine scoreboard times. No filesystem cache flushing. Always compare against the measured control in the same row.
+
+| Candidate vs control | Control | Candidate | Wall time reduction |
+|---|---:|---:|---:|
+| Exact 64-bit person keys vs `cc9f33e` | 1.909 s | 1.489 s | 22.0% |
+
+Short ASCII person names are byte-packed, reversible keys; non-ASCII, long names and IDs ending in NUL are assigned exact interned keys in a disjoint namespace. Canonical names are still chosen by comparing original bytes. Session-event records shrink from 48 to 24 bytes and the comparator no longer follows string pointers. Zero-padded IDs, mixed case, embedded NUL and long names are covered by the suite.
+
 ## What the official material established
 
 The printed track page times **container start to exit** on eight pinned hyperthreads with 24 GB and no swap. The final runs approximately 60M events three times; any run over 180 s means no final score. The printout's practice leader was 0.75 s. Neither Opus's 0.59 s on 2M kit events nor a native Mac timing is comparable to that leaderboard.
