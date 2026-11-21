@@ -189,6 +189,62 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_purchase_stream_preserves_multiplicity_dedup_and_session_start_day(self):
+        before = "2026-10-01T23:55:00Z"
+        after = "2026-10-02T00:05:00Z"
+        isolated = "2026-10-02T00:35:00Z"
+        uid = "very long álias"
+        canonical = "A canonical name"
+        u, c = run_case(
+            events=[
+                ev("first", uid, before),
+                ev("p0", uid, after, "purchase", "p1", "13"),
+                ev("p1", canonical, after, "purchase", "p2", "11"),
+                ev("p2", canonical, after, "purchase", "p1", "7"),
+                ev("killed", uid, after, "purchase", "p3", "999", ingest=after),
+                ev("edge", uid, isolated, "cart", price="999"),
+                ev("next", uid, str(ms(isolated) + 30 * MIN + 1), "purchase", "p3", "20"),
+                ev("other", "other", after, "purchase", "p3", "5"),
+            ],
+            extra={"events/part-1.csv": [
+                ev("killed", "different", "bad", ingest=before),
+                ev("p1", "different", after, "purchase", "p3", "999", ingest=isolated),
+            ]},
+            links=[f"{uid},{canonical}"],
+            clicks=[f"k1,{uid},c_1,{before}", f"k2,{canonical},c_2,{after}"],
+        )
+        first = u[(canonical, "2026-10-01")]
+        self.assertEqual((first["sessions"], first["events"], first["revenue_cents"],
+                          first["top_category"]), (1, 5, 31, "shoes"))
+        self.assertEqual(u[(canonical, "2026-10-02")]["revenue_cents"], 20)
+        self.assertEqual(u[("other", "2026-10-02")]["revenue_cents"], 5)
+        self.assertEqual(set(k[0] for k in u), {canonical, "other"})
+        self.assertEqual(c[("c_1", "2026-10-01")]["revenue_cents"], 31)
+        self.assertEqual(c[("c_2", "2026-10-02")]["revenue_cents"], 20)
+
+    def test_sparse_wide_window_with_large_timestamp_spans(self):
+        lo = "0001-01-01T00:00:00Z"
+        late = "9998-12-31T00:00:00Z"
+        person = "person with a large span"
+        for hi in ("9999-01-01T00:00:00Z", str(2**63 - 1)):
+            with self.subTest(window_end=hi):
+                u, c = run_case(
+                    window=(lo, hi),
+                    events=[
+                        ev("e1", person, lo, ingest=lo),
+                        ev("e2", "z alias", str(ms(late)), "purchase",
+                           "missing", "10000000", ingest=late),
+                        ev("e3", "another", late, ingest=late),
+                    ],
+                    links=[f"{person},z alias"],
+                    clicks=[f"k,{person},c_3,{late}"],
+                )
+                self.assertEqual(u[(person, "0001-01-01")]["events"], 1)
+                row = u[(person, "9998-12-31")]
+                self.assertEqual((row["sessions"], row["events"], row["revenue_cents"],
+                                  row["top_category"]), (1, 1, 10000000, "unknown"))
+                self.assertEqual(c[("c_3", "9998-12-31")]["revenue_cents"], 10000000)
+
     def test_no_survivors_still_writes_both_empty_tables(self):
         u, c = run_case(events=[ev("e", "", WS)], clicks=[f"k,u,c_1,{WS}"])
         self.assertEqual((u, c), ({}, {}))

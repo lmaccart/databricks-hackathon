@@ -1,5 +1,24 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 2 challenger: compact linked rank + purchase stream — 2026-11-20
+
+The link graph already assigns each exact ID a node. Reuse its canonical root
+index as an exact rank; when the manifest span and rank width fit, sort linked
+events on a single 8-byte integer. Unlinked people and over-wide windows use a
+16-byte `(person, ts)` key instead; no person-ID spelling assumptions or extra
+event-time dictionary lookups. Clicks use the matching identity space.
+
+Claims locate one of four per-shard streams (compact/wide × temporal/purchase).
+Removing a purchase loser drops its entire record before it can contribute
+either an event key or revenue. Only purchases carry price/category. Their
+timestamps still contribute one key apiece to the temporal sort; the session
+scan consumes all purchase records through each inclusive session-end key.
+Ties preserve event and purchase multiplicity and use the session start day.
+Both official dev checkers matched; 36/36 official fixtures for each
+implementation, 33/33 Python cases against both, 14 Rust tests, and 10/10
+kit-generated 20k-event differential seeds passed. Performance comparison is
+delegated to the parent A/B run.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.
