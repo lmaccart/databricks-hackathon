@@ -1,5 +1,20 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Person CSR timeline challenger — 2026-11-20
+
+Experimental worktree candidate: count exact person keys into shared event/click
+CSR groups, scatter each payload directly from its source piece, discard
+click-only people, and order each person's timestamps separately. Groups of
+at least 2,048 rows use an exact signed 64-bit LSD radix with constant-byte
+passes skipped; smaller groups use comparison sorting. This removes both global
+person/timestamp sorts and the preliminary duplicate gather. Long and interned
+IDs remain exact and click-ID ties are still resolved in the attribution scan.
+
+Validation: 15 Rust tests, 32 Python and binary tests, 36/36 official fixtures
+for both implementations, both dev-answer comparers, 10 kit dirty seeds at 20k,
+and official-generator seeds 1, 7 and 15 at 10k and 100k, including leap day.
+Parent is measuring the required 20M five-run timing; **delta not yet known**.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.

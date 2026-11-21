@@ -22,6 +22,7 @@ mod events;
 mod links;
 mod output;
 mod person;
+mod timeline;
 use links::{People, person_names};
 use person::Codec;
 
@@ -203,18 +204,6 @@ fn by_destination<T>(batches: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
     jobs
 }
 
-fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
-    if pieces.len() <= 1 {
-        return pieces.pop().unwrap_or_default();
-    }
-    let size: usize = pieces.iter().map(Vec::len).sum();
-    let mut rows = Vec::with_capacity(size);
-    for piece in pieces {
-        rows.extend_from_slice(&piece);
-    }
-    rows
-}
-
 fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<'a>) -> Vec<Vec<PCl>> {
     let hint = reserve_per_shard(c.data);
     let mut b: Vec<Vec<PCl>> = (0..NS).map(|_| Vec::with_capacity(hint)).collect();
@@ -276,9 +265,8 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
     best.map(|b| b as u32)
 }
 
-fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec) -> ShardOut {
-    evs.sort_unstable_by_key(|e| (e.person, e.ts));
-    cls.sort_unstable_by_key(|c| (c.person, c.ts));
+fn process_shard(event_parts: Vec<Vec<PEv>>, click_parts: Vec<Vec<PCl>>, sm: &Small, codec: &Codec) -> ShardOut {
+    let (evs, cls, groups) = timeline::group(event_parts, click_parts);
     let ncamp = sm.camp_names.len();
     let mut users = Vec::new();
     let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
@@ -287,22 +275,11 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
     let mut pos = vec![0u32; ncamp]; // index of a campaign inside `active`
     let mut catsum = vec![0i64; sm.cat_names.len()];
 
-    let mut ci = 0usize;
-    let mut i = 0usize;
-    while i < evs.len() {
-        let person = evs[i].person;
-        let mut j = i;
-        while j < evs.len() && evs[j].person == person {
-            j += 1;
-        }
-        while ci < cls.len() && cls[ci].person < person {
-            ci += 1;
-        }
-        let c0 = ci;
-        while ci < cls.len() && cls[ci].person == person {
-            ci += 1;
-        }
-        let clicks = &cls[c0..ci];
+    for group in groups {
+        let person = group.person;
+        let i = group.e_start;
+        let j = group.e_end;
+        let clicks = &cls[group.c_start..group.c_end];
         let (mut lo, mut hi) = (0usize, 0usize);
         let mut latest = 0;
 
@@ -399,7 +376,6 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
             cnt[a as usize] = 0;
         }
         active.clear();
-        i = j;
     }
     ShardOut { users, camps }
 }
@@ -477,7 +453,7 @@ fn main() {
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(gather(e), gather(c), &sm, &names.codec))
+        .map(|(e, c)| process_shard(e, c, &sm, &names.codec))
         .collect();
     log("sessions done");
 

@@ -189,6 +189,34 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_large_linked_timeline_ties_cross_midnight_and_attribution(self):
+        start = ms("2026-10-02T23:59:00Z")
+        events = [
+            ev(f"whale-{i}", "long-linked-id-β" if i % 2 else "canonical-long-id",
+               str(start + (i * 7919 % 110_000)), ingest="2026-10-03T00:01:00Z")
+            for i in range(2300)
+        ]
+        events.extend([
+            ev("purchase", "long-linked-id-β", "2026-10-03T00:10:00Z", "purchase", price="37"),
+            ev("later", "canonical-long-id", "2026-10-03T01:00:00Z"),
+        ])
+        clicks = [f"z-long-click-{i},long-linked-id-β,c_2,{start}" for i in range(2100)]
+        clicks += [
+            f"a-long-click-winner,canonical-long-id,c_1,{start}",
+            f"later-click,canonical-long-id,c_2,{start + 1}",
+            f"unused-click,click-only-long-id,c_3,{start}",
+        ]
+        u, c = run_case(events=events, clicks=clicks, links=["canonical-long-id,long-linked-id-β"])
+        first = u[("canonical-long-id", "2026-10-02")]
+        later = u[("canonical-long-id", "2026-10-03")]
+        self.assertEqual((first["sessions"], first["events"], first["revenue_cents"]), (1, 2301, 37))
+        self.assertEqual((later["sessions"], later["events"]), (1, 1))
+        self.assertEqual((c[("c_1", "2026-10-02")]["sessions"],
+                          c[("c_2", "2026-10-02")]["assisted_sessions"]), (1, 1))
+        self.assertEqual((c[("c_2", "2026-10-03")]["sessions"],
+                          c[("c_1", "2026-10-03")]["assisted_sessions"]), (1, 1))
+        self.assertFalse(any(k[0] == "c_3" for k in c))
+
     def test_no_survivors_still_writes_both_empty_tables(self):
         u, c = run_case(events=[ev("e", "", WS)], clicks=[f"k,u,c_1,{WS}"])
         self.assertEqual((u, c), ({}, {}))
