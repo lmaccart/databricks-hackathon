@@ -30,27 +30,109 @@ pub(super) fn unmix(x: u64) -> u64 {
     y ^ (y >> 27) ^ (y >> 54)
 }
 
-#[derive(Clone, Copy, Default)]
-struct Slot {
-    key: u64,
-    value: u64,
+struct Lane {
+    keys: Vec<u64>,
+    ranks: Vec<u32>,
+    retrieval: Option<Retrieval>,
 }
 
-struct Lane {
-    slots: Vec<Slot>,
-    mask: usize,
+struct Retrieval {
+    seed: u64,
+    part: usize,
+    values: Vec<u32>,
+}
+
+// Three disjoint vertex ranges ensure that an edge cannot repeat a vertex.
+#[inline]
+fn vertices(hash: u64, seed: u64, part: usize) -> [usize; 3] {
+    let a = mix(hash ^ seed);
+    let b = mix(a ^ 0x9e37_79b9_7f4a_7c15);
+    let c = mix(b ^ 0xd1b5_4a32_d192_ed03);
+    let reduce = |x: u64| ((u128::from(x) * part as u128) >> 64) as usize;
+    [reduce(a), part + reduce(b), 2 * part + reduce(c)]
+}
+
+impl Retrieval {
+    fn attempt(keys: &[u64], seed: u64, part: usize) -> Option<Self> {
+        let size = part.checked_mul(3)?;
+        if size > u32::MAX as usize || keys.len() > u32::MAX as usize {
+            return None;
+        }
+        let mut degrees = vec![0u32; size];
+        let mut edges = vec![0u32; size];
+        for (i, &key) in keys.iter().enumerate() {
+            for v in vertices(mix(key), seed, part) {
+                degrees[v] += 1;
+                edges[v] ^= i as u32;
+            }
+        }
+        let mut queue: Vec<u32> = degrees
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &d)| (d == 1).then_some(i as u32))
+            .collect();
+        let mut stack = Vec::with_capacity(keys.len());
+        while let Some(v) = queue.pop() {
+            let v = v as usize;
+            if degrees[v] != 1 {
+                continue;
+            }
+            let edge = edges[v];
+            stack.push((edge, v as u32));
+            for u in vertices(mix(keys[edge as usize]), seed, part) {
+                degrees[u] -= 1;
+                edges[u] ^= edge;
+                if degrees[u] == 1 {
+                    queue.push(u as u32);
+                }
+            }
+        }
+        if stack.len() != keys.len() {
+            return None;
+        }
+        let mut values = vec![0u32; size];
+        for &(edge, v) in stack.iter().rev() {
+            let [a, b, c] = vertices(mix(keys[edge as usize]), seed, part);
+            values[v as usize] = edge ^ values[a] ^ values[b] ^ values[c];
+        }
+        Some(Self { seed, part, values })
+    }
+
+    #[inline]
+    fn index(&self, hash: u64) -> usize {
+        let [a, b, c] = vertices(hash, self.seed, self.part);
+        (self.values[a] ^ self.values[b] ^ self.values[c]) as usize
+    }
 }
 
 impl Lane {
+    fn build(keys: Vec<u64>, attempts: u64) -> Self {
+        // Fixed bounded retries: even adversarial cycles fall back to exact
+        // binary search without growing the table or retrying indefinitely.
+        let part = keys
+            .len()
+            .checked_mul(135)
+            .and_then(|n| n.checked_add(299))
+            .map(|n| (n / 300).max(1));
+        Self::build_with_part(keys, attempts, part)
+    }
+
+    fn build_with_part(keys: Vec<u64>, attempts: u64, part: Option<usize>) -> Self {
+        let retrieval = part.and_then(|part| (0..attempts).find_map(|seed| Retrieval::attempt(&keys, seed, part)));
+        Self {
+            ranks: vec![0; keys.len()],
+            keys,
+            retrieval,
+        }
+    }
+
     #[inline]
-    fn find(&self, key: u64, hash: u64) -> usize {
-        let mut i = (hash >> LANES.trailing_zeros()) as usize & self.mask;
-        loop {
-            let k = self.slots[i].key;
-            if k == key || k == 0 {
-                return i;
-            }
-            i = (i + 1) & self.mask;
+    fn find(&self, key: u64, hash: u64) -> Option<usize> {
+        if let Some(retrieval) = &self.retrieval {
+            let i = retrieval.index(hash);
+            (self.keys.get(i) == Some(&key)).then_some(i)
+        } else {
+            self.keys.binary_search(&key).ok()
         }
     }
 }
@@ -62,10 +144,7 @@ pub(super) struct People<'a> {
     pub(super) count: usize,
 }
 
-// This bit is disjoint from the packed routing shard and the canonical node
-// index. It is internal to the link table, not reserved in arbitrary person keys.
-const LINKED: u64 = 1 << 63;
-const _: () = assert!(SHARD_SHIFT >= 32 && ((NS as u64 - 1) << SHARD_SHIFT) & LINKED == 0);
+const _: () = assert!(SHARD_SHIFT >= 32);
 
 #[derive(Clone, Copy)]
 pub(super) enum Identity {
@@ -77,9 +156,10 @@ impl<'a> People<'a> {
     #[inline]
     pub(super) fn lookup(&self, key: u64, h: u64) -> Identity {
         let lane = &self.lanes[h as usize & (LANES - 1)];
-        let s = lane.slots[lane.find(key, h)];
-        if s.value & LINKED != 0 {
-            Identity::Linked(s.value ^ LINKED)
+        if let Some(i) = lane.find(key, h) {
+            let rank = lane.ranks[i];
+            let routing = self.roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
+            Identity::Linked(routing | u64::from(rank))
         } else {
             Identity::Standalone(h)
         }
@@ -93,8 +173,9 @@ impl<'a> People<'a> {
     #[inline]
     pub(super) fn prefetch(&self, h: u64) {
         let lane = &self.lanes[h as usize & (LANES - 1)];
-        let i = (h >> LANES.trailing_zeros()) as usize & lane.mask;
-        let addr = &lane.slots[i] as *const Slot;
+        let Some(retrieval) = &lane.retrieval else { return };
+        let i = vertices(h, retrieval.seed, retrieval.part)[0];
+        let addr = &retrieval.values[i] as *const u32;
         // Only an in-bounds address in an immutable, live table; prefetch is
         // a hint, never an actual read used for a decision.
         #[cfg(target_arch = "x86_64")]
@@ -161,39 +242,27 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
             }
             keys.sort_unstable();
             keys.dedup();
-            let cap = (keys.len() * 2 + 1).next_power_of_two();
-            let mut lane = Lane {
-                slots: vec![Slot::default(); cap],
-                mask: cap - 1,
-            };
-            for (j, &k) in keys.iter().enumerate() {
-                let i = lane.find(k, mix(k));
-                lane.slots[i] = Slot {
-                    key: k,
-                    value: j as u64,
-                };
-            }
-            (lane, keys)
+            Lane::build(keys, 4)
         })
         .collect();
     drop(key_parts);
-    let (mut lanes, groups): (Vec<_>, Vec<_>) = built.into_iter().unzip();
+    let mut lanes = built;
     let mut offsets = [0; LANES];
     let mut count = 0usize;
-    for (s, g) in groups.iter().enumerate() {
+    for (s, g) in lanes.iter().enumerate() {
         offsets[s] = count;
-        count += g.len();
+        count += g.keys.len();
     }
     assert!(
         u32::try_from(count).is_ok(),
         "too many linked IDs for addressable memory"
     );
-    let keys: Vec<u64> = groups.into_iter().flatten().collect();
+    let keys: Vec<u64> = lanes.iter().flat_map(|lane| lane.keys.iter().copied()).collect();
     let parent: Vec<_> = (0..count as u32).map(AtomicU32::new).collect();
     let index = |key| {
         let hash = mix(key);
         let s = hash as usize & (LANES - 1);
-        (offsets[s] + lanes[s].slots[lanes[s].find(key, hash)].value as usize) as u32
+        (offsets[s] + lanes[s].find(key, hash).expect("link endpoint indexed")) as u32
     };
     edges
         .par_iter()
@@ -230,12 +299,8 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
     let mut roots = keys;
     roots.par_iter_mut().for_each(|k| *k = mix(*k));
     lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
-        for slot in &mut lane.slots {
-            if slot.key != 0 {
-                let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
-                let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
-                slot.value = LINKED | routing | u64::from(rank);
-            }
+        for (i, rank) in lane.ranks.iter_mut().enumerate() {
+            *rank = root(&parent, (offsets[s] + i) as u32);
         }
     });
     People {
@@ -243,5 +308,42 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         lanes,
         roots,
         count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retrieval_exact_membership_and_fallback() {
+        for n in [0, 1, 2, 31, 10_000] {
+            let keys: Vec<_> = (1..=n).map(|i| i * 2).collect();
+            for attempts in [0, 4] {
+                let lane = Lane::build(keys.clone(), attempts);
+                if attempts == 0 {
+                    assert!(lane.retrieval.is_none());
+                }
+                if n == 10_000 && attempts > 0 {
+                    assert!(lane.retrieval.is_some());
+                }
+                for i in 0..=(n * 2 + 100) {
+                    assert_eq!(lane.find(i, mix(i)), keys.binary_search(&i).ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forced_cycle_cannot_peel_and_uses_sorted_fallback() {
+        let keys: Vec<_> = (1..=10_000).collect();
+        // One vertex per partition forces every edge into the same cycle.
+        assert!(Retrieval::attempt(&keys, 0, 1).is_none());
+        let lane = Lane::build_with_part(keys.clone(), 4, Some(1));
+        assert!(lane.retrieval.is_none());
+        for &key in &keys {
+            assert_eq!(lane.find(key, mix(key)), keys.binary_search(&key).ok());
+        }
+        assert_eq!(lane.find(10_001, mix(10_001)), None);
     }
 }

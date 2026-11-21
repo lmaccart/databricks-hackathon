@@ -1,5 +1,24 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Sharded peel retrieval experiment — 2026-11-21
+
+Replaced the original link union-find index with 64 independently built XOR
+three-hash peel tables, dense exact codec keys, and u32 canonical ranks.
+Candidates are always checked against the full key; after four failed peel
+seeds or an unaddressable table, the lane uses sorted-key binary search.
+Scratch space and retries are linear and bounded. Rank routing still requires
+an additional canonical-root read; this trades latency for smaller entries.
+
+Rust tests 21/21, reference and binary tests 39/39 each, 36/36 official
+fixtures for both implementations, 10 dirty seeds, and both 1M dev comparers
+passed. Clippy `-D warnings` passed. Five alternating 1M dev pairs against
+the pre-existing `scratch/round3/control-mac` binary measured 0.072 →
+0.072 s (0.7% less time), too small and noisy to establish a speedup; that
+binary's source identity was not independently verified here. As requested,
+no local 20M/60M, Docker, or submission was run. Final-scale memory,
+construction cost, and scorer performance remain unmeasured; this is an
+experiment, not a verified speed pick.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

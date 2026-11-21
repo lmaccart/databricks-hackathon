@@ -390,6 +390,21 @@ class EventsOrder(unittest.TestCase):
 
 
 class LinkedIds(unittest.TestCase):
+    def test_mixed_aliases_unused_spill_names_and_unknowns(self):
+        t = "2026-10-02T10:00:00Z"
+        users, campaigns = run_case(
+            events=[ev("e1", "alias", t), ev("e2", "another long alias", t),
+                    ev("e3", "alias ", t), ev("e4", "é", t),
+                    ev("e5", "lonely long name", t)],
+            clicks=[f"k,another long alias,c_1,{t}"],
+            links=["alias,another long alias", "another long alias, a very long unused label",
+                   "é,é", "alias,alias", "another long alias,alias"],
+        )
+        self.assertEqual(set(users), {(name, "2026-10-02") for name in
+                         (" a very long unused label", "alias ", "é", "lonely long name")})
+        self.assertEqual(users[(" a very long unused label", "2026-10-02")]["events"], 2)
+        self.assertEqual(campaigns[("c_1", "2026-10-02")]["sessions"], 1)
+
     def test_self_links_and_unrelated_graph_nodes_preserve_both_tables(self):
         # "A line ... may link an ID to itself; neither changes anything."
         # The same rows must agree when all, some, or none of their owners
