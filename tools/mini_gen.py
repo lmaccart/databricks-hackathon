@@ -83,6 +83,10 @@ def main():
     ap.add_argument("--events", type=int, default=20000)
     ap.add_argument("--clicks", type=int, default=0)
     ap.add_argument("--out", required=True)
+    # Wider windows and more categories exercise the fast path's wide layouts.
+    ap.add_argument("--window-days", type=int, default=14)
+    ap.add_argument("--categories", type=int, default=0,
+                    help="use exactly this many categories (default: 20, drawn at random per product)")
     a = ap.parse_args()
     rnd = random.Random(a.seed)
     E = a.events
@@ -92,17 +96,17 @@ def main():
     if year == 2028 and rnd.random() < 0.5:
         start = dt.datetime(2028, 2, 20, tzinfo=dt.timezone.utc)
     ws = int(start.timestamp() * 1000)
-    we = ws + 14 * DAY
+    we = ws + a.window_days * DAY
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "manifest.json"), "w") as fh:
         json.dump({"window_start": f1(ws), "window_end": f1(we)}, fh)
 
-    cats = [f"cat_{i:02d}" for i in range(20)]
-    products = [f"p_{i}" for i in range(max(50, E // 50))]
+    cats = [f"cat_{i:02d}" for i in range(a.categories or 20)]
+    products = [f"p_{i}" for i in range(max(50, E // 50, a.categories))]
     with open(os.path.join(a.out, "products.csv"), "w") as fh:
         fh.write("product_id,category\n")
-        for p in products:
-            fh.write(f"{p},{rnd.choice(cats)}\n")
+        for i, p in enumerate(products):
+            fh.write(f"{p},{cats[i] if i < a.categories else rnd.choice(cats)}\n")
     camps = [f"c_{i}" for i in range(max(20, E // 500))]
     with open(os.path.join(a.out, "campaigns.csv"), "w") as fh:
         fh.write("campaign_id,channel\n")
@@ -172,7 +176,7 @@ def main():
         ids = people[pi]
         t = rnd.randint(ws - 2 * 3600_000, we + 3600_000)
         if rnd.random() < 0.01:
-            t = ws + rnd.randint(0, 13) * DAY + DAY - rnd.randint(1, 10) * MIN  # near midnight
+            t = ws + rnd.randint(0, a.window_days - 1) * DAY + DAY - rnd.randint(1, 10) * MIN  # near midnight
         session_starts.append((pi, t))
         for _ in range(rnd.randint(1, 12)):
             eid += 1
