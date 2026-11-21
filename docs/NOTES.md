@@ -1,5 +1,23 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Fixed-row CSV tile parser validation — 2026-11-21
+
+The in-progress tile parser compacts quote syntax only for the canonical fixed
+column layouts; malformed quote syntax and unusual headers retain the original
+scanner. Added an end-to-end click-tile case for long byte-exact click-ID ties
+and assists, alongside the event-tile coverage. On this arm64 host, the Rust
+tests, 40 Python tests against both the oracle and binary, all 36 official
+fixtures, the 1M dev-answer comparison (117,038 user rows and 27,400 campaign
+rows), and five 10k-event dirty seeds matched. The official fixture harness
+could not start because its optional `polars` dependency is absent, so fixtures
+were checked against their expected CSVs with `tools/compare_outputs.py`.
+
+No speed or memory result is claimed; parent session to benchmark. Runtime
+coverage here is ARM/NEON plus the portable kernel. An x86 cross-target check
+was attempted but this toolchain has no x86 Rust `core` target installed, so
+the AVX2/VBMI2 paths still need an x86 build/run check before relying on
+cross-architecture parity.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

@@ -104,6 +104,48 @@ struct Pending {
     cat: u32,
 }
 
+#[inline(always)]
+fn decode<'a>(
+    r: impl csv::Fields<'a>,
+    sm: &Small,
+    people: &People<'a>,
+    (ws, we, clock): (i64, i64, &ManifestClock),
+    spill: &mut Vec<i64>,
+) -> Option<Pending> {
+    if r.bytes(0).is_empty() {
+        return None;
+    }
+    let claim_key = links::mix(r.key(0, &people.codec));
+    let (ingest, seconds) = clock.ingest_for_claim(r.bytes(3));
+    let ts = clock.parse_ts(r.bytes(2));
+    let mut next = Pending {
+        claim_key,
+        ts,
+        claim_order: Claim::order(ingest, seconds, spill),
+        ..Default::default()
+    };
+    if !r.bytes(1).is_empty() && !r.bytes(5).is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
+        let purchase = match r.bytes(4) {
+            b"purchase" => parse_price(r.bytes(6)),
+            b"view" | b"cart" => Some(0),
+            _ => None,
+        };
+        if let Some(price) = purchase {
+            let cat = if price == 0 {
+                0
+            } else {
+                sm.product_cat.get(r.bytes(5)).unwrap_or(sm.unknown_cat)
+            };
+            next.uid = r.key(1, &people.codec);
+            next.hash = links::mix(next.uid);
+            people.prefetch(next.hash);
+            next.price = price;
+            next.cat = cat;
+        }
+    }
+    Some(next)
+}
+
 fn parse<'a>(
     c: &Chunk<'a>,
     sm: &Small,
@@ -111,7 +153,6 @@ fn parse<'a>(
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
 ) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
-    let (ws, we, clock) = window;
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Payload> = (0..NS)
         .map(|_| {
@@ -143,38 +184,12 @@ fn parse<'a>(
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
-    for_rows(c, |r| {
-        if r[0].is_empty() {
-            return;
-        }
-        let claim_key = links::mix(people.codec.key(r[0]));
-        let (ingest, seconds) = clock.ingest_for_claim(r[3]);
-        let ts = clock.parse_ts(r[2]);
-        let mut next = Pending {
-            claim_key,
-            ts,
-            claim_order: Claim::order(ingest, seconds, &mut spill),
-            ..Default::default()
+    csv::for_fixed::<7>(c, |r| {
+        let next = match r {
+            csv::Row::Compact(r) => decode(r, sm, people, window, &mut spill),
+            csv::Row::Raw(r) => decode(r, sm, people, window, &mut spill),
         };
-        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
-            let purchase = match r[4] {
-                b"purchase" => parse_price(r[6]),
-                b"view" | b"cart" => Some(0),
-                _ => None,
-            };
-            if let Some(price) = purchase {
-                let cat = if price == 0 {
-                    0
-                } else {
-                    sm.product_cat.get(r[5]).unwrap_or(sm.unknown_cat)
-                };
-                next.uid = people.codec.key(r[1]);
-                next.hash = links::mix(next.uid);
-                people.prefetch(next.hash);
-                next.price = price;
-                next.cat = cat;
-            }
-        }
+        let Some(next) = next else { return };
         let i = n % ring.len();
         if n >= ring.len() {
             emit(ring[i]);

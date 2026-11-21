@@ -244,6 +244,33 @@ fn parse_clicks<'a>(
         ts: i64,
         camp: u32,
     }
+    #[inline(always)]
+    fn decode<'a>(
+        r: impl csv::Fields<'a>,
+        sm: &Small,
+        names: &People<'a>,
+        (lo, we, clock): (i64, i64, &ManifestClock),
+    ) -> Option<PendingClick> {
+        // Copies are identical, so validating first is equivalent.
+        if r.bytes(0).is_empty() || r.bytes(1).is_empty() {
+            return None;
+        }
+        let camp = sm.camp_idx.get(r.bytes(2))?;
+        let ts = clock.parse_ts(r.bytes(3));
+        if ts == BAD || ts < lo || ts >= we {
+            return None;
+        }
+        let uid = r.key(1, &names.codec);
+        let hash = links::mix(uid);
+        names.prefetch(hash);
+        Some(PendingClick {
+            uid,
+            hash,
+            ts,
+            cid: r.key(0, &names.codec),
+            camp,
+        })
+    }
     let mut emit = |row: PendingClick| {
         let (dest, person) = match names.lookup(row.uid, row.hash) {
             Identity::Linked(p) if packed => (&mut b[shard(p)].packed, u64::from(p as u32)),
@@ -259,31 +286,17 @@ fn parse_clicks<'a>(
     };
     let mut ring = [PendingClick::default(); 16];
     let mut n = 0usize;
-    for_rows(c, |r| {
-        // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
-        let (cid, uid, camp) = (r[0], r[1], r[2]);
-        if cid.is_empty() || uid.is_empty() {
-            return;
-        }
-        let Some(ci) = sm.camp_idx.get(camp) else { return };
-        let ts = clock.parse_ts(r[3]);
-        if ts == BAD || ts < lo || ts >= we {
-            return;
-        }
-        let key = names.codec.key(uid);
-        let hash = links::mix(key);
-        names.prefetch(hash);
+    csv::for_fixed::<4>(c, |r| {
+        let next = match r {
+            csv::Row::Compact(r) => decode(r, sm, names, (lo, we, clock)),
+            csv::Row::Raw(r) => decode(r, sm, names, (lo, we, clock)),
+        };
+        let Some(next) = next else { return };
         let i = n % ring.len();
         if n >= ring.len() {
             emit(ring[i]);
         }
-        ring[i] = PendingClick {
-            uid: key,
-            hash,
-            ts,
-            cid: names.codec.key(cid),
-            camp: ci,
-        };
+        ring[i] = next;
         n += 1;
     });
     for i in n.saturating_sub(ring.len())..n {

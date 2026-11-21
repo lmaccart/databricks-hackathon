@@ -12,6 +12,10 @@ use memchr::memchr;
 use std::marker::PhantomData;
 use std::path::Path;
 
+#[path = "csv_tile.rs"]
+mod tile;
+pub(crate) use tile::{Fields, Row, for_fixed};
+
 /// Output slot for fields no caller reads (the ninth entry of the row buffer).
 const SKIP: u8 = 8;
 

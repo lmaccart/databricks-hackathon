@@ -31,12 +31,14 @@ def ms(iso: str) -> int:
     return P.parse_ts(iso.encode())
 
 
-def write(path, header, lines):
+def write(path, header, lines, unterminated=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as fh:
         fh.write(header.encode() + b"\n")
         for ln in lines:
             fh.write((ln if isinstance(ln, bytes) else ln.encode()) + b"\n")
+        if unterminated is not None:
+            fh.write(unterminated)
 
 
 def run_case(events=(), clicks=(), links=(), products=("p1,shoes", "p2,hats", "p3,bags"),
@@ -63,7 +65,8 @@ def _run_case_at(tmp, events, clicks, links, products, campaigns, extra=None, wi
     write(os.path.join(data, "clicks", "part-0.csv"), "click_id,user_id,campaign_id,ts", clicks)
     write(os.path.join(data, "links", "part-0.csv"), "user_id_a,user_id_b", links)
     for rel, lines in (extra or {}).items():  # more part files; may replace the header-only events/part-1
-        write(os.path.join(data, rel), HEADERS[rel.split("/")[0]], lines)
+        header, rows, tail = lines if isinstance(lines, tuple) else (HEADERS[rel.split("/")[0]], lines, None)
+        write(os.path.join(data, rel), header, rows, tail)
     if os.environ.get("SS_BIN"):  # run an implementation binary instead of the reference
         import subprocess
         subprocess.run([os.environ["SS_BIN"]], check=True, stderr=subprocess.DEVNULL,
@@ -90,6 +93,54 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_quoted_tiles_and_spilled_names_against_python(self):
+        # Successive copies exercise transitions between raw and compacted
+        # tiles without changing which spelling wins the exact ingest claim.
+        rows = []
+        for i in range(420):
+            uid = ("foo\0", "a\0b", "雪", "é" * 5, "abcdefghi", "ABCDEFGHIJ")[i % 6]
+            rows.append(ev(f'"{i}é"', f'"{uid}"', WS, pid='"p1"', price="z" * (i % 67)))
+        rows[83] = ev('"""x"', "malformed", WS)
+        rows[172] = ev("quoted-cr", "malformed", WS, price='"x"\r')
+        rows[220] = ev("too,few,too,many", "malformed", WS)
+        rows[270] = ev('"long-id' + "界" * 1800 + '"', '"long-user"', WS)
+        rows[331] = ev("plain-cr", "ordinary", WS, price="\r")
+        header = 'unused,price_cents,product_id,event_type,ingest_ts,ts,"user_id",event_id'
+        extra = {
+            "events/part-1.csv": (HEADERS["events"], [
+                ev('"6é"', "", WS, ingest="2026-09-30T23:59:59Z"),
+                ev('"12é"', "loser", WS, ingest="2026-10-01T00:00:01Z"),
+            ], ev('"tail"', '"final\0"', WS, price='""').encode()),
+            "events/perm.csv": (header, [
+                f'"unused",,p1,view,{WS},{WS},"雪",perm',
+                f'bad"unused,,p1,view,{WS},{WS},malformed,bad',
+            ], None),
+        }
+        users, _ = run_case(rows, extra=extra)
+        self.assertEqual({uid: row["events"] for (uid, _), row in users.items()}, {
+            "foo\0": 68, "a\0b": 69, "雪": 71, "é" * 5: 70,
+            "abcdefghi": 68, "ABCDEFGHIJ": 69,
+            "long-user": 1, "ordinary": 1, "final\0": 1,
+        })
+
+    def test_click_tiles_preserve_spilled_tie_keys_and_assists(self):
+        uid = "tile-user\0"
+        clicks = [f'"{"a" * 10}",\"{uid}\",c_2,{WS}']
+        clicks.extend(
+            f'"click-{i:04}-long","{uid}",{("c_1", "c_2")[i % 2]},{WS}'
+            for i in range(420)
+        )
+        users, campaigns = run_case(
+            events=[ev("tile-event", f'"{uid}"', WS)],
+            clicks=clicks,
+        )
+
+        self.assertEqual(users[(uid, WS[:10])]["sessions"], 1)
+        self.assertEqual(campaigns[("c_1", WS[:10])]["sessions"], 0)
+        self.assertEqual(campaigns[("c_1", WS[:10])]["assisted_sessions"], 1)
+        self.assertEqual(campaigns[("c_2", WS[:10])]["sessions"], 1)
+        self.assertEqual(campaigns[("c_2", WS[:10])]["assisted_sessions"], 1)
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"

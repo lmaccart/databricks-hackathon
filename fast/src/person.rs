@@ -26,6 +26,49 @@ pub fn inline(bytes: &[u8]) -> Option<u64> {
         tmp[..bytes.len()].copy_from_slice(bytes);
         (u64::from_be_bytes(tmp), 0)
     };
+    pack(word, tail)
+}
+
+/// Same byte-exact spelling as `inline`, but a tile gives short fields
+/// enough readable padding for one word load instead of a variable memcpy.
+///
+/// SAFETY: `p` must point at `len` readable bytes and, when len is 1..=9,
+/// at least eight readable bytes. Bytes past `len` do not affect the key.
+#[inline(always)]
+pub(crate) unsafe fn inline_padded(p: *const u8, len: usize, pext: bool) -> Option<u64> {
+    if !(1..=9).contains(&len) {
+        return None;
+    }
+    let raw = u64::from_be(unsafe { p.cast::<u64>().read_unaligned() });
+    let (word, tail) = if len <= 8 {
+        let shift = (8 - len) * 8;
+        let word = raw & (u64::MAX << shift);
+        if ((word >> shift) as u8) == 0 {
+            return None;
+        }
+        (word, 0)
+    } else {
+        let tail = unsafe { p.add(8).read() };
+        if tail == 0 {
+            return None;
+        }
+        (raw, tail)
+    };
+    #[cfg(target_arch = "x86_64")]
+    if pext {
+        if word & HIGH_BITS != 0 || tail > 127 {
+            return None;
+        }
+        // SAFETY: pext is only set by a kernel dispatched after detecting BMI2.
+        let eight = unsafe { std::arch::x86_64::_pext_u64(word, !HIGH_BITS) };
+        return Some((eight << 7) | u64::from(tail));
+    }
+    let _ = pext;
+    pack(word, tail)
+}
+
+#[inline(always)]
+fn pack(word: u64, tail: u8) -> Option<u64> {
     if word & HIGH_BITS != 0 || tail > 127 {
         return None;
     }
@@ -127,6 +170,15 @@ mod tests {
         for input in &inputs {
             let key = codec.key(input);
             assert_eq!(codec.bytes(unmix(mix(key)), &mut [0; 9]), input.as_slice());
+            let mut pad = [255; 12];
+            pad[..input.len()].copy_from_slice(input);
+            assert_eq!(inline(input), unsafe {
+                inline_padded(pad.as_ptr(), input.len(), false)
+            });
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("bmi2") {
+                assert_eq!(inline(input), unsafe { inline_padded(pad.as_ptr(), input.len(), true) });
+            }
         }
     }
 }
