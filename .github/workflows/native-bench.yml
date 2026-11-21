@@ -1,0 +1,68 @@
+name: Native amd64 performance check
+on:
+  workflow_dispatch:
+  push:
+    branches: [bench/native-amd64]
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build the scored and candidate binaries
+        shell: bash
+        run: |
+          set -eu
+          rustup toolchain install 1.100.0 --profile minimal
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
+          git worktree add --detach "$RUNNER_TEMP/control" cc9f33ee6c3ccf9799dd89bac6dbfd8ce81abc4e
+          cargo +1.100.0 build --release --locked --manifest-path "$RUNNER_TEMP/control/fast/Cargo.toml"
+          cp "$CARGO_TARGET_DIR/release/shopping_sessions" "$RUNNER_TEMP/scored"
+          cargo +1.100.0 build --release --locked --manifest-path fast/Cargo.toml
+          cp "$CARGO_TARGET_DIR/release/shopping_sessions" "$RUNNER_TEMP/candidate"
+      - name: Get and verify public generator and dev answer
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -eu
+          for name in generator dev-answer; do
+            curl --fail --silent --show-error --location --retry 2 \
+              "https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/$name.zip" -o "$name.zip"
+          done
+          sha256sum -c <<'SUMS'
+          13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  generator.zip
+          7eb8e1f0b1f431d178d28ac9437ce85809c44eb6393fdd42fb59857f30834fa9  dev-answer.zip
+          SUMS
+          unzip -q generator.zip
+          unzip -q dev-answer.zip
+          cargo +1.100.0 build --release --locked --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+          generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output practice
+      - name: Check exact dev rows and benchmark start to exit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" -q install pyarrow
+          t=$(nproc)
+          if (( t > 8 )); then t=8; fi
+          export NCPU=$t RAYON_NUM_THREADS=$t
+          DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$RUNNER_TEMP/dev-out" "$RUNNER_TEMP/candidate" >"$RUNNER_TEMP/stdout"
+          test ! -s "$RUNNER_TEMP/stdout"
+          "$RUNNER_TEMP/venv/bin/python" tools/compare_outputs.py "$RUNNER_TEMP/dev-answer" "$RUNNER_TEMP/dev-out"
+          {
+            echo "### Native Linux/amd64 — $GITHUB_SHA"
+            echo '```'
+            lscpu | grep -E 'Model name:|Thread.s. per core:'
+            echo "Rayon workers: $t; five pairs; process start to exit, no container startup"
+            python3 tools/bench_pair.py "$RUNNER_TEMP/scored" "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/practice" \
+              --threads "$t" --tmpdir "$RUNNER_TEMP"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
