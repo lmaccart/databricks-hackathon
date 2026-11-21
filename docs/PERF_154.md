@@ -59,6 +59,9 @@ Each row uses five alternating whole-process pairs per seed. Compare **across th
 | [Timestamp-run click winners plus distinct assisting campaigns, vs `a32d0b7`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935456168) | 1.667 → 1.660 | 1.665 → 1.658 |
 | [Pooled payload and claim pages, vs `4ad0e5d`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935576863) | 1.552 → 1.540 | 1.559 → 1.562 |
 | [Encode a guaranteed session gap between consecutive ranks, vs `4933dbe`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935698391) | 1.531 → 1.547 | 1.486 → 1.495 |
+| [Pack small result counts at first write, vs `4ad0e5d`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935845158) | 1.579 → 1.576 | 1.555 → 1.532 |
+| [Size temporal streams using an already parsed prefix, vs `4933dbe`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935956505) | 1.967 → **1.866** | 1.935 → **1.861** |
+| [One bounded campaign/day counter table per worker, vs `4ad0e5d`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936005555) | 1.700 → **1.591** | 1.711 → **1.576** |
 
 The column writer won **10/10** pairs and cut the seed-7 output stage from 0.094 to 0.054 s. It emits each person's spelling once per run, carries typed numeric columns directly from session aggregation, and encodes nullable categories with bounded dictionaries. Singleton ranks won **9/10**; their strongest effect was in sessions (0.456 → 0.427 s on seed 7). A singleton can claim a previously empty slot only by comparing its full exact ID; occupants never move and a collision retains the full-width key.
 
@@ -77,5 +80,27 @@ Each row compares a component with and without the other change on the **same** 
 | [First-slot ranks + columns → physical graph slots + columns (`4933dbe`)](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935485266) | 1.729 → **1.681** | 5.170 → **4.994** |
 | [Physical graph slots → physical graph slots + columns](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935485357) | 1.697 → **1.642** | 5.335 → **5.007** |
 | [Scored control → Highway vector sort](https://github.com/lmaccart/databricks-hackathon/actions/runs/44934661503) | 2.026 → 1.975 | 6.208 → 6.274 |
+| [Scored control → slot-based union alone, AMD EPYC 9V74](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935468441) | 2.227 → **2.150** | 6.723 → **6.257** |
+| [Scored control → slot-based union, direct time ranges and columns (`0558eaa`), AMD EPYC 9V45](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935810599) | 1.792 → **1.617** | 5.451 → **4.618** |
 
 The initial singleton technique by itself added almost nothing to the columns in the two full-Docker comparisons on the Xeon 8370C. Replacing the graph construction as well made a measurable difference on the 6975P-C: every pair favored physical slots, including all three final-scale pairs. Keeping a slot as the union node eliminates endpoint sorting/deduplication and gives the parser a direct rank to write.
+
+For `0558eaa` each claimed slot already identifies the destination worker partition. A histogram gathers events, purchases and clicks into exact per-person ranges. Small ranges sort just `u32` millisecond offsets; large ranges summarize bins narrower than the gap, stitching only if the actual neighboring extrema are at most 1,800,000 ms apart. Sparse graphs, large windows and overflow identities retain exact alternatives. It won all 18 pairs versus `7fd1b76` in the AMD job. The direct-range build also matched all 6,629,430 rows on the second 60M seed with 8.31 GiB peak RSS, and matched the Python oracle on deliberately colliding singletons and four 10,000-node components at one and eight workers under short and centuries-wide windows.
+
+## Reproduce the comparisons
+
+```sh
+# Use an immutable, public full SHA for the trial and the exact scored control.
+control=7fd1b7602280cfce05ac97b6afb703fa42c0b6ba
+gh workflow run native-bench.yml --ref perf/practice-154 \
+  -f revision="$CANDIDATE" -f baseline="$control" -f challenge=true \
+  -f oracle=true -f containers=true -f scale_pairs=true
+
+# Locally: exact output through both the ranked and wide-window paths.
+make build
+.venv/bin/python tools/graph_diff.py fast/target/release/shopping_sessions
+.venv/bin/python tools/grammar_diff.py fast/target/release/shopping_sessions
+.venv/bin/python tools/opaque_diff.py vendor/dev fast/target/release/shopping_sessions
+```
+
+The timed inputs are the public generator’s seed 7 and leap-day seed 15 (20M events / 5M clicks) and seed 13 (60M / 15M). The independent second 60M input uses seed 948307. The native and Docker timers use fresh output directories; none of the pipelines read earlier results. Each input is warmed once per executable for the paired measurements. The inside-container self-reported timer alone is not used for promotion.

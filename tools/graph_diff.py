@@ -39,7 +39,7 @@ def write_parts(root, folder, header, lines, rng):
 def generate(root, large):
     root.mkdir()
     rng = random.Random(408 if large else 407)
-    (root / "products.csv").write_bytes(b"product_id,category\np1,one\n")
+    (root / "products.csv").write_bytes(b"product_id,category\np1,one\np2,two\n")
     (root / "campaigns.csv").write_bytes(b"campaign_id,channel\nc1,email\nc2,ads\n")
     links, people = [], []
     for group, family in enumerate(colliders()):
@@ -56,7 +56,9 @@ def generate(root, large):
             links.extend(edges)
             links.extend((b, a) for a, b in edges)
             links.append((b"\0" + str(group).encode() + b"-unused\0", chain[-1]))
-            people.extend(chain[1::39])
+            # More than 4,096 events per component exercises the bin reducer;
+            # rules still require the exact 30-minute comparison on both edges.
+            people.extend(chain[1::6])
     else:
         # More independent people than statically available ranks.
         people.extend(f"extra-{i}".encode() for i in range(1024))
@@ -67,7 +69,8 @@ def generate(root, large):
         for j, delta in enumerate((0, 1_800_000, 3_600_001, 90_000_000)):
             eid = f"e{i:06x}{j}".encode()
             tick = str(t + delta).encode()
-            events.append(b",".join([eid, person, tick, TS, b"purchase", b"p1", str(1 + i % 997).encode()]))
+            pid = b"p1" if (i+j) % 2 else b"p2"
+            events.append(b",".join([eid, person, tick, TS, b"purchase", pid, str(1 + i % 997).encode()]))
         for j, (delta, camp) in enumerate(((-604_800_000, b"c1"), (0, b"c2"), (0, b"c1"), (1_800_001, b"c1"))):
             click = b",".join((f"k{i:06x}{j}".encode(), person, camp, str(t+delta).encode()))
             clicks.extend([click, click])
