@@ -1,5 +1,39 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Temporal slab stitching diagnostic — 2026-11-21 UTC
+
+No replacement was implemented or benchmarked; retain `f4ac682` as the control,
+not a tested stitching candidate. Temporary instrumentation of its existing
+whole-owner sorted scan measured slab-local sessions on the 1M-event official
+dev set (eight workers, manifest-aligned, half-open UTC slabs). This is a
+post-sort diagnostic, not a simulation of parallel slab processing. Its
+instrumented output matched both dev-answer tables and wrote no stdout.
+
+| Slab width | Local sessions | First/last records | Near-boundary sessions | Actual cross-slab joins |
+|---|---:|---:|---:|---:|
+| 1 day | 182,823 | 147,322 | 21,625 | 3,457 |
+| 2 days | 180,976 | 128,219 | 10,531 | 1,610 |
+
+"First/last" counts up to two sessions for every owner/slab; "near-boundary"
+counts local sessions whose first or last event lies within 30 minutes of
+either slab edge (including the two outer window edges). The latter is a safe
+candidate superset for these day-sized slabs and shows that the obvious
+first/last count greatly overstates necessary stitching. The 2-day slabs
+contained 134,108–144,734 events each. Among 977,930 surviving events, the
+largest person had 19,313; the largest individual packed/wide owner-shard
+stream had 21,158, so splitting the hot owner could plausibly improve balance.
+The largest click stream for one packed/wide owner shard had 3,496 entries.
+These distributions do not establish performance or memory at 20M/60M.
+
+The current event claim target embeds an 8-bit owner destination and an
+ordinal into a particular parse-batch payload; direct slab routing needs a
+new exact locator scheme. Repartitioning the already committed payloads instead
+adds a full-data scatter. Interior aggregation must also merge exact
+person/day category totals across slabs, and clicks must remain accessible
+for the earliest start of a stitched chain. Neither cost has been measured.
+No crafted multi-boundary, fixture, dirty-seed, or speed tests of a slab
+algorithm were run; there is no correctness or speed claim for it.
+
 ## Experimental word-offset event parser — 2026-11-21 UTC
 
 For the seven-column canonical header, validate and pack 7–9 byte ASCII IDs
