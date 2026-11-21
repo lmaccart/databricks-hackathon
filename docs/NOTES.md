@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Compact event streams and direct click routing — 2026-11-21 UTC
+
+The first combined candidate, `012174f`, uses the canonical link-node rank and a checked timestamp offset as one 64-bit sort key. It puts price and category in a separate purchase stream, and retains the full-width time and person key when packing is impossible. Catalog lookups and click-owner prefetch are included. [Four-worker Intel, five paired process runs per seed](https://github.com/lmaccart/databricks-hackathon/actions/runs/44870672021): **2.087 → 1.876 s** on seed 7 and **2.074 → 1.859 s** on seed 15 (10.1% / 10.4% less wall time vs `4f75f52`). All rows matched on both seeds. Both dev checkers and 36 fixtures matched; all 60 official-generator cases (20 seeds at each of 10k, 100k and 1M) matched the independent Python implementation. [Component and alternative timings](PERF_178.md).
+
 ## Official practice: rebuild at 1.78 s — 2026-11-21 UTC
 
 Leif reports **1.78 s** on the rebuild submitted before the final-scale CI job finished, down from **5.03 s** on `cc9f33e` (**2.83× faster**). The exact submitted SHA was not specified. Use [`4f75f52`](https://github.com/lmaccart/databricks-hackathon/commit/4f75f526cef27623e406d2ec1008b40eb1935f23) as the fixed control for the next round; the subsequent `bcdc149` commit only recorded the CI result. These official and CI clocks are tracked separately.

@@ -30,9 +30,10 @@ impl<'a> Dimension<'a> {
                 max = max.max(i);
             }
         }
-        if matches.len() * 2 < result.map.len() || matches.is_empty() {
+        if matches.is_empty() || matches.len() < result.map.len().div_ceil(2) {
             return result;
         }
+        // suffix_index requires i < limit, so max + 1 cannot overflow.
         result.dense.resize(max + 1, None);
         for (i, value) in matches {
             result.dense[i] = Some(value);

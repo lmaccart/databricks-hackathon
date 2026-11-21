@@ -10,11 +10,10 @@ struct Claim {
     target: u32,
 }
 
-// One chunk starts at most CHUNK+1 rows: extending its final line never adds a
-// second newline. A row index within a bucket + its bucket number fit in u32.
-const _: () = assert!(NS.is_power_of_two() && (CHUNK + 1) * NS < u32::MAX as usize);
+// An emitted event has at least six commas. At most one row extends past
+// CHUNK, so the stream kind, per-stream ordinal and shard fit in the claim.
+const _: () = assert!(NS.is_power_of_two() && (CHUNK / 6 + 1) * 4 * NS < u32::MAX as usize);
 const NONE: u32 = u32::MAX;
-const KILLED: u32 = u32::MAX; // never a valid purchase price
 
 #[derive(Clone, Copy)]
 struct Location {
@@ -39,23 +38,32 @@ fn parse<'a>(
     people: &People<'a>,
     ws: i64,
     we: i64,
+    packing: Option<Packing>,
     hs: &RandomState,
-) -> (Vec<Vec<PEv>>, Vec<Vec<Claim>>) {
+) -> (Vec<Payload>, Vec<Vec<Claim>>) {
     let reserve = reserve_per_shard(c.data);
-    let mut payload: Vec<Vec<PEv>> = (0..NS).map(|_| Vec::with_capacity(reserve)).collect();
+    let mut payload: Vec<Payload> = (0..NS)
+        .map(|_| {
+            let mut p = Payload::default();
+            p.wide
+                .times
+                .reserve(if packing.is_some() { reserve / 2 } else { reserve });
+            if packing.is_some() {
+                p.packed.times.reserve(reserve / 2);
+            }
+            p
+        })
+        .collect();
     let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
     let mut emit = |e: Pending| {
         let mut target = NONE;
         if e.uid != 0 {
             let person = people.lookup(e.uid, e.hash);
-            let p = shard(person);
-            target = (payload[p].len() * NS + p) as u32;
-            payload[p].push(PEv {
-                person,
-                ts: e.ts,
-                price: e.price,
-                cat: e.cat,
+            let p = shard(match person {
+                Identity::Linked(routed) | Identity::Standalone(routed) => routed,
             });
+            let slot = payload[p].push(person, e.ts, e.price, e.cat, packing, people);
+            target = (slot * NS + p) as u32;
         }
         claims[shard(hs.hash_one(e.id))].push(Claim {
             id: e.id,
@@ -180,10 +188,14 @@ pub(super) fn by_person<'a>(
     people: &People<'a>,
     ws: i64,
     we: i64,
-    hs: &RandomState,
+    packing: Option<Packing>,
     log: &impl Fn(&str),
-) -> Vec<Vec<Vec<PEv>>> {
-    let parsed: Vec<_> = chunks.par_iter().map(|c| parse(c, sm, people, ws, we, hs)).collect();
+) -> Vec<Vec<Payload>> {
+    let hs = rs();
+    let parsed: Vec<_> = chunks
+        .par_iter()
+        .map(|c| parse(c, sm, people, ws, we, packing, &hs))
+        .collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
     let mut claims: Vec<Vec<_>> = (0..NS).map(|_| Vec::new()).collect();
@@ -203,12 +215,26 @@ pub(super) fn by_person<'a>(
         }
     }
     payloads.par_iter_mut().zip(by_batch).for_each(|(payload, locations)| {
+        if locations.is_empty() {
+            return;
+        }
         for target in locations {
             let x = target as usize;
-            payload[x % NS][x / NS].price = KILLED;
+            let bucket = &mut payload[x % NS];
+            let slot = x / NS;
+            let index = slot / 4;
+            match slot % 4 {
+                0 => bucket.packed.times[index] = u64::MAX,
+                1 => bucket.packed.purchases[index].price = 0,
+                2 => bucket.wide.times[index].ts = BAD,
+                _ => bucket.wide.purchases[index].price = 0,
+            }
         }
         for dest in payload {
-            dest.retain(|e| e.price != KILLED);
+            dest.packed.times.retain(|&key| key != u64::MAX);
+            dest.packed.purchases.retain(|p| p.price != 0);
+            dest.wide.times.retain(|key| key.ts != BAD);
+            dest.wide.purchases.retain(|p| p.price != 0);
         }
     });
     payloads

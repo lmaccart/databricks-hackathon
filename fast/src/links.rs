@@ -1,6 +1,6 @@
 //! Build the canonical-name lookup in parallel, including transitive paths
-//! that span input files. Node indexes are temporary; only exact keys escape.
-use super::{Chunk, Codec, for_rows};
+//! that span input files. Canonical node indexes also serve as exact sort ranks.
+use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -58,15 +58,36 @@ impl Lane {
 pub(super) struct People<'a> {
     pub(super) codec: Codec<'a>,
     lanes: Vec<Lane>,
+    roots: Vec<u64>,
     pub(super) count: usize,
+}
+
+// This bit is disjoint from the packed routing shard and the canonical node
+// index. It is internal to the link table, not reserved in arbitrary person keys.
+const LINKED: u64 = 1 << 63;
+const _: () = assert!(SHARD_SHIFT >= 32 && ((NS as u64 - 1) << SHARD_SHIFT) & LINKED == 0);
+
+#[derive(Clone, Copy)]
+pub(super) enum Identity {
+    Linked(u64), // shard bits at their normal position, root node index in low bits
+    Standalone(u64),
 }
 
 impl<'a> People<'a> {
     #[inline]
-    pub(super) fn lookup(&self, key: u64, h: u64) -> u64 {
+    pub(super) fn lookup(&self, key: u64, h: u64) -> Identity {
         let lane = &self.lanes[h as usize & (LANES - 1)];
         let s = lane.slots[lane.find(key, h)];
-        if s.key != 0 { s.value } else { h }
+        if s.value & LINKED != 0 {
+            Identity::Linked(s.value ^ LINKED)
+        } else {
+            Identity::Standalone(h)
+        }
+    }
+
+    #[inline]
+    pub(super) fn original(&self, rank: u32) -> u64 {
+        self.roots[rank as usize]
     }
 
     #[inline]
@@ -206,12 +227,21 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
                 }
             }
         });
+    let mut roots = keys;
+    roots.par_iter_mut().for_each(|k| *k = mix(*k));
     lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
         for slot in &mut lane.slots {
             if slot.key != 0 {
-                slot.value = mix(keys[root(&parent, (offsets[s] + slot.value as usize) as u32) as usize]);
+                let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
+                let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
+                slot.value = LINKED | routing | u64::from(rank);
             }
         }
     });
-    People { codec, lanes, count }
+    People {
+        codec,
+        lanes,
+        roots,
+        count,
+    }
 }

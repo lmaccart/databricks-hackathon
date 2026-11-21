@@ -189,6 +189,62 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_purchase_stream_preserves_multiplicity_dedup_and_session_start_day(self):
+        before = "2026-10-01T23:55:00Z"
+        after = "2026-10-02T00:05:00Z"
+        isolated = "2026-10-02T00:35:00Z"
+        uid = "very long álias"
+        canonical = "A canonical name"
+        u, c = run_case(
+            events=[
+                ev("first", uid, before),
+                ev("p0", uid, after, "purchase", "p1", "13"),
+                ev("p1", canonical, after, "purchase", "p2", "11"),
+                ev("p2", canonical, after, "purchase", "p1", "7"),
+                ev("killed", uid, after, "purchase", "p3", "999", ingest=after),
+                ev("edge", uid, isolated, "cart", price="999"),
+                ev("next", uid, str(ms(isolated) + 30 * MIN + 1), "purchase", "p3", "20"),
+                ev("other", "other", after, "purchase", "p3", "5"),
+            ],
+            extra={"events/part-1.csv": [
+                ev("killed", "different", "bad", ingest=before),
+                ev("p1", "different", after, "purchase", "p3", "999", ingest=isolated),
+            ]},
+            links=[f"{uid},{canonical}"],
+            clicks=[f"k1,{uid},c_1,{before}", f"k2,{canonical},c_2,{after}"],
+        )
+        first = u[(canonical, "2026-10-01")]
+        self.assertEqual((first["sessions"], first["events"], first["revenue_cents"],
+                          first["top_category"]), (1, 5, 31, "shoes"))
+        self.assertEqual(u[(canonical, "2026-10-02")]["revenue_cents"], 20)
+        self.assertEqual(u[("other", "2026-10-02")]["revenue_cents"], 5)
+        self.assertEqual(set(k[0] for k in u), {canonical, "other"})
+        self.assertEqual(c[("c_1", "2026-10-01")]["revenue_cents"], 31)
+        self.assertEqual(c[("c_2", "2026-10-02")]["revenue_cents"], 20)
+
+    def test_sparse_wide_window_with_large_timestamp_spans(self):
+        lo = "0001-01-01T00:00:00Z"
+        late = "9998-12-31T00:00:00Z"
+        person = "person with a large span"
+        for hi in ("9999-01-01T00:00:00Z", str(2**63 - 1)):
+            with self.subTest(window_end=hi):
+                u, c = run_case(
+                    window=(lo, hi),
+                    events=[
+                        ev("e1", person, lo, ingest=lo),
+                        ev("e2", "z alias", str(ms(late)), "purchase",
+                           "missing", "10000000", ingest=late),
+                        ev("e3", "another", late, ingest=late),
+                    ],
+                    links=[f"{person},z alias"],
+                    clicks=[f"k,{person},c_3,{late}"],
+                )
+                self.assertEqual(u[(person, "0001-01-01")]["events"], 1)
+                row = u[(person, "9998-12-31")]
+                self.assertEqual((row["sessions"], row["events"], row["revenue_cents"],
+                                  row["top_category"]), (1, 1, 10000000, "unknown"))
+                self.assertEqual(c[("c_3", "9998-12-31")]["revenue_cents"], 10000000)
+
     def test_no_survivors_still_writes_both_empty_tables(self):
         u, c = run_case(events=[ev("e", "", WS)], clicks=[f"k,u,c_1,{WS}"])
         self.assertEqual((u, c), ({}, {}))
@@ -345,29 +401,39 @@ class Clicks(unittest.TestCase):
 class ByteDistinctIds(unittest.TestCase):
     def test_dimension_spellings_and_pipelined_click_ties(self):
         s = ms("2026-10-09T12:00:00Z")
-        products = ["p1,first", "p2,second", "p01,padded", "P1,upper",
+        products = ["p1,first", "p2,second", "p3,third", "p4,fourth", "p5,fifth", "p01,padded", "P1,upper",
                     "p\u00e91,unicode", "p\x001,nul", "p999999999999999999999999999,large"]
-        campaigns = ["c_1,one", "c_2,two", "c_01,padded", "C_1,upper",
+        campaigns = ["c_1,one", "c_2,two", "c_3,three", "c_4,four", "c_5,five", "c_01,padded", "C_1,upper",
                      "c_\u00e91,unicode", "c_\x001,nul",
                      "c_999999999999999999999999999,large"]
         # More than one FIFO rotation, including external and zero-padded keys.
-        clicks = [f"z{i},user,c_1,{s - HOUR}" for i in range(40)]
-        clicks += [f"\u00e9,user,c_2,{s - HOUR}", f"a\x00,user,c_01,{s - HOUR}",
-                   f"a,user,C_1,{s - HOUR}", f"b,user,c_\u00e91,{s - HOUR}",
-                   f"c,user,c_\x001,{s - HOUR}",
-                   f"d,user,c_999999999999999999999999999,{s - HOUR}",
-                   f"bad,user,c_001,{s - HOUR}"]
+        clicks = [f"z{i},alias,c_1,{s - HOUR}" for i in range(40)]
+        clicks += [f"\u00e9,user,c_2,{s - HOUR}", f"a\x00,alias,c_01,{s - HOUR}",
+                   f"a,alias,C_1,{s - HOUR}", f"b,user,c_\u00e91,{s - HOUR}",
+                   f"c,alias,c_\x001,{s - HOUR}",
+                   f"d,alias,c_999999999999999999999999999,{s - HOUR}",
+                   f"bad,alias,c_001,{s - HOUR}",
+                   f'0,alias,c_4,{s - HOUR},extra',  # malformed; would win the tie
+                   f'"a",alias,"C_1",{s - HOUR}',  # identical parsed copy
+                   f"solo,standalone,c_3,{s - HOUR}"]
         events = [ev(f"e{i}", "user", str(s), "purchase", product, str(i + 1))
                   for i, product in enumerate(("p1", "p2", "p01", "P1", "p\u00e91",
                                                 "p\x001", "p999999999999999999999999999", "p001"))]
-        users, result = run_case(events=events, clicks=clicks, products=products, campaigns=campaigns)
-        day = "2026-10-09"
-        self.assertEqual(users[("user", day)]["top_category"], "unknown")
-        self.assertEqual(result[("C_1", day)]["sessions"], 1)
-        for campaign in ("c_1", "c_2", "c_01", "C_1", "c_\u00e91", "c_\x001",
-                         "c_999999999999999999999999999"):
-            self.assertEqual(result[(campaign, day)]["assisted_sessions"], 1)
-        self.assertNotIn(("c_001", day), result)
+        events.append(ev("solo", "standalone", str(s)))
+        for window in ((WS, WE), ("0001-01-01T00:00:00Z", str(2**63 - 1))):
+            with self.subTest(window=window):
+                users, result = run_case(events=events, clicks=clicks, links=["user,alias"],
+                                         products=products, campaigns=campaigns, window=window)
+                day = "2026-10-09"
+                self.assertEqual(set(users), {("alias", day), ("standalone", day)})
+                self.assertEqual(users[("alias", day)]["top_category"], "unknown")
+                self.assertEqual(result[("C_1", day)]["sessions"], 1)
+                self.assertEqual(result[("c_3", day)]["sessions"], 1)
+                for campaign in ("c_1", "c_2", "c_01", "C_1", "c_\u00e91", "c_\x001",
+                                 "c_999999999999999999999999999"):
+                    self.assertEqual(result[(campaign, day)]["assisted_sessions"], 1)
+                self.assertNotIn(("c_001", day), result)
+                self.assertNotIn(("c_4", day), result)
 
     def test_lookalike_ids_and_lexical_click_tie(self):
         s = ms("2026-10-09T12:00:00Z")
