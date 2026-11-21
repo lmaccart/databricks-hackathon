@@ -2,6 +2,8 @@
 
 A native Rust entry for the [Databricks Shopping Sessions buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). It reads the mounted CSVs, resolves linked identities, deduplicates events, sessionizes, attributes clicks and assists, and writes `user_daily/` and `campaign_daily/` as Parquet. [Official rules](docs/rules.md) · [architecture](ARCHITECTURE.md) · [review, measurements and open checks](docs/NOTES.md).
 
+**Performance:** the organizer scored the original `cc9f33e` at **5.03 s**. In paired 20M-event native Linux runs with four workers, the rebuild took **2.078 s vs 6.112 s on Intel** and **2.635 s vs 7.708 s on AMD**—about 2.9× faster in both environments. These are measured process times, not a hidden practice score. The independent dev answer, all 36 official fixtures, 60 generator comparisons, and a row-for-row 60M comparison passed.
+
 ## Build and run
 
 ```sh
@@ -32,6 +34,8 @@ make check-dev OUT=out
 ```
 
 `make fixtures` checks the Rust binary and the independent Python oracle against the starter's hand-written answers. `make check-dev` uses both the official comparer and a second per-key diff. `tools/official_diff.py` runs differential checks on other official seeds. `python tools/bench_pair.py BASELINE CANDIDATE DATA_DIR` compares five alternating-order pairs, with fresh output directories and one warmup per binary. The competition clock also includes container startup. The optional **Native amd64 performance check** GitHub workflow runs the same comparison against the 5.03 s scored revision on a Linux runner and reports its actual worker count.
+
+For manual CI runs, select `containers` for paired full Docker invocations, `scale` for a 60M exact check, or `extended` to reproduce the allocator/CPU-dispatch trials. All inputs are generated on the runner; none are in the repository.
 
 ## Credits
 
