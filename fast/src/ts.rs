@@ -181,28 +181,6 @@ pub fn parse_ingest(s: &[u8]) -> i64 {
 
 const CLOCK_TEMPLATE: u64 = word(b"T00:00:0");
 const CLOCK_ADD: u64 = word(&[L, D, D, L, D, D, L, D]);
-const FIVE: u8 = 0x7F - 5;
-// Byte 12 (hour ones) is already validated by the shared prefix.
-const T_SUBHOUR: u64 = word(b"\0:00:00Z");
-const A_SUBHOUR: u64 = word(&[0, L, FIVE, D, L, FIVE, D, L]);
-const SUBHOUR_TENS: u64 = 0x0000_FF00_00FF_0000;
-
-#[inline(always)]
-fn subhour_seconds(tail: u64) -> i64 {
-    let pairs = (tail & SUBHOUR_TENS) * 10 + ((tail >> 8) & SUBHOUR_TENS);
-    b(pairs, 2) * 60 + b(pairs, 5)
-}
-
-/// `tail` has validated, template-XORed minute and second digits, while
-/// `prev` has the original event's validated ASCII digits in the same lanes.
-#[inline(always)]
-fn subhour_delta(tail: u64, prev: u64) -> i64 {
-    const DIGITS: u64 = 0x00FF_FF00_FFFF_0000;
-    // Bias each digit delta by 10 so the subtract can't borrow across
-    // bytes. Each base-10 pair then fits in one byte (at most 209).
-    let digits = ((tail & DIGITS) + (0x3A3A_3A3A_3A3A_3A3A & DIGITS)) - (prev & DIGITS);
-    subhour_seconds(digits) - 110 * (60 + 1)
-}
 
 const fn minute_table() -> [i32; 65536] {
     let mut table = [-1; 65536];
@@ -287,103 +265,43 @@ impl ManifestClock {
         });
     }
 
-    #[inline(always)]
-    fn cached_midnight(&self, s: &[u8], first: u64) -> Option<i64> {
+    /// `s` has the F1 length and a date separator at byte 4.
+    #[inline]
+    fn f1_seconds(&self, s: &[u8]) -> i64 {
         let tens = s[8].wrapping_sub(b'0');
         let ones = s[9].wrapping_sub(b'0');
         if tens <= 3 && ones <= 9 {
             let day = usize::from(tens) * 10 + usize::from(ones);
             if let Some(entries) = self.days.get(day) {
+                let first = load8(s, 0);
                 let last = u16::from_le_bytes([s[8], s[9]]);
                 for entry in entries {
                     if entry.first == first && entry.last == last {
-                        return Some(entry.midnight_seconds);
+                        let t = load8(s, 10) ^ CLOCK_TEMPLATE;
+                        let last_second = s[18].wrapping_sub(b'0');
+                        if !fits(t, CLOCK_ADD) || last_second > 9 || s[19] != b'Z' {
+                            return BAD;
+                        }
+                        let index = ((b(t, 1) as usize) << 12)
+                            | ((b(t, 2) as usize) << 8)
+                            | ((b(t, 4) as usize) << 4)
+                            | b(t, 5) as usize;
+                        let minute_seconds = MINUTES[index];
+                        let seconds = b(t, 7) * 10 + i64::from(last_second);
+                        if minute_seconds < 0 || seconds > 59 {
+                            return BAD;
+                        }
+                        return entry.midnight_seconds + i64::from(minute_seconds) + seconds;
                     }
                 }
             }
         }
-        None
-    }
-
-    /// `s` has the F1 length and a date separator at byte 4.
-    #[inline]
-    fn f1_seconds(&self, s: &[u8]) -> i64 {
-        let Some(midnight) = self.cached_midnight(s, load8(s, 0)) else {
-            return iso::<false, true>(s);
-        };
-        let t = load8(s, 10) ^ CLOCK_TEMPLATE;
-        let last_second = s[18].wrapping_sub(b'0');
-        if !fits(t, CLOCK_ADD) || last_second > 9 || s[19] != b'Z' {
-            return BAD;
-        }
-        let index =
-            ((b(t, 1) as usize) << 12) | ((b(t, 2) as usize) << 8) | ((b(t, 4) as usize) << 4) | b(t, 5) as usize;
-        let minute_seconds = MINUTES[index];
-        let seconds = b(t, 7) * 10 + i64::from(last_second);
-        if minute_seconds < 0 || seconds > 59 {
-            return BAD;
-        }
-        midnight + i64::from(minute_seconds) + seconds
+        iso::<false, true>(s)
     }
 
     #[inline]
     pub fn event_f1_seconds(&self, s: &[u8; 20]) -> i64 {
         self.f1_seconds(s)
-    }
-
-    /// Validate a shared F1 date and hour once, then decode the signed clock
-    /// delta only after proving both tails. Other dates use the full parser.
-    #[inline(always)]
-    pub fn event_f1_pair(&self, event: &[u8; 20], ingest: &[u8; 20]) -> Option<(i64, i64)> {
-        let date = load8(event, 0);
-        let last = load8(event, 5);
-        let first_diff = date ^ load8(ingest, 0);
-        let last_diff = last ^ load8(ingest, 5);
-        if (first_diff | last_diff) != 0 {
-            return self.f1_pair_fallback(event, ingest, first_diff | (last_diff & 0xFF_FFFF_FFFF));
-        }
-        let Some(midnight) = self.cached_midnight(event, date) else {
-            return self.f1_pair_fallback(event, ingest, 0);
-        };
-        let t = (last >> 40) ^ u64::from_le_bytes(*b"T00\0\0\0\0\0");
-        let hour = b(t, 1) * 10 + b(t, 2);
-        let previous = (load8(event, 12) & !0xFF) ^ T_SUBHOUR;
-        let next = (load8(ingest, 12) & !0xFF) ^ T_SUBHOUR;
-        if !(fits(t, word(&[L, D, D, 0, 0, 0, 0, 0])) & fits(previous, A_SUBHOUR) & fits(next, A_SUBHOUR)) || hour > 23
-        {
-            return None;
-        }
-        let hour_start = midnight + hour * 3600;
-        // event + (ingest subhour - event subhour), with the event terms
-        // canceled so neither clock is converted twice.
-        Some((
-            hour_start + subhour_seconds(previous),
-            hour_start + subhour_seconds(next),
-        ))
-    }
-
-    #[cold]
-    fn f1_pair_fallback(&self, event: &[u8; 20], ingest: &[u8; 20], changed_date: u64) -> Option<(i64, i64)> {
-        let seconds = self.f1_seconds(event);
-        if seconds == BAD {
-            return None;
-        }
-        if changed_date != 0 {
-            let next = self.f1_seconds(ingest);
-            return (next != BAD).then_some((seconds, next));
-        }
-        // Same date, but the hour may differ. Validate the entire new clock.
-        let t = load8(ingest, 10) ^ CLOCK_TEMPLATE;
-        let tail = (load8(ingest, 12) & !0xFF) ^ T_SUBHOUR;
-        let hour = b(t, 1) * 10 + b(t, 2);
-        if !(fits(t, CLOCK_ADD) & fits(tail, A_SUBHOUR)) || hour > 23 {
-            return None;
-        }
-        let prev_hour = i64::from((event[11] - b'0') * 10 + (event[12] - b'0'));
-        Some((
-            seconds,
-            seconds + (hour - prev_hour) * 3600 + subhour_delta(tail, load8(event, 12)),
-        ))
     }
 
     #[inline(always)]
@@ -546,53 +464,6 @@ mod tests {
             (if ms == BAD { i64::MAX } else { ms }, seconds),
             "{s:?}"
         );
-    }
-
-    #[test]
-    fn paired_ingest_matches_strict_f1_for_every_clock_and_mutated_byte() {
-        let clock = ManifestClock::new(want(b"1969-12-30T00:00:00Z"), want(b"1970-01-02T00:00:00Z"));
-        for (event, base) in [
-            (*b"1969-12-31T00:00:00Z", *b"1969-12-31T00:00:00Z"),
-            (*b"1969-12-31T12:34:56Z", *b"1969-12-31T12:09:07Z"),
-            (*b"1969-12-31T23:59:59Z", *b"1969-12-31T01:02:03Z"),
-            (*b"1969-12-31T23:59:59Z", *b"1970-01-01T00:00:00Z"),
-            (*b"2028-02-29T12:39:59Z", *b"2028-02-29T12:40:00Z"), // uncached
-            (*b"2028-02-29T23:59:59Z", *b"2028-03-01T00:00:00Z"),
-        ] {
-            let check = |event: &[u8; 20], ingest: &[u8; 20]| {
-                let (prev, next) = (want(event), want(ingest));
-                let expected = (prev != BAD && next != BAD).then_some((prev / 1000, next / 1000));
-                assert_eq!(clock.event_f1_pair(event, ingest), expected, "{event:?}, {ingest:?}");
-            };
-            for pos in 0..base.len() {
-                for byte in 0..=255 {
-                    let mut ingest = base;
-                    ingest[pos] = byte;
-                    check(&event, &ingest);
-                    let mut altered_event = event;
-                    altered_event[pos] = byte;
-                    check(&altered_event, &base);
-                    check(&altered_event, &ingest);
-                }
-            }
-        }
-
-        let event = b"1969-12-31T09:39:59Z";
-        let event_sec = want(event) / 1000;
-        let midnight = want(b"1969-12-31T00:00:00Z") / 1000;
-        for second in 0..86_400 {
-            let ingest = format!(
-                "1969-12-31T{:02}:{:02}:{:02}Z",
-                second / 3600,
-                second / 60 % 60,
-                second % 60
-            );
-            assert_eq!(
-                clock.event_f1_pair(event, ingest.as_bytes().try_into().unwrap()),
-                Some((event_sec, midnight + second)),
-                "{ingest}"
-            );
-        }
     }
 
     #[test]
