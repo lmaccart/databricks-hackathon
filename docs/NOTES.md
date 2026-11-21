@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round four: slot-indexed range reduction — 2026-11-21
+
+Port of `be4a89c` onto `4933dbe` for a direct final-scale comparison. The flat CAS graph is unchanged: the physical slot anchors identity and `slot & 255` still selects its owner. The range path indexes the owner-local histogram by `slot >> 8`, without a rank remap or another hash. Compact offsets and exact bins feed the same `finish_user_day` and `finish_person` calls as the full-width path. The columnar writer is unchanged from `4ad0e5d`. Singletons that cannot claim a slot and windows too wide for a 32-bit offset keep full-width time and exact identity. The prior standalone range branch reportedly won all ten 20M pairs by 3.5% / 2.5% against `a32d0b7`; those figures are not timings for this integration.
+
+Validation: 44 Python edge cases on both implementations, 24 Rust tests, all 36 official fixtures on both implementations, and all 10 dirty diffs. Both dev checkers matched 117,038 user rows and 27,400 campaign rows with no stdout. The 100k opaque/reordered input from seed 15 matched at one and eight workers. Clippy passed. No local run exceeded 1M events.
+
+On the 1M dev set, 21 alternating eight-worker native pairs against `4933dbe` measured **0.050 → 0.049 s** wall time (1.3% less; median paired savings 1.5%, 15/21 wins) and **0.009 → 0.008 s** in the session phase. Raw runs are in the ignored `scratch/slotranges-dev.json`. This does not establish a final-scale speedup; the 60M head-to-head remains to be run.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).

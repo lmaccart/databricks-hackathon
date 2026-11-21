@@ -44,18 +44,27 @@ pub(super) struct People<'a> {
     slots: Vec<Slot>,
     mask: usize,
     pub(super) count: usize,
-    pub(super) rank_limit: usize,
+    pub(super) local_slots: usize,
 }
 
-// This bit is disjoint from the packed routing shard and the canonical node
-// index. It is internal to the link table, not reserved in arbitrary person keys.
+// This bit distinguishes immutable links from slots that may admit singletons.
 const LINKED: u64 = 1 << 63;
-const _: () = assert!(SHARD_SHIFT >= 32 && ((NS as u64 - 1) << SHARD_SHIFT) & LINKED == 0);
+const _: () = assert!(NS == 256);
 
 #[derive(Clone, Copy)]
 pub(super) enum Identity {
-    Linked(u64), // shard bits at their normal position, root node index in low bits
+    Ranked(u32), // exact physical slot, including the owner in the low byte
     Standalone(u64),
+}
+
+impl Identity {
+    #[inline]
+    pub(super) fn owner(self) -> usize {
+        match self {
+            Self::Ranked(rank) => rank as usize & (NS - 1),
+            Self::Standalone(key) => ((key >> SHARD_SHIFT) as usize) & (NS - 1),
+        }
+    }
 }
 
 impl<'a> People<'a> {
@@ -68,7 +77,7 @@ impl<'a> People<'a> {
             let occupant = slot.key.load(Relaxed);
             let value = slot.value;
             if occupant == key {
-                return Identity::Linked(value & !LINKED);
+                return Identity::Ranked(value as u32);
             }
             if value & LINKED == 0 {
                 // Every singleton with this home probes the same bounded set
@@ -77,7 +86,7 @@ impl<'a> People<'a> {
                 if occupant == 0 {
                     let got = slot.key.compare_exchange(0, key, Relaxed, Relaxed);
                     if got.is_ok() || got == Err(key) {
-                        return Identity::Linked(value);
+                        return Identity::Ranked(value as u32);
                     }
                 }
                 holes -= 1;
@@ -149,7 +158,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         })
         .collect();
     let n: usize = edges.iter().map(Vec::len).sum();
-    let cap = (n * 2 + n / 2 + 1).max(256).next_power_of_two();
+    let cap = (n * 2 + n / 2 + 1).max(NS).next_power_of_two();
     assert!(u32::try_from(cap).is_ok(), "alias table exceeds addressable memory");
     let mask = cap - 1;
     let mut slots: Vec<_> = (0..cap).into_par_iter().map(|_| Slot::default()).collect();
@@ -212,7 +221,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         .map(|(i, slot)| {
             let linked = *slot.key.get_mut() != 0;
             let rank = u64::from(if linked { root(&parent, i as u32) } else { i as u32 });
-            slot.value = (if linked { LINKED } else { 0 }) | ((rank & (NS as u64 - 1)) << SHARD_SHIFT) | rank;
+            slot.value = (if linked { LINKED } else { 0 }) | rank;
             usize::from(linked)
         })
         .sum();
@@ -221,7 +230,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         slots,
         mask,
         count,
-        rank_limit: cap,
+        local_slots: cap / NS,
     }
 }
 
@@ -254,9 +263,10 @@ mod slot_tests {
             .map(|i| {
                 let (k, h) = pair[i % pair.len()];
                 match names.lookup(k, h) {
-                    Identity::Linked(v) => {
-                        assert_eq!(names.original(v as u32), h);
-                        (true, v)
+                    Identity::Ranked(v) => {
+                        assert_eq!(names.original(v), h);
+                        assert!(v as usize >> NS.trailing_zeros() < names.local_slots);
+                        (true, u64::from(v))
                     }
                     Identity::Standalone(v) => {
                         assert_eq!(v, h);
@@ -272,10 +282,10 @@ mod slot_tests {
         let root = mix(crate::person::inline(b"Aroot").unwrap());
         for bytes in [b"Aroot".as_slice(), b"Zalias", b"Balias"] {
             let k = crate::person::inline(bytes).unwrap();
-            let Identity::Linked(v) = names.lookup(k, mix(k)) else {
+            let Identity::Ranked(v) = names.lookup(k, mix(k)) else {
                 panic!("alias displaced");
             };
-            assert_eq!(names.original(v as u32), root);
+            assert_eq!(names.original(v), root);
         }
     }
 }
