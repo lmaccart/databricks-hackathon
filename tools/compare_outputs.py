@@ -32,7 +32,7 @@ TABLES = {
 }
 
 
-def _norm(table, col, v):
+def _norm_csv(table, col, v):
     if v is None:
         return None
     if col in TABLES[table]["ints"]:
@@ -60,15 +60,25 @@ def load_parquet_dir(path, table, problems):
     for f in files:
         t = pq.read_table(os.path.join(path, f))
         names = set(t.column_names)
-        if names != want:
+        if names != want or len(t.column_names) != len(want):
             problems.append(f"{table}/{f}: columns {sorted(names)} != {sorted(want)}")
-        if "day" in names and not pa.types.is_date(t.schema.field("day").type):
+            continue
+        if not pa.types.is_date32(t.schema.field("day").type):
             problems.append(f"{table}/{f}: day is {t.schema.field('day').type}, must be a Parquet DATE")
         for col in TABLES[table]["ints"]:
             if col in names and not pa.types.is_integer(t.schema.field(col).type):
                 problems.append(f"{table}/{f}: {col} is {t.schema.field(col).type}, must be an integer")
+        for col in want - set(TABLES[table]["ints"]) - {"day"}:
+            dtype = t.schema.field(col).type
+            if pa.types.is_dictionary(dtype):
+                dtype = dtype.value_type
+            if not (pa.types.is_string(dtype) or pa.types.is_large_string(dtype)
+                    or getattr(pa.types, "is_string_view", lambda _: False)(dtype)):
+                problems.append(f"{table}/{f}: {col} is {dtype}, must be a string")
         for r in t.to_pylist():
-            rows.append({c: _norm(table, c, r.get(c)) for c in TABLES[table]["cols"]})
+            if r["day"] is not None:
+                r["day"] = str(r["day"])
+            rows.append(r)
     return rows
 
 
@@ -76,7 +86,7 @@ def load_csv(path, table):
     rows = []
     with open(path, newline="", encoding="utf-8") as fh:
         for r in csv.DictReader(fh):
-            rows.append({c: _norm(table, c, r.get(c)) for c in TABLES[table]["cols"]})
+            rows.append({c: _norm_csv(table, c, r.get(c)) for c in TABLES[table]["cols"]})
     return rows
 
 
