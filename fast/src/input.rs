@@ -24,7 +24,7 @@ pub struct Inputs {
 impl Inputs {
     pub fn new() -> Self {
         Self {
-            enabled: cfg!(target_os = "linux") && std::env::var_os("SS_INPUT_VM").as_deref() == Some("huge".as_ref()),
+            enabled: cfg!(target_os = "linux") && std::env::var_os("SS_INPUT_VM").as_deref() != Some("stock".as_ref()),
             diagnostic: std::env::var_os("SS_VM_DIAG").as_deref() == Some("1".as_ref()),
             ..Self::default()
         }
