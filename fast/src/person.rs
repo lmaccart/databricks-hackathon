@@ -4,7 +4,7 @@
 use crate::{Map, rs};
 use std::sync::RwLock;
 
-const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+pub(super) const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
 const EXTERNAL: u64 = 1 << 63;
 const LANES: usize = 64;
 
@@ -29,11 +29,17 @@ pub fn inline(bytes: &[u8]) -> Option<u64> {
     if word & HIGH_BITS != 0 || tail > 127 {
         return None;
     }
+    Some(pack_ascii(word, tail))
+}
+
+/// Pack eight big-endian ASCII lanes plus one final ASCII lane.
+#[inline]
+pub(super) fn pack_ascii(word: u64, tail: u8) -> u64 {
     // Compress unsigned byte pairs, then quads, then the entire word.
     let pairs = (word & 0x007f_007f_007f_007f) | ((word >> 1) & 0x3f80_3f80_3f80_3f80);
     let quads = (pairs & 0x0000_3fff_0000_3fff) | ((pairs >> 2) & 0x0fff_c000_0fff_c000);
     let eight = (quads & 0x0fff_ffff) | ((quads >> 4) & 0x00ff_ffff_f000_0000);
-    Some((eight << 7) | u64::from(tail))
+    (eight << 7) | u64::from(tail)
 }
 
 #[derive(Default)]

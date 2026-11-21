@@ -343,6 +343,27 @@ class Clicks(unittest.TestCase):
 
 
 class ByteDistinctIds(unittest.TestCase):
+    def test_structural_families_do_not_absorb_lookalike_ids(self):
+        t = "2026-10-02T10:00:00Z"
+        # A large common family is mostly unused. Only explicit links can
+        # combine spellings, and a spill ID can still be the minimum.
+        names = [f"x{i:08d}" for i in range(256)]
+        separate = ["x00000000\0", "x0000000\0", "x0000000", "x+0000000",
+                    "x-0000000", "x００００００００", "xx0000000", "X00000000",
+                    "x00000256", "x00000300"]
+        minimum = "A\0"
+        u, c = run_case(
+            events=[ev("one", names[0], t), ev("two", names[-1], t)]
+                   + [ev(f"e{i}", uid, t) for i, uid in enumerate(separate)],
+            clicks=[f"c1,{names[1]},c_1,{t}", f"c2,{separate[1]},c_2,{t}"],
+            links=[f'{name},{names[0]}' for name in names]
+                  + [f'"{minimum}",{names[-1]}'],
+        )
+        self.assertEqual({key[0]: row["events"] for key, row in u.items()},
+                         {minimum: 2, **dict.fromkeys(separate, 1)})
+        self.assertEqual(c[("c_1", "2026-10-02")]["sessions"], 1)
+        self.assertEqual(c[("c_2", "2026-10-02")]["sessions"], 1)
+
     def test_lookalike_ids_and_lexical_click_tie(self):
         s = ms("2026-10-09T12:00:00Z")
         k = s - HOUR

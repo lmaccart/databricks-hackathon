@@ -1,5 +1,16 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 2 identity lookup challenger
+
+Learn a frequent first byte and width from linked keys, then probe one aligned
+cache line using the entire raw suffix as the tag. This also handles mixed
+alphanumeric suffixes: the index is just a hash, never proof of equality.
+Store only aliases whose name changes; a miss in a non-overflowed bucket is
+therefore the original ID. Other shapes, non-ASCII, trailing NUL, and
+overflowed-bucket misses retain the old exact lookup. Person tokens and the
+union-find naming rule are unchanged. No large timing run in this worktree;
+native timing is delegated to the parent session.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.

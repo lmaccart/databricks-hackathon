@@ -19,6 +19,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 mod events;
+mod identity;
 mod links;
 mod output;
 mod person;

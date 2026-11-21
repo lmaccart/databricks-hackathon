@@ -1,6 +1,7 @@
 //! Build the canonical-name lookup in parallel, including transitive paths
 //! that span input files. Node indexes are temporary; only exact keys escape.
 use super::{Chunk, Codec, for_rows};
+use crate::identity::{self, BuildParts, Family, Match, Shape};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -58,29 +59,72 @@ impl Lane {
 pub(super) struct People<'a> {
     pub(super) codec: Codec<'a>,
     lanes: Vec<Lane>,
+    family: Option<Family>,
     pub(super) count: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) enum Probe {
+    #[default]
+    None,
+    Exact(u64, u64),
+    Structural(u64, usize),
 }
 
 impl<'a> People<'a> {
     #[inline]
     pub(super) fn resolve(&self, uid: &'a [u8]) -> u64 {
-        let key = self.codec.key(uid);
-        let h = mix(key);
-        self.lookup(key, h)
+        self.lookup(self.prepare(uid))
     }
 
     #[inline]
-    pub(super) fn lookup(&self, key: u64, h: u64) -> u64 {
+    pub(super) fn prepare(&self, uid: &'a [u8]) -> Probe {
+        if let Some(family) = &self.family {
+            if let Some(raw) = family.shape.raw(uid) {
+                return Probe::Structural(raw, family.index(raw));
+            }
+        }
+        let key = self.codec.key(uid);
+        Probe::Exact(key, mix(key))
+    }
+
+    #[inline]
+    pub(super) fn lookup(&self, probe: Probe) -> u64 {
+        match probe {
+            Probe::None => 0,
+            Probe::Exact(key, h) => self.lookup_exact(key, h),
+            Probe::Structural(raw, index) => {
+                let family = self.family.as_ref().unwrap();
+                match family.lookup(index, raw) {
+                    Match::Canonical(name) => name,
+                    Match::Unlinked => mix(family.exact_key(raw)),
+                    Match::Overflow => {
+                        let key = family.exact_key(raw);
+                        self.lookup_exact(key, mix(key))
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn lookup_exact(&self, key: u64, h: u64) -> u64 {
         let lane = &self.lanes[h as usize & (LANES - 1)];
         let s = lane.slots[lane.find(key, h)];
         if s.key != 0 { s.value } else { h }
     }
 
     #[inline]
-    pub(super) fn prefetch(&self, h: u64) {
-        let lane = &self.lanes[h as usize & (LANES - 1)];
-        let i = (h >> LANES.trailing_zeros()) as usize & lane.mask;
-        let addr = &lane.slots[i] as *const Slot;
+    pub(super) fn prefetch(&self, probe: Probe) {
+        let addr = match probe {
+            Probe::Exact(_, h) => {
+                let lane = &self.lanes[h as usize & (LANES - 1)];
+                let i = (h >> LANES.trailing_zeros()) as usize & lane.mask;
+                (&lane.slots[i] as *const Slot).cast::<u8>()
+            }
+            Probe::Structural(_, index) => self.family.as_ref().unwrap().address(index),
+            Probe::None => return,
+        };
         // Only an in-bounds address in an immutable, live table; prefetch is
         // a hint, never an actual read used for a decision.
         #[cfg(target_arch = "x86_64")]
@@ -174,6 +218,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         u32::try_from(count).is_ok(),
         "too many linked IDs for addressable memory"
     );
+    let shape = Shape::learn(&groups);
     let keys: Vec<u64> = groups.into_iter().flatten().collect();
     let parent: Vec<_> = (0..count as u32).map(AtomicU32::new).collect();
     let index = |key| {
@@ -213,12 +258,34 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
                 }
             }
         });
-    lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
-        for slot in &mut lane.slots {
-            if slot.key != 0 {
-                slot.value = mix(keys[root(&parent, (offsets[s] + slot.value as usize) as u32) as usize]);
+    let parts: Vec<BuildParts> = lanes
+        .par_iter_mut()
+        .enumerate()
+        .map(|(s, lane)| {
+            let mut parts = BuildParts::default();
+            for slot in &mut lane.slots {
+                if slot.key != 0 {
+                    let name = keys[root(&parent, (offsets[s] + slot.value as usize) as u32) as usize];
+                    slot.value = mix(name);
+                    if let Some(shape) = shape {
+                        // A missing accelerator tag means "itself". Roots
+                        // need no slots, including explicit self-links.
+                        if name != slot.key {
+                            if let Some(raw) = shape.packed_raw(slot.key) {
+                                identity::add(&mut parts, raw, slot.value);
+                            }
+                        }
+                    }
+                }
             }
-        }
-    });
-    People { codec, lanes, count }
+            parts
+        })
+        .collect();
+    let family = shape.and_then(|shape| Family::build(shape, parts));
+    People {
+        codec,
+        lanes,
+        family,
+        count,
+    }
 }

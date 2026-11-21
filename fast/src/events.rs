@@ -25,8 +25,7 @@ struct Location {
 #[derive(Clone, Copy, Default)]
 struct Pending {
     id: u64,
-    uid: u64, // zero is never the key of a nonempty ID
-    hash: u64,
+    lookup: links::Probe,
     ts: i64,
     ingest: i64,
     price: u32,
@@ -46,8 +45,8 @@ fn parse<'a>(
     let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
     let mut emit = |e: Pending| {
         let mut target = NONE;
-        if e.uid != 0 {
-            let person = people.lookup(e.uid, e.hash);
+        let person = people.lookup(e.lookup);
+        if person != 0 {
             let p = shard(person);
             target = (payload[p].len() * NS + p) as u32;
             payload[p].push(PEv {
@@ -90,9 +89,8 @@ fn parse<'a>(
                 } else {
                     *sm.product_cat.get(r[5]).unwrap_or(&sm.unknown_cat)
                 };
-                next.uid = people.codec.key(r[1]);
-                next.hash = links::mix(next.uid);
-                people.prefetch(next.hash);
+                next.lookup = people.prepare(r[1]);
+                people.prefetch(next.lookup);
                 next.price = price;
                 next.cat = cat;
             }
