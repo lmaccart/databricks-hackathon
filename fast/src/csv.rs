@@ -1,27 +1,55 @@
-//! CSV dialect of rules.md: only `\n` ends a line, `\r` is data, a quote may only
-//! wrap a whole field, every comma separates fields, and an empty line or a
-//! line with the wrong field count is malformed.
+//! CSV dialect of rules.md: only `\n` ends a line, `\r` is data, a quote may
+//! only wrap a whole field, every comma separates fields, and an empty line or
+//! a line with the wrong number of fields is malformed.
 //!
-//! One pass per chunk: a SIMD classifier turns each 64-byte block into a bitmask
-//! of the three structural bytes `,` `"` `\n`, and a small state machine walks
-//! the set bits. Because no value may hold a comma, quote or newline, line ends
-//! are exactly the `\n` bytes and field ends exactly the commas, quotes or not;
-//! a quote is valid only as the first and last byte of its field.
+//! A chunk is read in windows of a few KB, twice, so the second pass and the
+//! row consumer find the bytes in L1:
+//! 1. A SIMD classifier turns each 64-byte block into a comma, a newline and a
+//!    quote bitmask. Comma and newline bits are flattened into position lists;
+//!    quote bits stay masks, with a running count per block.
+//! 2. Rows end at newline positions. A row of `n` fields is well formed iff it
+//!    is non-empty, holds exactly `n - 1` commas, and every quote in it is the
+//!    first or last byte of a field of length >= 2 ("wrapped"). Those boundary
+//!    bytes are distinct and are quotes, so the row's quote count (two prefix
+//!    lookups) equals twice its wrapped fields iff there is no other quote
+//!    anywhere in the row, in a selected column or not.
+//!
+//! Neither pass walks quote bits or branches on whether a field is quoted.
+//! With the header in the expected order, a 2-, 4- or 7-column row is checked
+//! and split at once from its comma positions. Lines longer than a window and
+//! a last line without `\n` take a scalar path with the same rules.
 
 use memchr::memchr;
-use std::marker::PhantomData;
 use std::path::Path;
 
-/// Output slot for fields no caller reads (the ninth entry of the row buffer).
+/// Bytes classified per pass: the window, its position lists and the fields
+/// the consumer reads stay in L1. A multiple of 64.
+const WINDOW: usize = 8 << 10;
+/// Row slot for fields no caller reads (the ninth entry of the row buffer).
 const SKIP: u8 = 8;
+/// After the last comma of a window; larger than any position in it.
+const END: u32 = u32::MAX;
 
-/// reference/pipeline.py names header columns with `_unquote(h) or h`.
-fn header_name(h: &[u8]) -> &[u8] {
-    let n = h.len();
-    if memchr(b'"', h).is_some() && n > 2 && h[0] == b'"' && h[n - 1] == b'"' && memchr(b'"', &h[1..n - 1]).is_none() {
-        &h[1..n - 1]
+type Row<'a> = [&'a [u8]; 8];
+
+/// A field's value, or None if a quote appears anywhere but around the whole field.
+fn unquote(f: &[u8]) -> Option<&[u8]> {
+    if memchr(b'"', f).is_none() {
+        return Some(f);
+    }
+    let n = f.len();
+    if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' && memchr(b'"', &f[1..n - 1]).is_none() {
+        Some(&f[1..n - 1])
     } else {
-        h
+        None
+    }
+}
+
+/// reference/pipeline.py names header columns `_unquote(h) or h`.
+fn header_name(h: &[u8]) -> &[u8] {
+    match unquote(h) {
+        Some(v) if !v.is_empty() => v,
+        _ => h,
     }
 }
 
@@ -45,7 +73,10 @@ fn chunks_sized<'a>(file: &'a [u8], cols: &[&str], path: &Path, size: usize) -> 
         return out;
     }
     let hdr_end = memchr(b'\n', file).unwrap_or(file.len());
-    let header: Vec<&[u8]> = file[..hdr_end].split(|&c| c == b',').map(header_name).collect();
+    let header: Vec<&[u8]> = file[..hdr_end]
+        .split(|&c| c == b',')
+        .map(header_name)
+        .collect();
     let mut idx = [0usize; 8];
     for (k, c) in cols.iter().enumerate() {
         idx[k] = header
@@ -79,182 +110,316 @@ fn chunks_sized<'a>(file: &'a [u8], cols: &[&str], path: &Path, size: usize) -> 
     out
 }
 
-/// Raw field index -> output slot (selected column k, or SKIP).
-fn slots(c: &Chunk) -> Vec<u8> {
+/// Call f with the selected columns of every well-formed line of a chunk.
+pub fn for_rows<'a>(c: &Chunk<'a>, mut f: impl FnMut(&Row<'a>)) {
+    dispatch(c, WINDOW, &mut f);
+}
+
+/// The classifier `for_rows` uses on this CPU.
+pub fn kernel() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        return "avx2";
+    }
+    std::any::type_name::<Native>()
+        .rsplit("::")
+        .next()
+        .unwrap_or("?")
+}
+
+#[inline(always)]
+fn dispatch<'a, F: FnMut(&Row<'a>)>(c: &Chunk<'a>, window: usize, f: &mut F) {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: the CPU has every feature scan_avx2 enables.
+        return unsafe { scan_avx2(c, window, f) };
+    }
+    scan::<Native, F>(c, window, f);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_avx2() -> bool {
+    is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("bmi1")
+        && is_x86_feature_detected!("popcnt")
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,popcnt")]
+unsafe fn scan_avx2<'a, F: FnMut(&Row<'a>)>(c: &Chunk<'a>, window: usize, f: &mut F) {
+    scan::<Avx2, F>(c, window, f);
+}
+
+/// Specialized only by field count, for a header that is exactly the
+/// selected columns in order; any other header takes the general row path.
+#[inline(always)]
+fn scan<'a, C: Classify, F: FnMut(&Row<'a>)>(c: &Chunk<'a>, window: usize, f: &mut F) {
+    debug_assert!(window >= 64 && window.is_multiple_of(64) && window < END as usize);
     let mut slot = vec![SKIP; c.nfields];
     for k in 0..c.ncols {
         slot[c.idx[k]] = k as u8;
     }
-    slot
-}
-
-/// Call f with the selected columns of every well-formed line of a chunk.
-#[inline]
-pub fn for_rows<'a>(c: &Chunk<'a>, mut f: impl FnMut(&[&'a [u8]; 8])) {
-    let slot = slots(c);
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: the CPU supports AVX2.
-            return unsafe { scan_avx2(c.data, &slot, &mut f) };
-        }
+    let in_order = c.ncols == c.nfields && slot.iter().enumerate().all(|(j, &k)| k as usize == j);
+    match (in_order, c.nfields) {
+        (true, 7) => windows::<C, F, 7>(c.data, window, &slot, f),
+        (true, 4) => windows::<C, F, 4>(c.data, window, &slot, f),
+        (true, 2) => windows::<C, F, 2>(c.data, window, &slot, f),
+        _ => windows::<C, F, 0>(c.data, window, &slot, f),
     }
-    scan::<Native, _>(c.data, &slot, &mut f);
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn scan_avx2<'a, F: FnMut(&[&'a [u8]; 8])>(data: &'a [u8], slot: &[u8], f: &mut F) {
-    scan::<Avx2, F>(data, slot, f);
-}
-
-/// The row state machine. Every structural byte is consumed exactly once, so a
-/// malformed line costs no more than a good one and never hides the next line.
+/// `N >= 2`: rows of exactly N fields in slot order; 0: the general path.
 #[inline(always)]
-fn scan<'a, C: Classify, F: FnMut(&[&'a [u8]; 8])>(data: &'a [u8], slot: &[u8], f: &mut F) {
-    let len = data.len();
-    let nfields = slot.len();
-    let mut cur = Cursor::<C>::new(data);
-    let mut row: [&'a [u8]; 9] = [&[]; 9];
-    let at = |p: usize| if p < len { data[p] } else { b'\n' }; // end of data ends the last line
-    let mut ls = 0; // line start
-    while ls < len {
-        let mut fs = ls; // field start
-        let mut nf = 0;
-        let (end, ok) = loop {
-            let mut p = cur.next();
-            let mut c = at(p);
-            let (vs, ve);
-            if c == b'"' {
-                // `"value"` followed directly by `,` / `\n` / end; nothing else may hold a quote
-                if p != fs {
-                    break (cur.skip_line(p, c), false);
-                }
-                let q = cur.next();
-                let cq = at(q);
-                if cq != b'"' {
-                    break (cur.skip_line(q, cq), false);
-                }
-                let r = cur.next();
-                let cr = at(r);
-                if r != q + 1 || cr == b'"' {
-                    break (cur.skip_line(r, cr), false);
-                }
-                (vs, ve, p, c) = (p + 1, q, r, cr);
-            } else {
-                (vs, ve) = (fs, p);
-            }
-            if nf == nfields {
-                break (cur.skip_line(p, c), false); // too many fields
-            }
-            // SAFETY: vs <= ve <= len (cursor positions only grow and never pass len);
-            // nf < nfields == slot.len(); every slot is <= SKIP < row.len().
-            unsafe {
-                *row.get_unchecked_mut(*slot.get_unchecked(nf) as usize) = data.get_unchecked(vs..ve);
-            }
-            nf += 1;
-            if c == b'\n' {
-                break (p, nf == nfields && p > ls); // p == ls: empty line
-            }
-            fs = p + 1;
-        };
-        if ok {
-            f(row.first_chunk::<8>().unwrap());
-        }
-        ls = end + 1;
-    }
-}
-
-/// Positions of structural bytes, in order; `data.len()` once exhausted.
-struct Cursor<'a, C> {
+fn windows<'a, C: Classify, F: FnMut(&Row<'a>), const N: usize>(
     data: &'a [u8],
-    base: usize,
-    bits: u64,
-    _c: PhantomData<C>,
+    window: usize,
+    slot: &[u8],
+    f: &mut F,
+) {
+    // A small chunk (a small file) needs no full-size lists.
+    let window = window.min(data.len().next_multiple_of(64));
+    let mut lists = Lists::new(window);
+    let mut ws = 0;
+    while ws < data.len() {
+        let w = &data[ws..data.len().min(ws + window)];
+        let lines = lists.classify::<C>(w);
+        if lines == 0 {
+            // A line longer than a window, or a last line without `\n`.
+            let end = ws + w.len();
+            let le = memchr(b'\n', &data[end..]).map_or(data.len(), |p| end + p);
+            scalar_line(&data[ws..le], slot, f);
+            ws = le + 1;
+        } else {
+            lists.rows::<F, N>(w, lines, slot, f);
+            // The partial line after the last newline starts the next window.
+            ws += lists.newlines[lines - 1] as usize + 1;
+        }
+    }
 }
 
-impl<'a, C: Classify> Cursor<'a, C> {
-    #[inline(always)]
-    fn new(data: &'a [u8]) -> Self {
-        let bits = if data.is_empty() { 0 } else { Self::block(data, 0) };
-        Cursor {
-            data,
-            base: 0,
-            bits,
-            _c: PhantomData,
+/// One window's structure. Positions are offsets into the window.
+struct Lists {
+    commas: Vec<u32>,
+    newlines: Vec<u32>,
+    /// Per 64-byte block: its quote mask, and the quotes in earlier blocks.
+    quotes: Vec<u64>,
+    before: Vec<u32>,
+}
+
+impl Lists {
+    fn new(window: usize) -> Self {
+        // flatten() writes past the count; rows() reads 8 ENDs past the last comma.
+        Lists {
+            commas: vec![END; window + 64],
+            newlines: vec![0; window + 64],
+            quotes: vec![0; window / 64],
+            before: vec![0; window / 64],
         }
     }
 
+    /// Classify `w` (at most one window); returns how many newlines it has.
     #[inline(always)]
-    fn block(data: &[u8], at: usize) -> u64 {
-        if data.len() - at >= 64 {
-            // SAFETY: 64 readable bytes at `at`.
-            unsafe { C::mask(data.as_ptr().add(at)) }
-        } else {
-            Self::tail(&data[at..])
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn tail(rest: &[u8]) -> u64 {
-        let mut buf = [0u8; 64]; // zero is not structural
-        buf[..rest.len()].copy_from_slice(rest);
-        // SAFETY: buf has 64 bytes.
-        unsafe { C::mask(buf.as_ptr()) }
-    }
-
-    #[inline(always)]
-    fn next(&mut self) -> usize {
-        while self.bits == 0 {
-            let nb = self.base + 64;
-            if nb >= self.data.len() {
-                return self.data.len();
+    fn classify<C: Classify>(&mut self, w: &[u8]) -> usize {
+        let blocks = w.len().div_ceil(64);
+        let quotes = &mut self.quotes[..blocks];
+        let before = &mut self.before[..blocks];
+        let (commas, newlines) = (self.commas.as_mut_ptr(), self.newlines.as_mut_ptr());
+        let (mut nc, mut nn, mut q) = (0, 0, 0u32);
+        for b in 0..blocks {
+            let at = 64 * b;
+            let [comma, newline, quote] = if w.len() - at >= 64 {
+                // SAFETY: 64 readable bytes at `at`.
+                unsafe { C::masks(w.as_ptr().add(at)) }
+            } else {
+                tail::<C>(&w[at..])
+            };
+            quotes[b] = quote;
+            before[b] = q;
+            q += quote.count_ones();
+            // SAFETY: both lists hold window + 64 entries. Blocks before this
+            // one added at most `at` positions, and this one writes at most 64.
+            unsafe {
+                nc = flatten::<8>(commas, nc, comma, at as u32);
+                nn = flatten::<4>(newlines, nn, newline, at as u32);
             }
-            self.base = nb;
-            self.bits = Self::block(self.data, nb);
         }
-        let p = self.base + self.bits.trailing_zeros() as usize;
-        self.bits &= self.bits - 1;
-        p
+        self.commas[nc..nc + 8].fill(END);
+        nn
     }
 
-    /// Consume the rest of a malformed line; returns its end (`\n` or len).
+    /// Emit the well-formed rows among the first `lines` lines of window `w`.
     #[inline(always)]
-    fn skip_line(&mut self, mut p: usize, mut c: u8) -> usize {
-        while c != b'\n' && p < self.data.len() {
-            p = self.next();
-            c = if p < self.data.len() { self.data[p] } else { b'\n' };
+    fn rows<'a, F: FnMut(&Row<'a>), const N: usize>(
+        &self,
+        w: &'a [u8],
+        lines: usize,
+        slot: &[u8],
+        f: &mut F,
+    ) {
+        let commas = &self.commas[..];
+        let mut c = 0; // first comma at or after the row start
+        let mut rs = 0u32; // row start
+        let mut qs = 0u32; // quotes before rs
+        let mut row: [&'a [u8]; 9] = [&[]; 9];
+        for &le in &self.newlines[..lines] {
+            let b = (le / 64) as usize;
+            // SAFETY: le < w.len(), so its block was classified.
+            let qe = unsafe {
+                self.before.get_unchecked(b)
+                    + (self.quotes.get_unchecked(b) & ((1u64 << (le % 64)) - 1)).count_ones()
+            };
+            if N >= 2 {
+                // SAFETY: c never passes the commas before le; ENDs pad N past them.
+                let (a, z) = unsafe {
+                    (
+                        *commas.get_unchecked(c + N - 2),
+                        *commas.get_unchecked(c + N - 1),
+                    )
+                };
+                if (a < le) & (z > le) {
+                    // Exactly N - 1 commas in the row: its N fields end at them and at le.
+                    let mut wrapped = 0;
+                    let mut s = rs;
+                    for (k, out) in row.iter_mut().enumerate().take(N) {
+                        // SAFETY: k < N - 1 indexes one of those commas.
+                        let e = if k + 1 < N {
+                            unsafe { *commas.get_unchecked(c + k) }
+                        } else {
+                            le
+                        };
+                        let (v, q) = field(w, s, e);
+                        *out = v;
+                        wrapped += q;
+                        s = e + 1;
+                    }
+                    if qe - qs == 2 * wrapped {
+                        f(row.first_chunk().unwrap());
+                    }
+                    c += N - 1;
+                } else {
+                    while commas[c] < le {
+                        c += 1;
+                    }
+                }
+            } else {
+                let (mut k, mut s, mut wrapped) = (0, rs, 0);
+                loop {
+                    let next = commas[c];
+                    let e = next.min(le);
+                    let (v, q) = field(w, s, e);
+                    wrapped += q;
+                    if let Some(&j) = slot.get(k) {
+                        row[j as usize] = v;
+                    }
+                    k += 1;
+                    if next > le {
+                        break;
+                    }
+                    c += 1;
+                    s = e + 1;
+                }
+                if k == slot.len() && le > rs && qe - qs == 2 * wrapped {
+                    f(row.first_chunk().unwrap());
+                }
+            }
+            rs = le + 1;
+            qs = qe;
         }
-        p
+    }
+}
+
+/// Field `w[s..e]` (e is its delimiter) without wrapping quotes, and 1 if it had them.
+#[inline(always)]
+fn field(w: &[u8], s: u32, e: u32) -> (&[u8], u32) {
+    let (s, e) = (s as usize, e as usize);
+    // SAFETY: s <= e < w.len(). An empty field probes its delimiter twice.
+    let (first, last) = unsafe { (*w.get_unchecked(s), *w.get_unchecked(e.max(s + 1) - 1)) };
+    let q = ((e - s >= 2) & (first == b'"') & (last == b'"')) as usize;
+    // SAFETY: q = 1 only when e - s >= 2.
+    (unsafe { w.get_unchecked(s + q..e - q) }, q as u32)
+}
+
+/// Write `base + i` for each set bit i of m at out[n..]; returns n + its count.
+/// The first K are written unconditionally, so a block costs no count branch.
+///
+/// SAFETY: out must hold n + 64 entries.
+#[inline(always)]
+unsafe fn flatten<const K: usize>(out: *mut u32, n: usize, mut m: u64, base: u32) -> usize {
+    let count = m.count_ones() as usize;
+    // SAFETY: at most max(K, count) <= 64 writes from out + n.
+    unsafe {
+        let o = out.add(n);
+        for i in 0..K {
+            o.add(i).write(base + m.trailing_zeros());
+            m &= m.wrapping_sub(1);
+        }
+        let mut i = K;
+        while m != 0 {
+            o.add(i).write(base + m.trailing_zeros());
+            m &= m - 1;
+            i += 1;
+        }
+    }
+    n + count
+}
+
+/// One line by the literal rule: lines longer than a window, last line without `\n`.
+#[cold]
+fn scalar_line<'a, F: FnMut(&Row<'a>)>(line: &'a [u8], slot: &[u8], f: &mut F) {
+    if line.is_empty() {
+        return;
+    }
+    let mut row: [&'a [u8]; 9] = [&[]; 9];
+    let mut k = 0;
+    for v in line.split(|&b| b == b',') {
+        let (Some(&j), Some(v)) = (slot.get(k), unquote(v)) else {
+            return;
+        };
+        row[j as usize] = v;
+        k += 1;
+    }
+    if k == slot.len() {
+        f(row.first_chunk().unwrap());
     }
 }
 
 // ------------------------------------------------------------------ classifiers
 
 trait Classify {
-    /// Bit i set iff byte i of the 64 at `p` is `,`, `"` or `\n`.
-    /// SAFETY: 64 bytes at `p` must be readable.
-    unsafe fn mask(p: *const u8) -> u64;
+    /// Bit i of each mask is set iff byte i of the 64 at p is `,` / `\n` / `"`.
+    ///
+    /// SAFETY: 64 bytes at p must be readable.
+    unsafe fn masks(p: *const u8) -> [u64; 3];
+}
+
+#[cold]
+fn tail<C: Classify>(rest: &[u8]) -> [u64; 3] {
+    let mut buf = [0u8; 64]; // zero is not structural
+    buf[..rest.len()].copy_from_slice(rest);
+    // SAFETY: buf has 64 bytes.
+    unsafe { C::masks(buf.as_ptr()) }
 }
 
 /// Portable fallback: exact zero-byte detection on eight 64-bit words.
-#[allow(dead_code)] // the native kernel on x86_64 and aarch64; tested everywhere
+#[allow(dead_code)] // the native kernel elsewhere; tested on every target
 struct Swar;
 
 impl Classify for Swar {
     #[inline(always)]
-    unsafe fn mask(p: *const u8) -> u64 {
+    unsafe fn masks(p: *const u8) -> [u64; 3] {
         const LO: u64 = 0x7F7F_7F7F_7F7F_7F7F;
         const ONES: u64 = 0x0101_0101_0101_0101;
-        // 0x80 in each zero byte, nothing else (no borrow between bytes)
+        // 0x80 in exactly the zero bytes of x: no carry crosses a byte.
         let zero = |x: u64| !(((x & LO) + LO) | x | LO);
-        let mut m = 0;
+        // the top bit of each byte, gathered into the top byte
+        let gather = |h: u64| (h >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56;
+        let mut m = [0u64; 3];
         for i in 0..8 {
-            // SAFETY: caller guarantees 64 readable bytes.
+            // SAFETY: the caller guarantees 64 readable bytes.
             let w = u64::from_le_bytes(unsafe { p.add(8 * i).cast::<[u8; 8]>().read_unaligned() });
-            let hit = zero(w ^ (ONES * b',' as u64)) | zero(w ^ (ONES * b'"' as u64)) | zero(w ^ (ONES * b'\n' as u64));
-            m |= ((hit >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * i);
+            for (m, ch) in m.iter_mut().zip(*b",\n\"") {
+                *m |= gather(zero(w ^ (ONES * ch as u64))) << (8 * i);
+            }
         }
         m
     }
@@ -274,65 +439,62 @@ struct Sse2;
 #[cfg(target_arch = "x86_64")]
 impl Classify for Sse2 {
     #[inline(always)]
-    unsafe fn mask(p: *const u8) -> u64 {
+    unsafe fn masks(p: *const u8) -> [u64; 3] {
         use std::arch::x86_64::*;
-        // SAFETY: caller guarantees 64 readable bytes; SSE2 is baseline on x86_64.
+        // SAFETY: the caller guarantees 64 readable bytes; SSE2 is baseline.
         unsafe {
-            let (cm, qt, nl) = (
+            let ch = [
                 _mm_set1_epi8(b',' as i8),
-                _mm_set1_epi8(b'"' as i8),
                 _mm_set1_epi8(b'\n' as i8),
-            );
-            let mut m = 0u64;
+                _mm_set1_epi8(b'"' as i8),
+            ];
+            let mut m = [0u64; 3];
             for i in 0..4 {
                 let v = _mm_loadu_si128(p.add(16 * i).cast());
-                let hit = _mm_or_si128(
-                    _mm_or_si128(_mm_cmpeq_epi8(v, cm), _mm_cmpeq_epi8(v, qt)),
-                    _mm_cmpeq_epi8(v, nl),
-                );
-                m |= (_mm_movemask_epi8(hit) as u16 as u64) << (16 * i);
+                for (m, ch) in m.iter_mut().zip(ch) {
+                    *m |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, ch)) as u16 as u64) << (16 * i);
+                }
             }
             m
         }
     }
 }
 
-/// Only reached through `scan_avx2`, after runtime detection.
+/// Reached only through scan_avx2, after runtime detection.
 #[cfg(target_arch = "x86_64")]
 struct Avx2;
 
 #[cfg(target_arch = "x86_64")]
 impl Classify for Avx2 {
     #[inline(always)]
-    unsafe fn mask(p: *const u8) -> u64 {
-        // SAFETY: caller guarantees 64 readable bytes and AVX2 support.
-        unsafe { avx2_mask(p) }
+    unsafe fn masks(p: *const u8) -> [u64; 3] {
+        // SAFETY: the caller guarantees 64 readable bytes and AVX2.
+        unsafe { avx2_masks(p) }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn avx2_mask(p: *const u8) -> u64 {
+unsafe fn avx2_masks(p: *const u8) -> [u64; 3] {
     use std::arch::x86_64::*;
-    // SAFETY: caller guarantees 64 readable bytes.
+    // SAFETY: the caller guarantees 64 readable bytes. No closures: they
+    // would not inherit this function's target features.
     unsafe {
-        let (cm, qt, nl) = (
-            _mm256_set1_epi8(b',' as i8),
-            _mm256_set1_epi8(b'"' as i8),
-            _mm256_set1_epi8(b'\n' as i8),
-        );
         let lo = _mm256_loadu_si256(p.cast());
         let hi = _mm256_loadu_si256(p.add(32).cast());
-        let lo = _mm256_or_si256(
-            _mm256_or_si256(_mm256_cmpeq_epi8(lo, cm), _mm256_cmpeq_epi8(lo, qt)),
-            _mm256_cmpeq_epi8(lo, nl),
+        let (c, n, q) = (
+            _mm256_set1_epi8(b',' as i8),
+            _mm256_set1_epi8(b'\n' as i8),
+            _mm256_set1_epi8(b'"' as i8),
         );
-        let hi = _mm256_or_si256(
-            _mm256_or_si256(_mm256_cmpeq_epi8(hi, cm), _mm256_cmpeq_epi8(hi, qt)),
-            _mm256_cmpeq_epi8(hi, nl),
-        );
-        (_mm256_movemask_epi8(lo) as u32 as u64) | ((_mm256_movemask_epi8(hi) as u32 as u64) << 32)
+        let cl = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, c)) as u32 as u64;
+        let ch = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, c)) as u32 as u64;
+        let nl = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, n)) as u32 as u64;
+        let nh = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, n)) as u32 as u64;
+        let ql = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, q)) as u32 as u64;
+        let qh = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, q)) as u32 as u64;
+        [cl | ch << 32, nl | nh << 32, ql | qh << 32]
     }
 }
 
@@ -343,24 +505,32 @@ struct Neon;
 #[cfg(target_arch = "aarch64")]
 impl Classify for Neon {
     #[inline(always)]
-    unsafe fn mask(p: *const u8) -> u64 {
+    unsafe fn masks(p: *const u8) -> [u64; 3] {
         use std::arch::aarch64::*;
         const BIT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-        // SAFETY: caller guarantees 64 readable bytes; NEON is baseline on aarch64.
+        // SAFETY: the caller guarantees 64 readable bytes; NEON is baseline.
         unsafe {
             let bit = vld1q_u8(BIT.as_ptr());
-            let (cm, qt, nl) = (vdupq_n_u8(b','), vdupq_n_u8(b'"'), vdupq_n_u8(b'\n'));
-            let mut h = [vdupq_n_u8(0); 4];
-            for (i, h) in h.iter_mut().enumerate() {
-                let v = vld1q_u8(p.add(16 * i));
-                *h = vandq_u8(
-                    vorrq_u8(vorrq_u8(vceqq_u8(v, cm), vceqq_u8(v, qt)), vceqq_u8(v, nl)),
-                    bit,
-                );
-            }
-            // pairwise adds fold each 8-byte group into the byte holding its 8 bits
-            let s = vpaddq_u8(vpaddq_u8(h[0], h[1]), vpaddq_u8(h[2], h[3]));
-            vgetq_lane_u64::<0>(vreinterpretq_u64_u8(vpaddq_u8(s, s)))
+            let v = [
+                vld1q_u8(p),
+                vld1q_u8(p.add(16)),
+                vld1q_u8(p.add(32)),
+                vld1q_u8(p.add(48)),
+            ];
+            // Each matching byte keeps its bit weight; pairwise adds fold the
+            // 64 bytes into 8 (two folds here, the third below).
+            let fold = |ch: u8| {
+                let h = v.map(|v| vandq_u8(vceqq_u8(v, vdupq_n_u8(ch)), bit));
+                vpaddq_u8(vpaddq_u8(h[0], h[1]), vpaddq_u8(h[2], h[3]))
+            };
+            let cn = vreinterpretq_u64_u8(vpaddq_u8(fold(b','), fold(b'\n')));
+            let q = fold(b'"');
+            let qq = vreinterpretq_u64_u8(vpaddq_u8(q, q));
+            [
+                vgetq_lane_u64::<0>(cn),
+                vgetq_lane_u64::<1>(cn),
+                vgetq_lane_u64::<0>(qq),
+            ]
         }
     }
 }
@@ -371,148 +541,118 @@ mod tests {
 
     type Rows = Vec<Vec<Vec<u8>>>;
 
-    // ---- literal transcription of reference/pipeline.py (read_csv_rows, parse_line, _unquote)
-
-    fn py_unquote(f: &[u8]) -> Option<&[u8]> {
-        if !f.contains(&b'"') {
-            return Some(f);
-        }
-        if f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' && !f[1..f.len() - 1].contains(&b'"') {
-            return Some(&f[1..f.len() - 1]);
-        }
-        None
-    }
-
-    fn py_parse_line(line: &[u8], nfields: usize) -> Option<Vec<&[u8]>> {
-        if line.is_empty() {
-            return None;
-        }
-        let parts: Vec<&[u8]> = line.split(|&c| c == b',').collect();
-        if parts.len() != nfields {
-            return None;
-        }
-        parts.into_iter().map(py_unquote).collect()
-    }
-
-    fn py_rows(data: &[u8], cols: &[&str]) -> Rows {
-        if data.is_empty() {
-            return vec![];
-        }
-        let mut lines: Vec<&[u8]> = data.split(|&c| c == b'\n').collect();
-        if data.ends_with(b"\n") {
-            lines.pop();
-        }
-        let header: Vec<&[u8]> = lines[0]
-            .split(|&c| c == b',')
-            .map(|h| match py_unquote(h) {
-                Some(v) if !v.is_empty() => v,
-                _ => h,
-            })
-            .collect();
-        let idx: Vec<usize> = cols
-            .iter()
-            .map(|c| header.iter().position(|h| *h == c.as_bytes()).expect("column"))
-            .collect();
-        let mut out = vec![];
-        for line in &lines[1..] {
-            if let Some(vals) = py_parse_line(line, header.len()) {
-                out.push(idx.iter().map(|&i| vals[i].to_vec()).collect());
-            }
-        }
-        out
-    }
-
-    /// Kernels this CPU can run: dispatching entry, SWAR, native SIMD, AVX2.
-    fn kernels() -> Vec<usize> {
-        #[allow(unused_mut)]
-        let mut k = vec![0, 1, 2];
+    #[derive(Clone, Copy, Debug)]
+    enum Kernel {
+        Swar,
+        Native,
         #[cfg(target_arch = "x86_64")]
-        if std::arch::is_x86_feature_detected!("avx2") {
-            k.push(3);
+        Avx2,
+    }
+
+    fn kernels() -> Vec<Kernel> {
+        #[allow(unused_mut)]
+        let mut k = vec![Kernel::Swar, Kernel::Native];
+        #[cfg(target_arch = "x86_64")]
+        if has_avx2() {
+            k.push(Kernel::Avx2);
         }
         k
     }
 
-    fn kernel_rows(data: &[u8], cols: &[&str], size: usize, kernel: usize) -> Rows {
-        let mut out: Rows = vec![];
-        for c in chunks_sized(data, cols, Path::new("test.csv"), size) {
-            let mut f = |r: &[&[u8]; 8]| out.push(r[..cols.len()].iter().map(|v| v.to_vec()).collect());
-            let slot = slots(&c);
-            match kernel {
-                0 => for_rows(&c, &mut f),
-                1 => scan::<Swar, _>(c.data, &slot, &mut f),
-                2 => scan::<Native, _>(c.data, &slot, &mut f),
+    fn masks(k: Kernel, block: &[u8; 64]) -> [u64; 3] {
+        // SAFETY: 64 bytes; Avx2 is listed only when detected.
+        unsafe {
+            match k {
+                Kernel::Swar => Swar::masks(block.as_ptr()),
+                Kernel::Native => Native::masks(block.as_ptr()),
                 #[cfg(target_arch = "x86_64")]
-                3 => unsafe { scan_avx2(c.data, &slot, &mut f) },
-                _ => unreachable!(),
+                Kernel::Avx2 => avx2_masks(block.as_ptr()),
             }
         }
-        out
     }
 
-    fn fast_rows(data: &[u8], cols: &[&str], size: usize) -> Rows {
-        let rows = kernel_rows(data, cols, size, 0);
-        for k in kernels() {
-            assert_eq!(
-                kernel_rows(data, cols, size, k),
-                rows,
-                "kernel {k} {:?}",
-                String::from_utf8_lossy(data)
-            );
+    fn run(k: Kernel, c: &Chunk, window: usize, out: &mut Rows) {
+        let ncols = c.ncols;
+        let mut push = |r: &Row| out.push(r[..ncols].iter().map(|v| v.to_vec()).collect());
+        match k {
+            Kernel::Swar => scan::<Swar, _>(c, window, &mut push),
+            Kernel::Native => scan::<Native, _>(c, window, &mut push),
+            // SAFETY: listed only when detected.
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Avx2 => unsafe { scan_avx2(c, window, &mut push) },
+        }
+    }
+
+    /// reference/pipeline.py read literally: split the whole file at `\n`,
+    /// then each line at `,`, then unquote each field.
+    fn model(file: &[u8], cols: &[&str]) -> Rows {
+        let mut lines: Vec<&[u8]> = file.split(|&b| b == b'\n').collect();
+        if file.ends_with(b"\n") {
+            lines.pop();
+        }
+        if file.is_empty() || lines.is_empty() {
+            return Vec::new();
+        }
+        let header: Vec<&[u8]> = lines[0].split(|&b| b == b',').map(header_name).collect();
+        let idx: Vec<usize> = cols
+            .iter()
+            .map(|c| header.iter().position(|h| *h == c.as_bytes()).unwrap())
+            .collect();
+        let unq = |p: &[u8]| -> Option<Vec<u8>> {
+            let n = p.len();
+            match p.iter().filter(|&&b| b == b'"').count() {
+                0 => Some(p.to_vec()),
+                2 if n >= 2 && p[0] == b'"' && p[n - 1] == b'"' => Some(p[1..n - 1].to_vec()),
+                _ => None,
+            }
+        };
+        let mut rows = Vec::new();
+        for line in &lines[1..] {
+            let parts: Vec<&[u8]> = line.split(|&b| b == b',').collect();
+            if line.is_empty() || parts.len() != header.len() {
+                continue;
+            }
+            if let Some(vals) = parts.iter().map(|p| unq(p)).collect::<Option<Vec<_>>>() {
+                rows.push(idx.iter().map(|&i| vals[i].clone()).collect());
+            }
         }
         rows
     }
 
-    fn check(data: &[u8], cols: &[&str]) {
-        let want = py_rows(data, cols);
-        for size in [usize::MAX, 1, 2, 3, 63, 64, 65, 200] {
-            let got = fast_rows(data, cols, size);
-            assert_eq!(
-                got,
-                want,
-                "file {:?} cols {cols:?} chunk {size}",
-                String::from_utf8_lossy(data)
-            );
-        }
-    }
+    const WINDOWS: [usize; 4] = [64, 128, 192, WINDOW];
 
-    fn scalar_mask(b: &[u8]) -> u64 {
-        (0..64)
-            .filter(|&i| matches!(b[i], b',' | b'"' | b'\n'))
-            .fold(0, |m, i| m | 1 << i)
-    }
-
-    #[test]
-    fn classifiers_agree() {
-        let mut rng = Rng(0xA076_1D64_78BD_642F);
-        let mut buf = [0u8; 64];
-        for round in 0..200_000 {
-            for b in buf.iter_mut() {
-                *b = match round % 3 {
-                    0 => rng.next() as u8, // every byte value, incl. 0x80+ and neighbours of , " \n
-                    1 => b",\"\n\r\x0b\x2b\x2d\x21\x23\x09\xac\xa2\x8a"[rng.below(13)],
-                    _ => {
-                        if rng.below(8) == 0 {
-                            b",\"\n"[rng.below(3)]
-                        } else {
-                            b'a'
-                        }
+    /// Every kernel, window and chunk size agrees with the model; returns it.
+    fn check_with(file: &[u8], cols: &[&str], windows: &[usize], sizes: &[usize]) -> Rows {
+        let want = model(file, cols);
+        for k in kernels() {
+            for &window in windows {
+                for &size in sizes {
+                    let mut got = Vec::new();
+                    for c in chunks_sized(file, cols, Path::new("t.csv"), size) {
+                        run(k, &c, window, &mut got);
                     }
-                };
-            }
-            let want = scalar_mask(&buf);
-            unsafe {
-                assert_eq!(Swar::mask(buf.as_ptr()), want, "swar {buf:?}");
-                assert_eq!(Native::mask(buf.as_ptr()), want, "native {buf:?}");
-                #[cfg(target_arch = "x86_64")]
-                if std::arch::is_x86_feature_detected!("avx2") {
-                    assert_eq!(Avx2::mask(buf.as_ptr()), want, "avx2 {buf:?}");
+                    assert_eq!(
+                        got,
+                        want,
+                        "{k:?} window {window} chunk {size} cols {cols:?} file {:?}",
+                        String::from_utf8_lossy(file)
+                    );
                 }
             }
         }
+        want
     }
 
-    /// Deterministic xorshift; tests stay reproducible without extra crates.
+    fn check(file: &[u8], cols: &[&str]) -> Rows {
+        check_with(file, cols, &WINDOWS, &[1, 50, usize::MAX])
+    }
+
+    fn rows(v: &[&[&str]]) -> Rows {
+        v.iter()
+            .map(|r| r.iter().map(|f| f.as_bytes().to_vec()).collect())
+            .collect()
+    }
+
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -526,167 +666,390 @@ mod tests {
         }
     }
 
+    const COLS7: [&str; 7] = [
+        "event_id",
+        "user_id",
+        "ts",
+        "ingest_ts",
+        "event_type",
+        "product_id",
+        "price_cents",
+    ];
+
     #[test]
-    fn rules_examples() {
-        let cols = ["a", "b", "c"];
-        check(b"a,b,c\n\"u1\",,\"\"\n", &cols);
-        check(b"a,b,c\nu\"1,a,b\n\"u1,a,b\n\"\"\"\",a,b\na,b\n\na,b,1000\r\n", &cols);
-        check(b"a,b,c\r\nx,y,z\r\n", &["a", "b"]); // header's last name is `c\r`
-        check(b"a,b,c\n u1 ,\" u1\",\"u1 \"\n", &cols);
-        check(b"a,b,c\nx,y,z", &cols); // no final newline
-        check(b"a,b,c\nx,y,z\n\n", &cols); // trailing empty line
-        check(b"a,b,c\n\"x\",\"y\",\"z\"", &cols); // closing quote at end of file
-        check(b"a,b,c\n\"x\",\"y\",\"", &cols); // lone quote at end of file
-        check(b"a,b,c", &cols); // header only, no newline
-        check(b"a,b,c\n", &cols);
+    fn kernels_classify_every_byte_value() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for round in 0..4096 {
+            let mut block = [0u8; 64];
+            for b in &mut block {
+                *b = match rng.below(4) {
+                    0 => b",\n\"\r"[rng.below(4)],
+                    _ => rng.below(256) as u8,
+                };
+            }
+            if round < 256 {
+                block = [round as u8; 64];
+            }
+            let want = b",\n\"".map(|ch| {
+                block
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |m, (i, &b)| m | ((b == ch) as u64) << i)
+            });
+            for k in kernels() {
+                assert_eq!(masks(k, &block), want, "{k:?} {block:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dialect_examples_from_rules() {
+        let body = concat!(
+            "x,y\n",
+            "\"x\",\"y\"\n",
+            "\"\",\"\"\n",
+            ",\n",
+            "\n",
+            "x\n",
+            "x,y,z\n",
+            "\"x,y\"\n",
+            "x,\"\n",
+            "x,\"\"\"\n",
+            "x,\"\"\"\"\n",
+            "\"x\"y,z\n",
+            "x,y\r\n",
+            "x,\"y\"\r\n",
+            "x,\"y\r\"\n",
+            " x , \"y \"\n", // a space before the quote: not a whole-field wrap
+            " x ,\"y \"\n",
+            "\"x\",y\n",
+        );
+        let want = rows(&[
+            &["x", "y"],
+            &["x", "y"],
+            &["", ""],
+            &["", ""],
+            &["x", "y\r"],
+            &["x", "y\r"],
+            &[" x ", "y "],
+            &["x", "y"],
+        ]);
+        let file = format!("a,b\n{body}");
+        assert_eq!(check(file.as_bytes(), &["a", "b"]), want);
+        // the same lines on the general path: reordered selection
+        let swapped: Rows = want
+            .iter()
+            .map(|r| vec![r[1].clone(), r[0].clone()])
+            .collect();
+        assert_eq!(check(file.as_bytes(), &["b", "a"]), swapped);
+    }
+
+    #[test]
+    fn stray_quotes_never_balance_across_fields_rows_or_columns() {
+        // Each line holds as many quotes as a well-formed one could, or pairs
+        // a missing boundary quote with an extra quote elsewhere.
+        let bad = [
+            "a\"b,\"c,d",      // two lone quotes in two fields
+            "a,\",\"",         // a quote alone in each of two fields
+            "\"a,b\",c",       // a wrap spanning a comma
+            "\"a,\"b\",c",     // an unopened field next to a wrapped one
+            "\"a\",\"b\"\",c", // a wrapped field with a doubled end quote
+            "\"\"\",\"\",c",   // three quotes, then a valid empty wrap
+            "a,b,\"c\"\"\"",   // four quotes in the last field
+            "\"a\"\"b\",c,d",  // escaped quote inside a wrap is not a dialect
+        ];
+        let good = ["\"a\",\"b\",\"c\"", "\"\",b,\"\"", "a,\"b\",c"];
+        let mut file = String::from("p,q,r\n");
+        for (i, b) in bad.iter().enumerate() {
+            file.push_str(b);
+            file.push('\n');
+            file.push_str(good[i % good.len()]);
+            file.push('\n');
+        }
+        let got = check(file.as_bytes(), &["p", "q", "r"]);
+        assert_eq!(
+            got.len(),
+            bad.len(),
+            "every bad line dropped, every good kept"
+        );
+
+        // Two neighbours with one stray quote each; their sum is even.
+        let pair = "x,y\n\"a,b\na,b\"\n\"x\",\"y\"\n";
+        assert_eq!(
+            check(format!("a,b\n{pair}").as_bytes(), &["a", "b"]),
+            rows(&[&["x", "y"], &["x", "y"]])
+        );
+
+        // A stray quote in a column nobody reads still drops the line.
+        let extra = "a,b\"c,d\na,\"b\",d\na,\"\",d\na,\"b\"\",d\n\"\"\"\",b,d\n";
+        assert_eq!(
+            check(format!("id,extra,v\n{extra}").as_bytes(), &["id", "v"]),
+            rows(&[&["a", "d"], &["a", "d"]])
+        );
+
+        // The same in every position of a 7- and a 4-column row.
+        for n in [7, 4] {
+            let cols = &COLS7[..n];
+            let mut file = cols.join(",") + "\n";
+            for k in 0..n {
+                for bad in ["\"v", "v\"", "\"", "\"\"\"", "\"v\"v\"", "v\"\"v"] {
+                    let line: Vec<&str> =
+                        (0..n).map(|j| if j == k { bad } else { "\"w\"" }).collect();
+                    file += &line.join(",");
+                    file += "\n";
+                }
+            }
+            file += &vec!["\"w\""; n].join(",");
+            assert_eq!(
+                check(file.as_bytes(), cols),
+                vec![vec![b"w".to_vec(); n]],
+                "{n} columns"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_straddle_blocks_windows_and_chunks() {
+        let lines = [
+            "e1,u1,2026-10-03T23:58:10Z,2026-10-03T23:58:11Z,view,p1,",
+            "\"e2\",\"u2\",\"1791071890000\",\"2026-10-03T23:58:11Z\",\"purchase\",\"p2\",\"0250\"",
+            "e3,u3,t,i,cart,p3,\"\"",
+            "",
+            "e4,u4,t,i,view,p4",
+            "e5,u5,t,i,view,p5,1,extra",
+            "e6,u\"6,t,i,view,p6,1",
+            "e7,u7,t,i,view,p7,1\r",
+            "\"e8\",u8,t,i,view,p8,\"1\"",
+            ",,,,,,",
+        ];
+        for n in [7, 4, 2, 3] {
+            let cols = &COLS7[..n];
+            for perm in [false, true] {
+                let mut header: Vec<&str> = cols.to_vec();
+                if perm {
+                    header.reverse();
+                }
+                let body: String = lines
+                    .iter()
+                    .map(|l| {
+                        let f: Vec<&str> = l.split(',').collect();
+                        // keep the malformed shapes: an extra or missing field stays one
+                        let keep = if f.len() == 7 {
+                            &f[..n]
+                        } else if f.len() < 7 {
+                            &f[..(n - 1).min(f.len())]
+                        } else {
+                            &f[..n + 1]
+                        };
+                        keep.join(",") + "\n"
+                    })
+                    .collect();
+                let mut total = 0;
+                for pad in 0..=130 {
+                    let mut file = header.join(",") + "\n";
+                    file += &format!("{},{}\n", "z".repeat(pad), vec!["q"; n - 1].join(","));
+                    file += &body;
+                    for end in [false, true] {
+                        let f = if end {
+                            file.trim_end_matches('\n').to_string()
+                        } else {
+                            file.clone()
+                        };
+                        total += check_with(f.as_bytes(), cols, &WINDOWS, &[usize::MAX]).len();
+                        check_with(f.as_bytes(), cols, &[64], &[1]);
+                    }
+                }
+                assert!(total > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn lines_longer_than_a_window() {
+        let cols = ["a", "b"];
+        for len in [
+            62,
+            63,
+            64,
+            65,
+            127,
+            128,
+            129,
+            191,
+            192,
+            193,
+            300,
+            WINDOW - 1,
+            WINDOW,
+            WINDOW + 1,
+            3 * WINDOW,
+        ] {
+            let v = "v".repeat(len);
+            let cases = [
+                (format!("{v},x"), Some([v.as_str(), "x"])),
+                (format!("\"{v}\",x"), Some([v.as_str(), "x"])),
+                (format!("{v}\",x"), None),
+                (format!("x,{v},y"), None),
+                (v.clone(), None),
+                (format!("x,\"{v}"), None),
+            ];
+            for (line, want) in &cases {
+                for tail in ["\n", "\nx,\"y\"\n", ""] {
+                    let file = format!("a,b\n{line}{tail}");
+                    let got = check(file.as_bytes(), &cols);
+                    let mut expect: Rows = want
+                        .iter()
+                        .map(|r| r.iter().map(|f| f.as_bytes().to_vec()).collect())
+                        .collect();
+                    if tail.len() > 1 {
+                        expect.push(vec![b"x".to_vec(), b"y".to_vec()]);
+                    }
+                    assert_eq!(got, expect, "len {len} tail {tail:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn end_of_input() {
+        let cols = ["a", "b"];
+        let cases: [(&str, &[&[&str]]); 13] = [
+            ("a,b", &[]),
+            ("a,b\n", &[]),
+            ("a,b\n\n", &[]),
+            ("a,b\n\n\n", &[]),
+            ("a,b\nx,y", &[&["x", "y"]]),
+            ("a,b\nx,", &[&["x", ""]]),
+            ("a,b\nx,\"\"", &[&["x", ""]]),
+            ("a,b\nx,\"", &[]),
+            ("a,b\n\"x\",\"y\"", &[&["x", "y"]]),
+            ("a,b\nx,y\r", &[&["x", "y\r"]]),
+            ("a,b\nx,y\n,", &[&["x", "y"], &["", ""]]),
+            ("a,b\nx,y\nz", &[&["x", "y"]]),
+            ("a,b\n,\n", &[&["", ""]]),
+        ];
+        for (file, want) in cases {
+            assert_eq!(check(file.as_bytes(), &cols), rows(want), "{file:?}");
+        }
+        // last byte at every offset around block and window ends
+        for len in 1..=200 {
+            let row = format!("{},y", "x".repeat(len));
+            for end in ["", "\n", "\n\n", ","] {
+                let file = format!("a,b\n{row}{end}");
+                let want: &[&str] = if end == "," {
+                    &[]
+                } else {
+                    &[row.split(',').next().unwrap(), "y"]
+                };
+                let got = check_with(file.as_bytes(), &cols, &WINDOWS, &[usize::MAX]);
+                assert_eq!(
+                    got,
+                    if want.is_empty() {
+                        vec![]
+                    } else {
+                        rows(&[want])
+                    },
+                    "{file:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn header_maps_columns_by_name() {
+        let file = b"\"v\",extra,\"\",id\n1,x,y,a\n\"2\",x,y,\"b\"\n3,x\"y,z,c\n";
+        assert_eq!(check(file, &["id", "v"]), rows(&[&["a", "1"], &["b", "2"]]));
+        let shuffled =
+            "price_cents,ts,event_id,product_id,user_id,event_type,ingest_ts\n9,t,e,p,u,view,i\n";
+        assert_eq!(
+            check(shuffled.as_bytes(), &COLS7),
+            rows(&[&["e", "u", "t", "i", "view", "p", "9"]])
+        );
+        // a selected subset of a wider header, in order: the general path
+        let wide = "a,b,c\n1,2,3\n1,2\n";
+        assert_eq!(check(wide.as_bytes(), &["a", "b"]), rows(&[&["1", "2"]]));
     }
 
     #[test]
     fn exhaustive_short_bodies() {
-        const ALPHA: &[u8] = b"a,\"\n\r";
-        let headers: [(&[u8], &[&str]); 4] = [
-            (b"x", &["x"]),
-            (b"x,y", &["x", "y"]),
-            (b"x,y", &["y"]),
-            (b"x,\"y\",z", &["z", "x", "y"]),
+        const ALPHABET: [u8; 4] = *b"a,\"\n";
+        let headers: [(&str, &[&str]); 6] = [
+            ("a", &["a"]),
+            ("a,b", &["a", "b"]),
+            ("a,b,c", &["a", "b", "c"]),
+            ("a,b,c", &["c", "a"]),
+            ("a,b,c,d", &["a", "b", "c", "d"]),
+            ("a,b,c,d,e,f,g", &["a", "b", "c", "d", "e", "f", "g"]),
         ];
-        let mut body = Vec::new();
         for len in 0..=7u32 {
-            for mut code in 0..ALPHA.len().pow(len) {
-                body.clear();
-                for _ in 0..len {
-                    body.push(ALPHA[code % ALPHA.len()]);
-                    code /= ALPHA.len();
-                }
+            for code in 0..4usize.pow(len) {
+                let body: Vec<u8> = (0..len)
+                    .map(|i| ALPHABET[code / 4usize.pow(i) % 4])
+                    .collect();
                 for (h, cols) in headers {
-                    let mut file = h.to_vec();
-                    file.push(b'\n');
+                    let mut file = format!("{h}\n").into_bytes();
                     file.extend_from_slice(&body);
-                    let want = py_rows(&file, cols);
-                    assert_eq!(
-                        fast_rows(&file, cols, usize::MAX),
-                        want,
-                        "{:?}",
-                        String::from_utf8_lossy(&file)
-                    );
-                    assert_eq!(fast_rows(&file, cols, 1), want, "{:?}", String::from_utf8_lossy(&file));
+                    check_with(&file, cols, &[64], &[usize::MAX]);
                 }
             }
         }
     }
 
     #[test]
-    fn header_mapping() {
-        // reordered, quoted names, first of duplicate names wins, columns we do not read
-        check(
-            b"c,\"b\",a,b\n1,2,3,4\n\"1\",\"2\",\"3\",\"4\"\n1,2,3\n",
-            &["a", "b", "c"],
-        );
-        check(
-            b"a,b,c,d,e,f,g,h,i,j\n0,1,2,3,4,5,6,7,8,9\n0,1,2,3,4,5,6,7,8\n",
-            &["j", "a", "e"],
-        );
-        check(b"z0,z1,z2,z3,z4,z5,z6,z7,z8,a\n0,1,2,3,4,5,6,7,8,9\n", &["a"]);
-        check(b"\"\",a\n1,2\n", &["a"]);
-        let ev = [
-            "event_id",
-            "user_id",
-            "ts",
-            "ingest_ts",
-            "event_type",
-            "product_id",
-            "price_cents",
+    fn random_dirty_files() {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        let atoms: [&str; 12] = [
+            "u",
+            "p123",
+            "",
+            "2026-10-03T19:58:10-04:00",
+            "1791071890000",
+            " x ",
+            "\r",
+            "\"",
+            "\"\"",
+            "view",
+            "a\"b",
+            "\"\"\"",
         ];
-        check(
-            b"price_cents,product_id,event_type,ingest_ts,ts,user_id,event_id\n7,p,view,i,t,u,e\n\"7\",p,view,i,t,u,\"e\"\n",
-            &ev,
-        );
-    }
-
-    #[test]
-    fn every_block_offset() {
-        // Put each structural byte of a line on every offset of a 64-byte block,
-        // with and without the final newline and with fields longer than a block.
-        let long = "q".repeat(70);
-        let lines = [
-            "e1,\"u1\",\"\",x".to_string(),
-            format!("\"{long}\",{long},\"{long}\",\"\""),
-            format!("{long}\",a,b,c"),
-            format!("\"{long},a,b,c"),
-            format!("a,b,c,\"{long}\"\r"),
-            "a,b,c".to_string(),
-            "a,b,c,d,e".to_string(),
-            "\"a\"\"\",b,c,d".to_string(),
-        ];
-        let cols = ["w", "x", "y", "z"];
-        for pad in 0..140 {
-            for (i, line) in lines.iter().enumerate() {
-                let mut file = b"w,x,y,z\n".to_vec();
-                file.extend_from_slice("p".repeat(pad).as_bytes());
-                file.extend_from_slice(b",1,2,3\n");
-                file.extend_from_slice(line.as_bytes());
-                check(&file, &cols);
-                file.push(b'\n');
-                file.extend_from_slice(lines[(i + 1) % lines.len()].as_bytes());
-                file.push(b'\n');
-                check(&file, &cols);
+        for round in 0..400 {
+            let n = [2, 4, 7, 3, 1][round % 5];
+            let cols: Vec<&str> = COLS7[..n.min(7)].to_vec();
+            let mut header = cols.clone();
+            if round % 3 == 1 {
+                header.reverse();
             }
-        }
-    }
-
-    #[test]
-    fn random_bodies() {
-        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        // weighted alphabet: mostly data, plenty of separators and quotes, some high bytes
-        const ALPHA: &[u8] = b"aaaaaab01 ,,,,\"\"\"\n\n\r\x00\x80\xff\xe2";
-        let headers: [(&[u8], &[&str]); 3] = [
-            (b"a,b,c,d,e,f,g", &["a", "b", "c", "d", "e", "f", "g"]),
-            (b"g,\"f\",e,d,c,b,a", &["a", "b", "c", "d", "e", "f", "g"]),
-            (b"a,b", &["b", "a"]),
-        ];
-        for _ in 0..20_000 {
-            let (h, cols) = headers[rng.below(headers.len())];
-            let mut file = h.to_vec();
-            file.push(b'\n');
-            let n = rng.below(600);
-            for _ in 0..n {
-                file.push(ALPHA[rng.below(ALPHA.len())]);
+            if round % 7 == 2 {
+                header.push("extra");
             }
-            check(&file, cols);
-        }
-        // mostly well-formed lines with random dirt, so the valid path is exercised heavily
-        for _ in 0..5_000 {
-            let mut file = b"a,b,c,d,e,f,g\n".to_vec();
-            for _ in 0..rng.below(20) {
-                let nf = if rng.below(10) == 0 { rng.below(9) } else { 7 };
-                for k in 0..nf {
-                    if k > 0 {
-                        file.push(b',');
+            let mut file = header.join(",") + "\n";
+            for _ in 0..rng.below(120) {
+                let fields = match rng.below(40) {
+                    0 => header.len() + 1,
+                    1 => header.len().saturating_sub(1),
+                    2 => 0,
+                    _ => header.len(),
+                };
+                let mut line: Vec<String> = Vec::new();
+                for _ in 0..fields {
+                    let mut v = if rng.below(50) == 0 {
+                        "w".repeat(rng.below(300))
+                    } else {
+                        let pool = if rng.below(8) == 0 { atoms.len() } else { 6 };
+                        atoms[rng.below(pool)].to_string()
+                    };
+                    if rng.below(5) == 0 {
+                        v = format!("\"{v}\"");
                     }
-                    let q = rng.below(5) == 0;
-                    if q {
-                        file.push(b'"');
-                    }
-                    for _ in 0..rng.below(30) {
-                        file.push(if rng.below(200) == 0 {
-                            b'"'
-                        } else {
-                            b'a' + rng.below(26) as u8
-                        });
-                    }
-                    if q && rng.below(30) != 0 {
-                        file.push(b'"');
-                    }
+                    line.push(v);
                 }
-                if rng.below(20) == 0 {
-                    file.push(b'\r');
-                }
-                file.push(b'\n');
+                file += &line.join(",");
+                file += "\n";
             }
-            if rng.below(2) == 0 {
+            if rng.below(4) == 0 {
                 file.pop();
             }
-            check(&file, &["g", "c", "a"]);
+            check_with(file.as_bytes(), &cols, &WINDOWS, &[1, 97, usize::MAX]);
         }
     }
 }

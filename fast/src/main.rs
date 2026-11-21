@@ -424,6 +424,7 @@ fn main() {
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let outd = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let log = |m: &str| eprintln!("[{:>7.3}s] {m}", t0.elapsed().as_secs_f64());
+    eprintln!("CSV kernel: {}", csv::kernel());
 
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(data.join("manifest.json")).expect("manifest")).expect("json");

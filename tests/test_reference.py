@@ -166,6 +166,27 @@ class CsvDialect(unittest.TestCase):
                          (1, 3, 750, "shoes"))
         self.assertEqual(u[(" u1", "2026-10-02")]["revenue_cents"], 700)
 
+    def test_wide_shuffled_header_validates_ignored_quotes_before_dedup(self):
+        # Malformed copies are dropped before dedup, even when their only
+        # stray quotes are in columns that the event consumer never reads.
+        from unittest.mock import patch
+        t = "2026-10-02T10:00:00Z"
+        header = "extra,price_cents,ts,event_id,product_id,user_id,event_type,ingest_ts,tail"
+        with patch.dict(HEADERS, events=header):
+            u, _ = run_case(
+                events=[ev("e1", "u1", t, "purchase", price="500",
+                           ingest="2026-10-02T10:01:00Z")],
+                extra={"events/part-1.csv": [
+                    f'a"b,1,{t},e1,p1,u1,purchase,{t},c"d',
+                    f'"ok",700,{t},e2,p1,u1,purchase,{t},""',
+                    f'"",,{t},e3,p1,u1,view,{t},plain',
+                ]},
+            )
+        self.assertEqual(set(u), {("u1", "2026-10-02")})
+        r = u[("u1", "2026-10-02")]
+        self.assertEqual((r["sessions"], r["events"], r["revenue_cents"]),
+                         (1, 3, 1200))
+
 
 class EventsOrder(unittest.TestCase):
     def test_no_survivors_still_writes_both_empty_tables(self):
