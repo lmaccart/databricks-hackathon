@@ -38,6 +38,15 @@ impl Chunk<'_> {
     pub fn identity_order(&self, width: usize) -> bool {
         self.nfields == width && self.ncols == width && self.idx[..width].iter().copied().eq(0..width)
     }
+
+    pub fn with_data<'a>(&self, data: &'a [u8]) -> Chunk<'a> {
+        Chunk {
+            data,
+            nfields: self.nfields,
+            ncols: self.ncols,
+            idx: self.idx,
+        }
+    }
 }
 
 /// Decode one physical line after the caller has checked the identity header.

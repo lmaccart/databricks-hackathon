@@ -1,5 +1,44 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Runtime-adaptive typed/SIMD event tiles — 2026-11-21 UTC
+
+Canonical event headers now classify independent 64 KiB, whole-line tiles
+using up to eight real rows. If every sample row proves the typed grammar,
+those rows are reused and the rest of the tile stays on the typed path. If any
+sample row misses (for example, a short, long, non-ASCII or NUL-containing ID),
+the strict SIMD column-mapped decoder handles the whole tile. Later tiles
+sample again, so the parser can return to typed decoding. This avoids paying a
+typed miss plus generic decode for every row in consistently unusual regions;
+the existing generic header path and mmap-backed slices remain unchanged.
+
+The unit regression sends one chunk through typed → strict → typed tiles.
+Each tile contains fully quoted fields; the middle tile mixes short ASCII and
+opaque UTF-8 IDs.
+It asserts the selected mode and compares every emitted event and spill entry
+with the strict decoder. The full Python/binary suite, 22 Rust tests, ten
+20,000-event dirty seeds, and public dev answer all matched. A transformed
+canonical-header copy of the public dev input also matched the Python oracle
+for both `f4ac682` and the candidate (117,038 user rows and 27,400 campaign
+rows). The transform prefixes every nonempty ID with `é/`, appends NUL, and
+quotes ID fields while retaining canonical header order.
+
+Same-input native M2 Pro, eight workers, five alternating whole-process pairs,
+fresh output directories, one warmup per binary; all inputs are the public
+1M-event/250k-click dev set or a transformed copy of it. There was no 20M run
+because this experiment was capped at 1M:
+
+| Input | Pairs won | `f4ac682` median | Adaptive median | Less time |
+|---|---:|---:|---:|---:|
+| Public dev | 4/5 | 0.099 s | 0.094 s | 5.0% |
+| Canonical-header non-ASCII dev | 3/5 | 0.340 s | 0.325 s | 4.4% |
+
+Raw pairs (seconds): public dev `0.086/0.094, 0.089/0.088, 0.099/0.092,
+0.102/0.095, 0.106/0.095`; transformed dev `0.340/0.404, 0.358/0.331,
+0.343/0.325, 0.305/0.308, 0.328/0.305` (baseline/candidate). The first
+transformed candidate pair was a clear outlier; its median still improved.
+These small native samples show no public-dev penalty and a modest win on the
+unusual-ID input, not a 20M or scorer-time claim.
+
 ## Experimental word-offset event parser — 2026-11-21 UTC
 
 For the seven-column canonical header, validate and pack 7–9 byte ASCII IDs

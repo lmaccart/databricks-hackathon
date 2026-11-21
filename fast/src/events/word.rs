@@ -1,10 +1,49 @@
-//! The canonical header permits a fixed event grammar. A hit proves every
-//! byte of the physical line; misses retry from the original line start.
+//! The canonical header permits a fixed event grammar. Sampled 64 KiB tiles
+//! use it only when every sample row proves the grammar; otherwise SIMD checks
+//! the complete tile instead of retrying the typed parser for each row.
 use super::*;
+use memchr::memchr;
 
+const ADAPT_TILE: usize = 64 << 10;
+const SAMPLE_ROWS: usize = 8;
 const ONES: u64 = 0x0101_0101_0101_0101;
 const HIGH: u64 = ONES << 7;
 const FLOOR: u64 = ONES * b'-' as u64;
+
+struct Sample {
+    after: usize,
+    rows: [Pending; SAMPLE_ROWS],
+    len: usize,
+}
+
+#[inline]
+fn tile_end(data: &[u8], start: usize) -> usize {
+    let target = start.saturating_add(ADAPT_TILE).min(data.len());
+    if target == data.len() {
+        return target;
+    }
+    memchr(b'\n', &data[target..]).map_or(data.len(), |p| target + p + 1)
+}
+
+fn sample(data: &[u8], limit: usize, sm: &Small, window: (i64, i64, &ManifestClock)) -> Option<Sample> {
+    let mut result = Sample {
+        after: 0,
+        rows: [Pending::default(); SAMPLE_ROWS],
+        len: 0,
+    };
+    while result.len < SAMPLE_ROWS && result.after < limit {
+        let rest = &data[result.after..];
+        let (event, tail) = decode(rest, sm, window)?;
+        let consumed = rest.len() - tail.len();
+        if consumed == 0 {
+            return None;
+        }
+        result.rows[result.len] = event;
+        result.len += 1;
+        result.after += consumed;
+    }
+    Some(result)
+}
 
 #[inline(always)]
 fn quoted(s: &[u8]) -> (bool, &[u8]) {
@@ -292,6 +331,83 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn adaptive_tiles_reenter_typed_grammar_after_opaque_rows() {
+        let path = Path::new("fixture.csv");
+        let sm = read_small(
+            b"product_id,category\nitem0001,shoes\n",
+            b"campaign_id,channel\n",
+            path,
+            path,
+        );
+        let ws = parse_ts(b"2026-10-01T00:00:00Z");
+        let we = parse_ts(b"2026-10-15T00:00:00Z");
+        let clock = ManifestClock::new(ws, we);
+        let window = (ws, we, &clock);
+        let row = |i: usize, opaque: bool| {
+            if opaque {
+                if i % 2 == 0 {
+                    format!(
+                        "\"e{i:05}\",\"u{i:05}\",\"2026-10-03T10:00:00Z\",\"2026-10-03T10:00:00Z\",\"view\",\"item0001\",\"\"\n"
+                    )
+                } else {
+                    format!(
+                        "\"é{i:07}\",\"客{i:07}\",\"2026-10-03T10:00:00Z\",\"2026-10-03T10:00:00Z\",\"view\",\"item0001\",\"\"\n"
+                    )
+                }
+            } else {
+                format!(
+                    "\"e{i:06}\",\"u{i:07}\",\"2026-10-03T10:00:00Z\",\"2026-10-03T10:00:00Z\",\"view\",\"item-7\",\"\"\n"
+                )
+            }
+        };
+        let mut data = Vec::new();
+        let mut i = 0;
+        for opaque in [false, true, false] {
+            let target = data.len() + ADAPT_TILE;
+            while data.len() < target {
+                data.extend_from_slice(row(i, opaque).as_bytes());
+                i += 1;
+            }
+        }
+
+        let mut modes = Vec::new();
+        let mut start = 0;
+        while start < data.len() {
+            let end = tile_end(&data, start);
+            modes.push(sample(&data[start..], end - start, &sm, window).is_some());
+            start = end;
+        }
+        assert_eq!(modes, [true, false, true]);
+
+        let cols = [
+            "event_id",
+            "user_id",
+            "ts",
+            "ingest_ts",
+            "event_type",
+            "product_id",
+            "price_cents",
+        ];
+        let file = [
+            b"event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n".as_slice(),
+            &data,
+        ]
+        .concat();
+        let chunk = chunks_of(&file, &cols, path);
+        let codec = Codec::new();
+        let mut expected = Vec::new();
+        let mut expected_spill = Vec::new();
+        for_rows(&chunk[0], |r| {
+            expected.extend(decode_fields(r, &sm, &codec, window, &mut expected_spill));
+        });
+        let mut got = Vec::new();
+        let mut got_spill = Vec::new();
+        for_events(&chunk[0], &sm, &codec, window, &mut got_spill, |e| got.push(e));
+        assert_eq!(got, expected);
+        assert_eq!(got_spill, expected_spill);
+    }
 }
 
 #[inline(always)]
@@ -353,17 +469,39 @@ pub(super) fn for_events<'a>(
             }
         });
     }
-    let mut rest = c.data;
-    while !rest.is_empty() {
-        if let Some((e, tail)) = decode(rest, sm, window) {
-            emit(e);
-            rest = tail;
-        } else {
-            let (e, tail) = fallback(rest, sm, codec, window, spill);
-            if let Some(e) = e {
-                emit(e);
+    let mut start = 0;
+    while start < c.data.len() {
+        let end = tile_end(c.data, start);
+        let data = &c.data[start..];
+        let limit = end - start;
+        if let Some(sample) = sample(data, limit, sm, window) {
+            // Keep the sampled typed rows so a fast tile does not pay twice
+            // for them; a miss instead sends this whole interval to SIMD.
+            for &event in &sample.rows[..sample.len] {
+                emit(event);
             }
-            rest = tail;
+            let mut consumed = sample.after;
+            while consumed < limit {
+                let rest = &data[consumed..];
+                if let Some((e, tail)) = decode(rest, sm, window) {
+                    emit(e);
+                    consumed += rest.len() - tail.len();
+                } else {
+                    let (e, tail) = fallback(rest, sm, codec, window, spill);
+                    if let Some(e) = e {
+                        emit(e);
+                    }
+                    consumed += rest.len() - tail.len();
+                }
+            }
+        } else {
+            let tile = c.with_data(&c.data[start..end]);
+            for_rows(&tile, |r| {
+                if let Some(event) = decode_fields(r, sm, codec, window, spill) {
+                    emit(event);
+                }
+            });
         }
+        start = end;
     }
 }
