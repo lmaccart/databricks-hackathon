@@ -42,7 +42,6 @@ fn rs() -> RandomState {
 
 // ------------------------------------------------------------------ CSV dialect, timestamps
 
-mod counters;
 mod csv;
 mod ts;
 
@@ -254,7 +253,7 @@ struct UserRow {
 
 struct ShardOut {
     users: Vec<UserRow>,
-    camps: counters::Counts,
+    camps: Map<u64, [i64; 4]>, // (camp << 32 | day) -> sessions, purchasing, revenue, assisted
 }
 
 #[inline]
@@ -262,29 +261,31 @@ fn ckey(camp: u32, day: i32) -> u64 {
     ((camp as u64) << 32) | (day as u32 as u64)
 }
 
-fn finish_categories(catsum: &mut [i64], touched: &mut Vec<u32>, rank: &[u32]) -> Option<u32> {
-    let mut best = None;
-    let mut highest = 0;
-    for c in touched.drain(..) {
-        let v = std::mem::take(&mut catsum[c as usize]);
-        if v > highest || (v == highest && best.is_some_and(|b: u32| rank[c as usize] < rank[b as usize])) {
-            best = Some(c);
-            highest = v;
+fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
+    let mut best: Option<usize> = None;
+    for c in 0..catsum.len() {
+        if catsum[c] == 0 {
+            continue;
         }
+        best = match best {
+            None => Some(c),
+            Some(b) if catsum[c] > catsum[b] || (catsum[c] == catsum[b] && rank[c] < rank[b]) => Some(c),
+            keep => keep,
+        };
     }
-    best
+    best.map(|b| b as u32)
 }
 
-fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec, out: &mut ShardOut) {
+fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec) -> ShardOut {
     evs.sort_unstable_by_key(|e| (e.person, e.ts));
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
     let ncamp = sm.camp_names.len();
-    let ShardOut { users, camps } = out;
+    let mut users = Vec::new();
+    let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
     let mut cnt = vec![0usize; ncamp]; // copies enter and leave the window together
     let mut active: Vec<u32> = Vec::new(); // campaigns with cnt > 0
     let mut pos = vec![0u32; ncamp]; // index of a campaign inside `active`
     let mut catsum = vec![0i64; sm.cat_names.len()];
-    let mut purchased_categories = Vec::new();
 
     let mut ci = 0usize;
     let mut i = 0usize;
@@ -319,7 +320,7 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
             let day = start.div_euclid(DAY) as i32;
             if day != cur_day {
                 if cur_day != i32::MIN {
-                    let top = finish_categories(&mut catsum, &mut purchased_categories, &sm.cat_rank);
+                    let top = top_category(&catsum, &sm.cat_rank);
                     users.push(UserRow {
                         person,
                         day: cur_day,
@@ -328,6 +329,7 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
                         revenue: d_rev,
                         top,
                     });
+                    catsum.iter_mut().for_each(|x| *x = 0);
                 }
                 cur_day = day;
                 (d_sess, d_ev, d_rev) = (0, 0, 0);
@@ -338,11 +340,7 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
                 if e.price != 0 {
                     purch = true;
                     rev += e.price as i64;
-                    let sum = &mut catsum[e.cat as usize];
-                    if *sum == 0 {
-                        purchased_categories.push(e.cat);
-                    }
-                    *sum += e.price as i64;
+                    catsum[e.cat as usize] += e.price as i64;
                 }
             }
             d_sess += 1;
@@ -378,16 +376,16 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
             // The entire latest timestamp run expires together. Identical
             // copies change neither the tie winner nor campaign membership.
             let credit = if lo < hi { clicks[latest].camp } else { ORGANIC };
-            let e = camps.at(credit, day);
+            let e = camps.entry(ckey(credit, day)).or_insert([0; 4]);
             e[0] += 1;
             e[1] += purch as i64;
             e[2] += rev;
             for &a in &active {
-                camps.at(a, day)[3] += 1;
+                camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
             }
             k = m;
         }
-        let top = finish_categories(&mut catsum, &mut purchased_categories, &sm.cat_rank);
+        let top = top_category(&catsum, &sm.cat_rank);
         users.push(UserRow {
             person,
             day: cur_day,
@@ -396,12 +394,14 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
             revenue: d_rev,
             top,
         });
+        catsum.iter_mut().for_each(|x| *x = 0);
         for &a in &active {
             cnt[a as usize] = 0;
         }
         active.clear();
         i = j;
     }
+    ShardOut { users, camps }
 }
 
 // ------------------------------------------------------------------ output
@@ -424,7 +424,6 @@ fn main() {
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let outd = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let log = |m: &str| eprintln!("[{:>7.3}s] {m}", t0.elapsed().as_secs_f64());
-    eprintln!("CSV kernel: {}", csv::kernel());
 
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(data.join("manifest.json")).expect("manifest")).expect("json");
@@ -476,32 +475,20 @@ fn main() {
     jobs.sort_unstable_by_key(|(e, c)| {
         std::cmp::Reverse(e.iter().map(Vec::len).sum::<usize>() + c.iter().map(Vec::len).sum::<usize>())
     });
-    // Several independent partitions share counters. Deal the largest jobs
-    // across the groups instead of leaving all whales in one sequential tail.
-    let groups = (rayon::current_num_threads().min(NS) * 4).min(NS);
-    let mut batches: Vec<Vec<_>> = (0..groups).map(|_| Vec::new()).collect();
-    for (i, job) in jobs.into_iter().enumerate() {
-        batches[i % groups].push(job);
-    }
-    let shape = counters::Shape::new(ws, we, sm.camp_names.len(), groups);
-    let outs: Vec<_> = batches
+    let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|batch| {
-            let mut out = ShardOut {
-                users: vec![],
-                camps: counters::Counts::new(shape),
-            };
-            for (e, c) in batch {
-                process_shard(gather(e), gather(c), &sm, &names.codec, &mut out);
-            }
-            out
-        })
+        .map(|(e, c)| process_shard(gather(e), gather(c), &sm, &names.codec))
         .collect();
     log("sessions done");
 
-    let mut camps = counters::Counts::new(shape);
+    let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
     for o in &outs {
-        camps.merge(&o.camps);
+        for (k, v) in &o.camps {
+            let e = camps.entry(*k).or_insert([0; 4]);
+            for q in 0..4 {
+                e[q] += v[q];
+            }
+        }
     }
     let ud = outd.join("user_daily");
     let cd = outd.join("campaign_daily");
@@ -509,10 +496,9 @@ fn main() {
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
 
     let camp_rows: Vec<output::CampRow> = camps
-        .rows()
-        .into_iter()
+        .iter()
         .map(|(k, v)| {
-            let c = (k >> 32) as u32;
+            let c = (*k >> 32) as u32;
             let (campaign, channel) = if c == ORGANIC {
                 (&b"organic"[..], &b"organic"[..])
             } else {
@@ -521,8 +507,8 @@ fn main() {
             output::CampRow {
                 campaign,
                 channel,
-                day: k as u32 as i32,
-                counts: v,
+                day: *k as u32 as i32,
+                counts: *v,
             }
         })
         .collect();

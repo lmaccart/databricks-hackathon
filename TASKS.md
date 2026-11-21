@@ -46,8 +46,8 @@ Measure every change on the 20M official dataset, 5 runs, report the median. Kee
 - [x] **T11. Fewer passes.** Payloads are routed directly, source buckets are consumed into correctly sized sort buffers, and identical click copies no longer require a separate click-ID partition. See paired medians in `docs/NOTES.md`.
 - [x] **T12. Sort experiments.** Tried two-level bucketing and a gather fused with a radix pass; neither beat the compact exact-key comparison sorts by >3% overall. Kept the faster control.
 - [x] **T13. Output.** Sonnet’s typed, uncompressed PLAIN writer uses the Parquet crate’s supported column API and explicitly closes both tables before exit. Official dev answer exact. Integrated 20M median 1.073 → 1.036 s (-3.4%).
-- [ ] **T14. Image and start-up.** Try `FROM scratch` with a static musl build (`x86_64-unknown-linux-musl`, mimalloc or jemalloc for the allocator). Measure container start to exit.
-- [ ] **T15. Thread tuning.** Read `NCPU`; try rayon pool = 8 vs 16; try `CHUNK` 2/4/8/16 MB and `NS` 64/256/1024.
+- [x] **T14. Image and start-up experiment.** The static musl candidate exceeded the 10-minute local emulated build budget under load and was stopped before producing an image; no static runtime claim. The dynamic Debian candidate built in 59.61 s and passed restricted-container parity. Native allocator/ISA checks in `docs/NOTES.md`.
+- [x] **T15. Thread tuning.** Honor `NCPU` when no explicit Rayon override is set. Native 4-vCPU matched-allocation vs double-oversubscribed trial: 2.068 vs 2.071 s. Four shard/chunk alternatives did not improve end-to-end time. Retain one worker per allocated CPU and the 256-shard / 8 MiB settings.
 
 ## Phase D: lock the final
 
