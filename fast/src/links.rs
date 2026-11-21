@@ -129,6 +129,39 @@ fn root(parent: &[AtomicU32], mut x: u32) -> u32 {
     }
 }
 
+#[inline]
+fn decode_link<'a>(r: &[&'a [u8]; 8], codec: &Codec<'a>) -> Option<(u64, u64)> {
+    if r[0].is_empty() || r[1].is_empty() {
+        return None;
+    }
+    Some((codec.key(r[0]), codec.key(r[1])))
+}
+
+fn for_links<'a>(c: &Chunk<'a>, codec: &Codec<'a>, mut emit: impl FnMut(u64, u64)) {
+    if !c.identity_order(2) {
+        return for_rows(c, |r| {
+            if let Some((a, b)) = decode_link(r, codec) {
+                emit(a, b);
+            }
+        });
+    }
+    let mut rest = c.data;
+    while !rest.is_empty() {
+        let pair =
+            crate::word::id::<b','>(rest).and_then(|(a, s)| crate::word::id::<b'\n'>(s).map(|(b, tail)| (a, b, tail)));
+        if let Some((a, b, tail)) = pair {
+            emit(a, b);
+            rest = tail;
+        } else {
+            rest = crate::word::fallback::<2>(rest, |r| {
+                if let Some((a, b)) = decode_link(r, codec) {
+                    emit(a, b);
+                }
+            });
+        }
+    }
+}
+
 pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
     let codec = Codec::new();
     let parsed: Vec<_> = chunks
@@ -136,12 +169,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         .map(|c| {
             let mut edges = Vec::new();
             let mut keys: Vec<Vec<u64>> = (0..LANES).map(|_| Vec::new()).collect();
-            for_rows(c, |r| {
-                if r[0].is_empty() || r[1].is_empty() {
-                    return;
-                }
-                let a = codec.key(r[0]);
-                let b = codec.key(r[1]);
+            for_links(c, &codec, |a, b| {
                 edges.push((a, b));
                 for k in [a, b] {
                     keys[mix(k) as usize & (LANES - 1)].push(k);
@@ -243,5 +271,52 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         lanes,
         roots,
         count,
+    }
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+    use crate::csv::chunks_of;
+    use std::path::Path;
+
+    #[test]
+    fn link_rows_match_strict_csv_under_byte_mutations() {
+        let header = b"user_id_a,user_id_b\n";
+        let following = b"other0007,other0008\n";
+        let cols = ["user_id_a", "user_id_b"];
+        let check = |row: &[u8], after: &[u8], hdr: &[u8]| {
+            let file = [hdr, row, after].concat();
+            let codec = Codec::new();
+            for c in chunks_of(&file, &cols, Path::new("link.csv")) {
+                let (mut want, mut got) = (vec![], vec![]);
+                for_rows(&c, |r| want.extend(decode_link(r, &codec)));
+                for_links(&c, &codec, |a, b| got.push((a, b)));
+                assert_eq!(got, want, "{row:?} {after:?} {hdr:?}");
+            }
+        };
+        let after = [&b"\n"[..], following].concat();
+        for row in [&b"user00007,user00008"[..], b"\"user0007\",\"user00009\""] {
+            let input = [row, &after].concat();
+            let (_, s) = crate::word::id::<b','>(&input).unwrap();
+            let (_, rest) = crate::word::id::<b'\n'>(s).unwrap();
+            assert_eq!(rest, following);
+            check(row, b"", header);
+            for i in 0..row.len() {
+                check(&row[..i], &after, header);
+                for byte in 0..=255u8 {
+                    let mut changed = row.to_vec();
+                    changed[i] = byte;
+                    check(&changed, &after, header);
+                    if matches!(byte, b',' | b'"' | b'\n') {
+                        changed.insert(i, byte);
+                        check(&changed, &after, header);
+                    }
+                }
+            }
+        }
+        check(b"user00008,user00007\n", b"", b"user_id_b,user_id_a\n");
+        check(b"user00007,user00008,x\n", b"", b"user_id_a,user_id_b,extra\n");
+        check(b"x,\"unicode \xc3\xa9\"", b"", header);
     }
 }

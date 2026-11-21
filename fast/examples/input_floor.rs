@@ -26,6 +26,9 @@ mod person;
 #[allow(dead_code)]
 #[path = "../src/ts.rs"]
 mod ts;
+#[allow(dead_code)]
+#[path = "../src/word.rs"]
+mod word;
 use csv::{Chunk, for_rows};
 use person::Codec;
 const NS: usize = 256;
