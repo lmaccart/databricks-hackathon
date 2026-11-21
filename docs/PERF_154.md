@@ -10,15 +10,16 @@ Seed 7 has 1.921 GB of event, click and link CSVs before the dimension files and
 
 **Practice SHA:** [`1a3d0fdf38c14e858a92ba53bfa29da2f0f9b94a`](https://github.com/lmaccart/databricks-hackathon/commit/1a3d0fdf38c14e858a92ba53bfa29da2f0f9b94a). Its Docker inputs and tests match the [timed `14ccc10` trial](https://github.com/lmaccart/databricks-hackathon/commit/14ccc10f1dfc0845760640eeee2fa3db62b3e87a). It combines physical identity slots, person-local temporal ranges, typed Parquet columns, bounded worker-local campaign/day counters and linked mimalloc 3.3.2 on Linux. Its `fast/` Git tree is `4f81720222297220b46c957167e202e3709c1091`. Extra parser reservations and allocator overrides did not consistently clear the incremental practice threshold head-to-head.
 
-Direct comparisons against the production source of the 1.54 s entry, on four-worker native AMD runners. Each arrow is a pair of medians in seconds, control → candidate. The Docker clock starts before `docker run` and includes container creation and removal. Both executables receive a warmup and write fresh output on every run. The candidate won **53/54 pairs**, including all nine 60M pairs.
+Direct comparisons against the production source of the 1.54 s entry, on four-worker native AMD and Intel runners. Each arrow is a pair of medians in seconds, control → candidate. The Docker clock starts before `docker run` and includes container creation and removal. Both executables receive a warmup and write fresh output on every run. This production build won **71/72 pairs**, including all twelve 60M pairs.
 
 | Release check | 20M seed 7, native | 20M seed 15, native | 20M seed 7, full Docker | 60M seed 13, full Docker | Pairs won |
 |---|---:|---:|---:|---:|---:|
+| [Public practice SHA `1a3d0fd`, Xeon 6975P-C](https://github.com/lmaccart/databricks-hackathon/actions/runs/44938836557) | 1.682 → 1.165 | 1.672 → 1.172 | 1.825 → **1.294** (−29.1%) | 5.508 → **3.871** (−29.7%) | 18/18 |
 | [Python oracle and packaged entry](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937040474) | 1.744 → 1.113 | 1.731 → 1.116 | 2.359 → **1.683** (−28.7%) | 6.617 → **4.627** (−30.1%) | 17/18 |
 | [Independent run and second 60M input](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937344723) | 1.727 → 1.119 | 1.720 → 1.116 | 2.239 → **1.541** (−31.2%) | 6.633 → **4.676** (−29.5%) | 18/18 |
 | [Repeat on EPYC 7763 with Python and peak memory](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937264092) | 2.100 → 1.349 | 2.081 → 1.330 | 2.357 → **1.552** (−34.2%) | 7.120 → **4.729** (−33.6%) | 18/18 |
 
-Across those runs, the candidate won **30/30 native pairs**, **14/15 practice Docker pairs** and **9/9 final-scale Docker pairs**. The one slower practice pair lost 9.3%; individual 60M Docker savings ranged from 25.5% to 35.1%. Percentages in the table compare medians within each job.
+Across those runs, the candidate won **40/40 native pairs**, **19/20 practice Docker pairs** and **12/12 final-scale Docker pairs**. The one slower practice pair lost 9.3%; individual 60M Docker savings ranged from 25.5% to 35.1%. Percentages in the table compare medians within each job.
 
 **Correctness:** both 20M inputs, 60 independent Python comparisons, the official dev answer, all 36 official fixtures, opaque IDs, malformed CSV, and colliding/transitive identity graphs matched. The restricted image matched every row against `7fd1b76` on two 60M inputs: **6,615,971** rows on seed 13 and **6,629,430** on seed 948307. With 14 GiB and no swap, Linux `wait4` reported **7.80 and 7.76 GiB peak RSS** respectively; the corresponding cgroup charges were 3.20 and 3.11 GiB. Shared mapped input can be resident without being charged to this cgroup. Timings and memory were taken in separate runs.
 
@@ -26,7 +27,7 @@ On the oracle runner the first unpaired 60M container after data generation took
 
 For this exact source on the M2 Pro (system allocator, native arm64, eight workers), medians against `7fd1b76` fell **0.673 → 0.553 s** and **0.622 → 0.513 s** on the two 20M seeds, and **1.625 → 1.356 s** on the 60M holdout. It won 15/15 pairs. The holdout's peak process RSS was 8.00 GiB with four workers. The official dev checkers and 36 fixtures both passed locally; six independent Python holdouts at 250k and 1M events also matched.
 
-A separate eight-worker correctness check kept the same ranked people, their timestamps and their clicks, then added one unused campaign dimension. With 3,503 campaigns the dense counters fit; with 3,504 the same 14-day manifest required sparse counters. Both native outputs matched Python on **7,004 user-days and 3,506 campaign-days**, including assist-only rows on two nonconsecutive dates.
+A separate eight-worker correctness check kept the same ranked people, their timestamps and their clicks, then added one unused campaign dimension. With 3,503 campaigns the dense counters fit; with 3,504 the same 14-day manifest required sparse counters. Both modes matched Python on **7,004 user-days and 3,506 campaign-days**, including assist-only rows on two nonconsecutive dates, on both ARM64 and the packaged Linux executable from the public practice SHA. In its untimed 60M container, that SHA peaked at **7.83 GiB RSS**.
 
 ### Earlier checkpoints
 
@@ -60,7 +61,7 @@ On a [four-worker Intel Xeon 6975P-C](https://github.com/lmaccart/databricks-hac
 
 The release won all three alternating pairs in each cell; every output matched the control. The [harness](https://github.com/lmaccart/databricks-hackathon/blob/161fd41/tools/coldcheck_terra.py) flushed and evicted just the generated input files, verified residency with `mincore` before each run, then started the timer. It measured 0 of 469,253 input pages resident at 20M and 0 of 1,393,407 at 60M; the warm runs had all of them resident. Device and storage-service caches were not controlled. A first job that failed the residency check produced no cold timing.
 
-The [positioned-read challenger](https://github.com/lmaccart/databricks-hackathon/commit/bd1fc948d19b26936ab472fa16e439da156878a2) keeps one bounded `pread` buffer per worker and falls back to the mapped input for oversized lines. Against `14ccc10` on a heavily loaded eight-worker Mac, native medians were 6.545 → 6.757 s and 7.230 → 7.269 s on the two 20M seeds, with just 2/10 pair wins. All 36 official fixtures, dev and ten dirty-seed comparisons passed. The Mac test did not control page-cache residency; the Linux comparison below can be reproduced with explicit input-cache control.
+The [positioned-read challenger](https://github.com/lmaccart/databricks-hackathon/commit/bd1fc948d19b26936ab472fa16e439da156878a2) keeps one bounded `pread` buffer per worker and falls back to the mapped input for oversized lines. Against `14ccc10` on a heavily loaded eight-worker Mac, native medians were 6.545 → 6.757 s and 7.230 → 7.269 s on the two 20M seeds, with just 2/10 pair wins. All 36 official fixtures, dev and ten dirty-seed comparisons passed. The two 20M inputs matched on all **4,475,005 user-days and 56,028 campaign-days**, without duplicate keys. The Mac test did not control page-cache residency; the [Linux head-to-head](https://github.com/lmaccart/databricks-hackathon/actions/runs/44939527659) measures both conditions.
 
 ### Container launch and parsing
 

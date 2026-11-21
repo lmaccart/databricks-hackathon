@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Public practice SHA rebuilt and timed directly — 2026-11-21
+
+[`1a3d0fd`](https://github.com/lmaccart/databricks-hackathon/commit/1a3d0fdf38c14e858a92ba53bfa29da2f0f9b94a) won **18/18 pairs** in the [Intel repeat against the 1.54 s control](https://github.com/lmaccart/databricks-hackathon/actions/runs/44938836557). Warm full Docker medians: **1.825 → 1.294 s** at 20M; **5.508 → 3.871 s** at 60M. Both campaign accumulator paths, 60 independent Python comparisons, the official fixtures and all 6,615,971 final-scale rows matched. Peak 60M RSS was 7.83 GiB. Across this run and the three production-identical AMD runs the total is 71/72. The latest organizer result is still 1.54 s.
+
 ## Click record size: keep the release layout — 2026-11-21
 
 The [16-byte click trial](https://github.com/lmaccart/databricks-hackathon/actions/runs/44938958482) matched every row but lost 14/18 pairs against the practice build. Full Docker medians rose from **1.231 to 1.235 s** at 20M and **3.758 to 3.805 s** at 60M. Recommendation: `1a3d0fd`.
