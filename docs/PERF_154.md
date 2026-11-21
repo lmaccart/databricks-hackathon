@@ -18,6 +18,8 @@ Direct comparisons against the production source of the 1.54 s entry, on four-wo
 | [Independent run and second 60M input](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937344723) | 1.727 → 1.119 | 1.720 → 1.116 | 2.239 → **1.541** (−31.2%) | 6.633 → **4.676** (−29.5%) | 18/18 |
 | [Repeat on EPYC 7763 with Python and peak memory](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937264092) | 2.100 → 1.349 | 2.081 → 1.330 | 2.357 → **1.552** (−34.2%) | 7.120 → **4.729** (−33.6%) | 18/18 |
 
+Across those runs, the candidate won **30/30 native pairs**, **14/15 practice Docker pairs** and **9/9 final-scale Docker pairs**. The one slower practice pair lost 9.3%; individual 60M Docker savings ranged from 25.5% to 35.1%. Percentages in the table compare medians within each job.
+
 **Correctness:** both 20M inputs, 60 independent Python comparisons, the official dev answer, all 36 official fixtures, opaque IDs, malformed CSV, and colliding/transitive identity graphs matched. The restricted image matched every row against `7fd1b76` on two 60M inputs: **6,615,971** rows on seed 13 and **6,629,430** on seed 948307. With 14 GiB and no swap, Linux `wait4` reported **7.80 and 7.76 GiB peak RSS** respectively; the corresponding cgroup charges were 3.20 and 3.11 GiB. Shared mapped input can be resident without being charged to this cgroup. Timings and memory were taken in separate runs.
 
 On the oracle runner the first unpaired 60M container after data generation took **9.704 s**; the paired candidate median was **4.627 s**. The first run did not time the control under the same conditions. Use the paired numbers for the measured speedup; the organizers' input-cache state and eight pinned hyperthreads may produce different times.
