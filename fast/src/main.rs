@@ -50,7 +50,7 @@ mod csv;
 mod ts;
 
 use csv::{Chunk, chunks_of, for_rows};
-use ts::{parse_ingest, parse_ts};
+use ts::parse_ts;
 
 // ------------------------------------------------------------------ prices
 
@@ -546,13 +546,11 @@ fn main() {
         ],
     );
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
-    let hs = rs();
-
     let names = person_names(&link_chunks);
     let packing = Packing::new(ws, we, names.count);
     log(&format!("links: {} linked ids", names.count));
 
-    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, ws, we, packing, &hs, &log);
+    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, ws, we, packing, &log);
     log("events deduped");
 
     let cl_by_person = cl_chunks

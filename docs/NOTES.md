@@ -1,5 +1,24 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Exact permuted event claims experiment — 2026-11-20
+
+Against `012174f`, route by the top byte of the reversible event-ID token.
+The shard supplies that byte implicitly; each 16-byte claim holds the other
+56 bits, the full e81 four-stream locator, and 40 bits for ingest order.
+Every valid four-digit F1 ingest fits exactly in signed 39-bit seconds;
+non-F1 or malformed ingests retain the control's millisecond order in a per-chunk
+side table. Bloom and exact lookup take their index and tag bits from that
+same token. The two Bloom scans prefetch six claims ahead. No dense ID domain
+or generator assumptions.
+
+Official dev set, 15 alternating warm pairs, native Mac, 4 workers: **78.2 ms
+→ 77.9 ms** (about **0.4%** faster overall, inconclusive); logged dedup median
+**4 ms → 3 ms**. No large or Docker runs; not a promotion recommendation.
+Both dev checkers, 36/36 official fixtures per implementation, 35 Python tests
+per implementation, all 10 kit dirty seeds, and 17 Rust tests passed. Tests
+cover forced Bloom aliasing, diverse byte IDs, invalid earliest, the full locator
+and millisecond fallback.
+
 ## Round 2 integration: compact streams, exact catalog index and click prefetch — 2026-11-20
 
 The link graph already assigns each exact ID a node. Reuse its canonical root

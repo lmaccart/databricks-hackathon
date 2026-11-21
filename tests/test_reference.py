@@ -89,6 +89,22 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
     return f"{eid},{uid},{ts},{ingest},{etype},{pid},{price}"
 
 
+class EventClaims(unittest.TestCase):
+    def test_exact_bytes_and_distant_ingest_across_files(self):
+        # Quoting does not change identity, but trailing spaces, NULs, Unicode
+        # and prefix extensions do. The distant invalid copy still wins.
+        uid = "a"
+        distinct = ("e1 ", "e1\0", "é1", "e123456789", "e01", "E1")
+        events = [ev(key, uid, WS) for key in ("e1", *distinct)]
+        extra = {"events/part-1.csv": [
+            ev('"e1"', "", WS, ingest="1900-01-01T00:00:00Z"),
+            ev("e1\0", uid, WS, ingest="9999-01-01T00:00:00Z"),
+            ev('"é1"', "", WS, ingest="1900-01-01T00:00:00Z"),
+        ]}
+        users, _ = run_case(events, extra=extra)
+        self.assertEqual(users[(uid, "2026-10-01")]["events"], len(distinct) - 1)
+
+
 class Timestamps(unittest.TestCase):
     def test_forms(self):
         f1 = ms("2026-10-03T23:58:10Z")

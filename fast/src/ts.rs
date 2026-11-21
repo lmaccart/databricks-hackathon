@@ -55,7 +55,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 /// F1 (`F2 == false`, 20 bytes) or F2 (25 bytes), or BAD.
 #[inline(always)]
-fn iso<const F2: bool>(s: &[u8]) -> i64 {
+fn iso<const F2: bool, const SECONDS: bool>(s: &[u8]) -> i64 {
     let a = load8(s, 0) ^ T_DATE;
     let t = load8(s, 8) ^ T_TIME;
     let (z, ok, off_min) = if F2 {
@@ -84,8 +84,8 @@ fn iso<const F2: bool>(s: &[u8]) -> i64 {
     if d < 1 || d > mdays {
         return BAD;
     }
-    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se;
-    (secs - off_min * 60) * 1000 // subtract the offset to get UTC
+    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se - off_min * 60;
+    if SECONDS { secs } else { secs * 1000 }
 }
 
 /// Eight ASCII digits (first byte most significant) as a number, or None.
@@ -163,8 +163,8 @@ fn epoch_ms(s: &[u8]) -> i64 {
 pub fn parse_ts(s: &[u8]) -> i64 {
     // s[4] == '-' rules out F3, so F1/F2 syntax decides alone
     match s.len() {
-        20 if s[4] == b'-' => iso::<false>(s),
-        25 if s[4] == b'-' => iso::<true>(s),
+        20 if s[4] == b'-' => iso::<false, false>(s),
+        25 if s[4] == b'-' => iso::<true, false>(s),
         _ => epoch_ms(s),
     }
 }
@@ -177,6 +177,20 @@ pub fn parse_ingest(s: &[u8]) -> i64 {
         BAD => i64::MAX,
         t => t,
     }
+}
+
+/// The common F1 path supplies both exact milliseconds for the late check
+/// and seconds for the compact claim. Keep the old fallback for other inputs.
+#[inline]
+pub fn ingest_for_claim(s: &[u8]) -> (i64, i64) {
+    if s.len() == 20 && s[4] == b'-' {
+        let seconds = iso::<false, true>(s);
+        if seconds != BAD {
+            return (seconds * 1000, seconds);
+        }
+        return (i64::MAX, BAD);
+    }
+    (parse_ingest(s), BAD)
 }
 
 #[cfg(test)]
