@@ -8,62 +8,143 @@ mod word;
 
 #[derive(Clone, Copy)]
 struct Claim {
-    key_and_target: u64,
-    order_and_target: u64,
+    key: u64,
+    target: u32,
+    order: i64,
 }
 
-// An emitted event has at least six commas. At most one row extends past
-// CHUNK, so the stream kind, per-stream ordinal and shard fit in the claim.
-const _: () = assert!(NS == 256 && (CHUNK / 6 + 1) * 4 * NS < u32::MAX as usize);
 const NONE: u32 = u32::MAX;
 const KEY_BITS: u32 = u64::BITS - NS.trailing_zeros();
 const KEY_MASK: u64 = (1 << KEY_BITS) - 1;
-const TARGET_HI_BITS: u32 = 32 - NS.trailing_zeros();
-const TARGET_HI_MASK: u64 = (1 << TARGET_HI_BITS) - 1;
-// Signed 39-bit seconds cover every four-digit F1 year. In the 40-bit field,
-// the two high bits are 00/11 for seconds and 01 for a side-table index.
+// Four-digit F1 seconds fit below this reserved tag, which indexes the
+// per-chunk millisecond side table for exceptional ingests.
 const SPILL_TAG: u64 = 1 << 38;
-const _: () = assert!(std::mem::size_of::<Claim>() == 16 && ((CHUNK / 6 + 1) as u64) < SPILL_TAG);
+const _: () =
+    assert!(NS == 256 && (CHUNK / 6 + 1) * 4 * NS < u32::MAX as usize && ((CHUNK / 6 + 1) as u64) < SPILL_TAG);
 
 impl Claim {
     #[inline]
-    fn order(ingest: i64, seconds: i64, spill: &mut Vec<i64>) -> u64 {
+    fn order(ingest: i64, seconds: i64, spill: &mut Vec<i64>) -> i64 {
         if seconds != BAD {
             debug_assert!((-(SPILL_TAG as i64)..SPILL_TAG as i64).contains(&seconds));
-            seconds as u64
+            seconds
         } else {
             let i = spill.len() as u64;
             spill.push(ingest);
-            SPILL_TAG | i
+            (SPILL_TAG | i) as i64
         }
     }
 
     #[inline]
-    fn new(mixed: u64, target: u32, order: u64) -> Self {
+    fn new(mixed: u64, target: u32, order: i64) -> Self {
         Self {
-            key_and_target: (mixed & KEY_MASK) | (u64::from(target & (NS as u32 - 1)) << KEY_BITS),
-            order_and_target: (order << TARGET_HI_BITS) | u64::from(target >> NS.trailing_zeros()),
+            // The event-ID bucket supplies the omitted high shard byte.
+            key: mixed & KEY_MASK,
+            target,
+            order,
         }
     }
 
     #[inline]
-    fn key(self) -> u64 {
-        self.key_and_target & KEY_MASK
-    }
-
-    #[inline]
-    fn target(self) -> u32 {
-        (((self.order_and_target & TARGET_HI_MASK) << NS.trailing_zeros()) | (self.key_and_target >> KEY_BITS)) as u32
+    fn from_words(key: u64, metadata: ClaimMeta) -> Self {
+        Self {
+            key,
+            target: metadata.target,
+            order: metadata.order,
+        }
     }
 
     #[inline]
     fn ingest(self, spill: &[i64]) -> i64 {
-        let order = (self.order_and_target as i64) >> TARGET_HI_BITS;
-        if order >= SPILL_TAG as i64 {
-            spill[(order as u64 ^ SPILL_TAG) as usize]
+        if self.order >= SPILL_TAG as i64 {
+            spill[(self.order as u64 ^ SPILL_TAG) as usize]
         } else {
-            order * 1000
+            self.order * 1000
         }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ClaimMeta {
+    order: i64,
+    target: u32,
+}
+
+// One append-only event-ID bucket is striped into a 56-bit reversible key
+// column (the bucket supplies the high shard byte) and paired metadata lines.
+// Unique IDs never touch ingest/locator data during either Bloom traversal.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct ClaimBlock {
+    keys: [std::mem::MaybeUninit<u64>; 8],
+    metadata: [std::mem::MaybeUninit<ClaimMeta>; 8],
+}
+
+impl ClaimBlock {
+    fn new() -> Self {
+        Self {
+            keys: [std::mem::MaybeUninit::uninit(); 8],
+            metadata: [std::mem::MaybeUninit::uninit(); 8],
+        }
+    }
+
+    #[inline]
+    fn key(&self, lane: usize) -> u64 {
+        // Only lanes below ClaimBucket::len are visited.
+        unsafe { self.keys[lane].assume_init() }
+    }
+
+    #[inline]
+    fn meta(&self, lane: usize) -> ClaimMeta {
+        // Only candidate lanes below ClaimBucket::len are visited.
+        unsafe { self.metadata[lane].assume_init() }
+    }
+}
+
+const _: () = assert!(
+    std::mem::size_of::<ClaimBlock>() == 192
+        && std::mem::align_of::<ClaimBlock>() == 64
+        && std::mem::size_of::<ClaimMeta>() == 16
+);
+
+#[derive(Default)]
+struct ClaimBucket {
+    blocks: Vec<ClaimBlock>,
+    len: usize,
+}
+
+impl ClaimBucket {
+    #[inline]
+    fn with_capacity(claims: usize) -> Self {
+        Self {
+            blocks: Vec::with_capacity(claims.div_ceil(8)),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, claim: Claim) {
+        let block = self.len / 8;
+        let lane = self.len % 8;
+        if lane == 0 {
+            self.blocks.push(ClaimBlock::new());
+        }
+        self.blocks[block].keys[lane].write(claim.key);
+        self.blocks[block].metadata[lane].write(ClaimMeta {
+            order: claim.order,
+            target: claim.target,
+        });
+        self.len += 1;
+    }
+
+    #[inline]
+    fn key_at(&self, index: usize) -> u64 {
+        self.blocks[index / 8].key(index % 8)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
     }
 }
 
@@ -102,7 +183,7 @@ struct Pending {
     uid: u64, // zero is never the key of a nonempty ID
     hash: u64,
     ts: i64,
-    claim_order: u64,
+    claim_order: i64,
     price: u32,
     cat: u32,
 }
@@ -153,7 +234,7 @@ fn parse<'a>(
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
-) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
+) -> (Vec<Payload>, Vec<ClaimBucket>, Vec<i64>) {
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Payload> = (0..NS)
         .map(|_| {
@@ -167,7 +248,9 @@ fn parse<'a>(
             p
         })
         .collect();
-    let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
+    let mut claims: Vec<ClaimBucket> = (0..NS)
+        .map(|_| ClaimBucket::with_capacity(reserve + reserve / 8))
+        .collect();
     let mut spill = Vec::new();
     let mut emit = |e: Pending| {
         let mut target = NONE;
@@ -203,21 +286,28 @@ fn parse<'a>(
 }
 
 #[inline]
+#[cfg(test)]
 fn probe_index(c: Claim, mask: usize) -> usize {
-    // The mask excludes the colocated payload-shard byte.
-    c.key_and_target as usize & mask
+    c.key as usize & mask
 }
 
 #[inline]
+#[cfg(test)]
 fn probe(c: Claim, mask: usize) -> (usize, u64) {
-    let k = c.key_and_target;
+    let k = c.key;
     let bits = 1u64.rotate_left((k >> 36) as u32) | 1u64.rotate_left((k >> 42) as u32);
     (probe_index(c, mask), bits)
 }
 
 #[inline]
-fn prefetch(bloom: &[(u64, u64)], c: Claim, mask: usize) {
-    let ptr: *const (u64, u64) = &bloom[probe_index(c, mask)];
+fn probe_key(key: u64, mask: usize) -> (usize, u64) {
+    let bits = 1u64.rotate_left((key >> 36) as u32) | 1u64.rotate_left((key >> 42) as u32);
+    (key as usize & mask, bits)
+}
+
+#[inline]
+fn prefetch(bloom: &[(u64, u64)], key: u64, mask: usize) {
+    let ptr: *const (u64, u64) = &bloom[key as usize & mask];
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
@@ -232,7 +322,13 @@ fn prefetch(bloom: &[(u64, u64)], c: Claim, mask: usize) {
     let _ = ptr;
 }
 
-fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location> {
+struct LoserPass {
+    locations: Vec<Location>,
+    claims: usize,
+    candidates: usize,
+}
+
+fn losers(parts: Vec<(usize, ClaimBucket)>, spills: &[Vec<i64>]) -> LoserPass {
     let n: usize = parts.iter().map(|(_, v)| v.len()).sum();
     // Local blocked Bloom: the second occurrence of any ID necessarily finds
     // both bits already set and marks it suspect. False positives go to an
@@ -240,14 +336,15 @@ fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location>
     // every duplicate, too; no assumption about ingest order or validity.
     let words = n.div_ceil(8).next_power_of_two();
     let mut bloom = vec![(0u64, 0u64); words];
-    let mask = (words - 1) & KEY_MASK as usize;
+    let mask = words - 1;
     let mut suspects = 0usize;
     for (_, claims) in &parts {
-        for (j, &c) in claims.iter().enumerate() {
-            if let Some(&next) = claims.get(j + 6) {
-                prefetch(&bloom, next, mask);
+        for j in 0..claims.len() {
+            let key = claims.key_at(j);
+            if j + 6 < claims.len() {
+                prefetch(&bloom, claims.key_at(j + 6), mask);
             }
-            let (i, b) = probe(c, mask);
+            let (i, b) = probe_key(key, mask);
             let (seen, repeated) = &mut bloom[i];
             if *seen & b == b {
                 *repeated |= b;
@@ -256,44 +353,62 @@ fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location>
             *seen |= b;
         }
     }
-    let mut remove = Vec::new();
+    let mut result = LoserPass {
+        locations: Vec::new(),
+        claims: n,
+        candidates: 0,
+    };
     if suspects == 0 {
-        return remove;
+        return result;
     }
     let mut best = HashMap::with_capacity_and_hasher(suspects, BuildHasherDefault::<ClaimHasher>::default());
     for (batch, claims) in parts {
-        for (j, &c) in claims.iter().enumerate() {
-            if let Some(&next) = claims.get(j + 6) {
-                prefetch(&bloom, next, mask);
-            }
-            let (i, b) = probe(c, mask);
-            if bloom[i].1 & b != b {
-                continue;
-            }
-            let loc = Location {
-                batch,
-                target: c.target(),
-            };
-            let ingest = c.ingest(&spills[batch]);
-            let lost = match best.entry(c.key()) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((ingest, loc));
-                    continue;
+        for (block_index, block) in claims.blocks.iter().enumerate() {
+            let valid = (claims.len() - block_index * 8).min(8);
+            let mut candidate_lanes = 0u8;
+            for lane in 0..valid {
+                let j = block_index * 8 + lane;
+                if j + 6 < claims.len() {
+                    prefetch(&bloom, claims.key_at(j + 6), mask);
                 }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if ingest < e.get().0 {
-                        e.insert((ingest, loc)).1
-                    } else {
-                        loc
+                let key = block.key(lane);
+                let (i, b) = probe_key(key, mask);
+                if bloom[i].1 & b == b {
+                    candidate_lanes |= 1 << lane;
+                }
+            }
+            // The key summary decides candidate lanes before any paired
+            // ordering/locator bytes are loaded.
+            while candidate_lanes != 0 {
+                let lane = candidate_lanes.trailing_zeros() as usize;
+                candidate_lanes &= candidate_lanes - 1;
+                result.candidates += 1;
+                let c = Claim::from_words(block.key(lane), block.meta(lane));
+                let loc = Location {
+                    batch,
+                    target: c.target,
+                };
+                let ingest = c.ingest(&spills[batch]);
+                let lost = match best.entry(c.key) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert((ingest, loc));
+                        continue;
                     }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        if ingest < e.get().0 {
+                            e.insert((ingest, loc)).1
+                        } else {
+                            loc
+                        }
+                    }
+                };
+                if lost.target != NONE {
+                    result.locations.push(lost);
                 }
-            };
-            if lost.target != NONE {
-                remove.push(lost);
             }
         }
     }
-    remove
+    result
 }
 
 pub(super) fn by_person<'a>(
@@ -311,23 +426,40 @@ pub(super) fn by_person<'a>(
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
     let mut spills = Vec::with_capacity(parsed.len());
-    let mut claims: Vec<Vec<_>> = (0..NS).map(|_| Vec::new()).collect();
+    let mut claims: Vec<Vec<(usize, ClaimBucket)>> = (0..NS).map(|_| Vec::new()).collect();
     for (batch, (payload, cs, spill)) in parsed.into_iter().enumerate() {
         payloads.push(payload);
         spills.push(spill);
         for (bucket, c) in claims.iter_mut().zip(cs) {
-            if !c.is_empty() {
+            if c.len() != 0 {
                 bucket.push((batch, c));
             }
         }
     }
     let removals: Vec<_> = claims.into_par_iter().map(|parts| losers(parts, &spills)).collect();
     let mut by_batch: Vec<Vec<u32>> = (0..payloads.len()).map(|_| Vec::new()).collect();
-    for locations in removals {
-        for loc in locations {
+    let mut total_claims = 0usize;
+    let mut total_candidates = 0usize;
+    for pass in removals {
+        total_claims += pass.claims;
+        total_candidates += pass.candidates;
+        for loc in pass.locations {
             by_batch[loc.batch].push(loc.target);
         }
     }
+    let key_scan_bytes = total_claims.saturating_mul(16);
+    let candidate_metadata_bytes = total_candidates.saturating_mul(std::mem::size_of::<ClaimMeta>());
+    let previous_scan_bytes = total_claims.saturating_mul(32);
+    let scan_savings = previous_scan_bytes.saturating_sub(key_scan_bytes + candidate_metadata_bytes);
+    let scan_savings_pct = if previous_scan_bytes == 0 {
+        0.0
+    } else {
+        100.0 * scan_savings as f64 / previous_scan_bytes as f64
+    };
+    log(&format!(
+        "event dedup lanes: {total_candidates}/{total_claims} metadata; logical scan bytes {}/{previous_scan_bytes} ({scan_savings_pct:.1}% less)",
+        key_scan_bytes + candidate_metadata_bytes,
+    ));
     payloads.par_iter_mut().zip(by_batch).for_each(|(payload, locations)| {
         if locations.is_empty() {
             return;
@@ -368,9 +500,47 @@ mod tests {
         assert_eq!(probe(later, 1023), probe(distinct, 1023));
         let mut spill = Vec::new();
         let invalid = Claim::new(id, NONE, Claim::order(1234, BAD, &mut spill));
-        let lost = losers(vec![(0, vec![later, distinct]), (1, vec![invalid])], &[vec![], spill]);
-        assert_eq!(lost.len(), 1);
-        assert_eq!((lost[0].batch, lost[0].target), (0, 0));
+        let mut first = ClaimBucket::with_capacity(2);
+        first.push(later);
+        first.push(distinct);
+        let mut second = ClaimBucket::with_capacity(1);
+        second.push(invalid);
+        let lost = losers(vec![(0, first), (1, second)], &[vec![], spill]);
+        assert_eq!(lost.locations.len(), 1);
+        assert_eq!((lost.locations[0].batch, lost.locations[0].target), (0, 0));
+        assert_eq!(lost.candidates, 3);
+    }
+
+    #[test]
+    fn striped_claim_blocks_keep_keys_separate_from_candidate_metadata() {
+        assert_eq!(std::mem::align_of::<ClaimBlock>(), 64);
+        assert_eq!(std::mem::size_of::<ClaimBlock>(), 192);
+        assert_eq!(std::mem::offset_of!(ClaimBlock, metadata), 64);
+
+        let mut claims = ClaimBucket::with_capacity(8);
+        let mut spill = Vec::new();
+        for (i, target) in [0, 1, 0x5555_aaaa, NONE, 256, 255, 7, 9].into_iter().enumerate() {
+            let id = (i as u64 + 1) | (81 << KEY_BITS);
+            claims.push(Claim::new(
+                id,
+                target,
+                Claim::order(1_234 + i as i64 * 1000, BAD, &mut spill),
+            ));
+        }
+
+        // A first-pass key traversal can stay within the first aligned line;
+        // locators and ordering live only in the paired metadata lines.
+        assert_eq!(claims.len(), 8);
+        assert_eq!(claims.blocks[0].key(0), 1);
+        assert_eq!(claims.blocks[0].key(7), 8);
+        for (lane, expected) in [0, 1, 0x5555_aaaa, NONE, 256, 255, 7, 9].into_iter().enumerate() {
+            let meta = claims.blocks[0].meta(lane);
+            assert_eq!(Claim::from_words(claims.blocks[0].key(lane), meta).target, expected);
+            assert_eq!(
+                Claim::from_words(claims.blocks[0].key(lane), meta).ingest(&spill),
+                1_234 + lane as i64 * 1000
+            );
+        }
     }
 
     #[test]
@@ -394,8 +564,8 @@ mod tests {
                     let (ms, secs) = clock.ingest_for_claim(s);
                     let claim = Claim::new(mixed, target, Claim::order(ms, secs, &mut spill));
                     assert_eq!(claim.ingest(&spill), ts::parse_ingest(s));
-                    assert_eq!(claim.target(), target);
-                    let reconstructed = claim.key() | ((mixed >> KEY_BITS) << KEY_BITS);
+                    assert_eq!(claim.target, target);
+                    let reconstructed = claim.key | ((mixed >> KEY_BITS) << KEY_BITS);
                     assert_eq!(id, codec.bytes(links::unmix(reconstructed), &mut [0; 9]));
                 }
             }

@@ -209,7 +209,7 @@ fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestCloc
     let mut e = Pending {
         claim_key: links::mix(eid),
         ts,
-        claim_order: seconds as u64, // same exact F1 seconds encoding as Claim::order
+        claim_order: seconds, // same exact F1 seconds value as Claim::order
         ..Default::default()
     };
     // The accepted forms (four-digit civil year or 13 digits) make the

@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Striped exact-claim scan experiment — 2026-11-21
+
+Relative to base `4933dbe`, the per-event-ID bucket now stores eight reversible key words in an aligned 64-byte line, followed by eight 16-byte order/locator records in aligned metadata lines. Bloom marking and candidate-summary traversal read only keys; the second pass builds an 8-bit lane mask and loads metadata only for selected lanes. The key remains exact within its bucket (which supplies the omitted high shard byte); Bloom bits only select candidates, and the complete key still indexes earliest-ingest selection. The original full-width signed order and `NONE` target remain lossless, including exceptional-date side-table orders and opaque IDs. Appending a claim still performs one bucket push, not a second scatter or input reread.
+
+On the 1M-event dev set, 1,071,554 claims selected 116,295 metadata lanes (10.85%). The logical scan model is 19,005,584 bytes (two 8-byte key traversals plus 16 bytes per selected metadata lane), versus 34,289,728 bytes for two full 16-byte claim traversals: 44.6% less. This is a load-volume model, not measured DRAM traffic: a selected lane can fetch its whole metadata cache line, and the second key scan may hit cache. Claim storage rises from 16 to 24 bytes per event (+50%), trading memory for fewer metadata loads; no 20M timing or Docker run was made per the experiment scope.
+
+Validation: 41 reference and binary tests, 10 dirty 20k seeds, 36 official fixtures, and both dev comparers passed (117,038 user rows / 27,400 campaign rows, zero differences). Rust unit coverage checks 64-byte alignment, the 64-byte key-column offset, exact key/metadata separation, high locator values, `NONE`, spill orders and byte-exact key recovery.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).
