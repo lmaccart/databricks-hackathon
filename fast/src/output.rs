@@ -1,48 +1,26 @@
-//! Parquet output: one row group per file, PLAIN, uncompressed, no statistics.
-//!
-//! Rows are pushed straight into the parquet crate's typed column writers in
-//! small blocks, so there is no intermediate Arrow array (and no second copy of
-//! every column). Only the crate's own encoders, page framing, footer and
-//! thrift code write bytes; nothing here touches the file format.
-//!
-//! Schema (rules.md, Outputs): strings are `BYTE_ARRAY (STRING)`, `day` is
-//! `INT32 (DATE)`, counts are `INT64`, only `top_category` is nullable.
-//! Every string is checked to be UTF-8 before it reaches a page; NUL bytes
-//! and non-ASCII text are legal and byte-exact.
+//! Direct PLAIN Parquet pages, framed and described by the parquet crate.
+//! The only nullable column uses bit-packed definition levels; IDs are UTF-8
+//! bytes without normalization. Row groups and pages are bounded independently.
 use crate::UserRow;
 use bytes::Bytes;
-use parquet::basic::{ConvertedType, LogicalType, Repetition, Type as Physical};
-use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
-use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesPtr};
-use parquet::file::writer::{SerializedColumnWriter, SerializedFileWriter, SerializedRowGroupWriter};
-use parquet::schema::types::{Type, TypePtr};
+use parquet::basic::{ConvertedType, Encoding, LogicalType, Repetition, Type as Physical};
+use parquet::column::page::{CompressedPage, Page, PageWriter};
+use parquet::file::metadata::{
+    ColumnChunkMetaData, FileMetaData, ParquetMetaData, ParquetMetaDataWriter, RowGroupMetaData,
+};
+use parquet::file::writer::{SerializedPageWriter, TrackedWrite};
+use parquet::schema::types::{SchemaDescriptor, Type};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Values handed to a column writer per call. Also the writer's own page-size
-/// check interval, so a page never overshoots its limit by more than a block.
-const BLOCK: usize = 4096;
-
-fn props() -> WriterPropertiesPtr {
-    Arc::new(
-        WriterProperties::builder()
-            .set_dictionary_enabled(false)
-            .set_statistics_enabled(EnabledStatistics::None)
-            .set_write_batch_size(BLOCK)
-            .set_data_page_row_count_limit(usize::MAX)
-            .build(),
-    )
-}
+const GROUP_ROWS: usize = 65_536;
+const PAGE_BYTES: usize = 1024 * 1024;
+const LEVEL_RESERVE: usize = 4 + 3 + GROUP_ROWS.div_ceil(8);
 
 fn field(name: &str, physical: Physical, logical: Option<LogicalType>, optional: bool) -> Arc<Type> {
-    let rep = if optional {
-        Repetition::OPTIONAL
-    } else {
-        Repetition::REQUIRED
-    };
     let converted = match &logical {
         Some(LogicalType::String) => ConvertedType::UTF8,
         Some(LogicalType::Date) => ConvertedType::DATE,
@@ -50,104 +28,183 @@ fn field(name: &str, physical: Physical, logical: Option<LogicalType>, optional:
     };
     Arc::new(
         Type::primitive_type_builder(name, physical)
-            .with_repetition(rep)
+            .with_repetition(if optional {
+                Repetition::OPTIONAL
+            } else {
+                Repetition::REQUIRED
+            })
             .with_logical_type(logical)
             .with_converted_type(converted)
             .build()
             .expect("column type"),
     )
 }
-
-fn schema(fields: Vec<Arc<Type>>) -> TypePtr {
-    Arc::new(
+fn string(name: &str, optional: bool) -> Arc<Type> {
+    field(name, Physical::BYTE_ARRAY, Some(LogicalType::String), optional)
+}
+fn date() -> Arc<Type> {
+    field("day", Physical::INT32, Some(LogicalType::Date), false)
+}
+fn integer(name: &str, narrow: bool) -> Arc<Type> {
+    field(
+        name,
+        if narrow { Physical::INT32 } else { Physical::INT64 },
+        None,
+        false,
+    )
+}
+fn schema(fields: Vec<Arc<Type>>) -> Arc<SchemaDescriptor> {
+    Arc::new(SchemaDescriptor::new(Arc::new(
         Type::group_type_builder("schema")
             .with_fields(fields)
             .build()
             .expect("schema"),
-    )
+    )))
 }
-
-fn string(name: &str, optional: bool) -> Arc<Type> {
-    field(name, Physical::BYTE_ARRAY, Some(LogicalType::String), optional)
+fn int(out: &mut Vec<u8>, value: i64, narrow: bool) {
+    if narrow {
+        out.extend_from_slice(&i32::try_from(value).expect("integer width").to_le_bytes());
+    } else {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
 }
-fn date(name: &str) -> Arc<Type> {
-    field(name, Physical::INT32, Some(LogicalType::Date), false)
+fn text(out: &mut Vec<u8>, put: impl FnOnce(&mut Vec<u8>)) {
+    let start = out.len();
+    out.extend_from_slice(&[0; 4]);
+    put(out);
+    let len = out.len() - start - 4;
+    assert!(std::str::from_utf8(&out[start + 4..]).is_ok(), "IDs must be UTF-8");
+    out[start..start + 4].copy_from_slice(&u32::try_from(len).expect("Parquet string too long").to_le_bytes());
 }
-fn long(name: &str) -> Arc<Type> {
-    field(name, Physical::INT64, None, false)
-}
-
-/// Fixed-width column: `value` is called once per row, in order.
-fn fixed<'a, T: DataType, R: 'a>(
-    cw: &mut SerializedColumnWriter<'_>,
-    mut rows: impl Iterator<Item = &'a R>,
-    value: impl Fn(&R) -> T::T,
-) where
-    T::T: Copy,
-{
-    let mut buf: Vec<T::T> = Vec::with_capacity(BLOCK);
+fn varint(mut n: usize, out: &mut [u8; 3]) -> usize {
+    let mut i = 0;
     loop {
-        buf.clear();
-        buf.extend(rows.by_ref().take(BLOCK).map(&value));
-        if buf.is_empty() {
-            return;
+        out[i] = (n as u8 & 127) | if n >= 128 { 128 } else { 0 };
+        i += 1;
+        n >>= 7;
+        if n == 0 {
+            return i;
         }
-        cw.typed::<T>().write_batch(&buf, None, None).expect("write column");
     }
 }
 
-/// String column: `put` appends the row's bytes to the arena and returns
-/// false for NULL (appending nothing). A block's values are views into one
-/// shared allocation, so the only per-value cost is a reference-count bump.
-fn strings<'a, R: 'a>(
-    cw: &mut SerializedColumnWriter<'_>,
-    mut rows: impl Iterator<Item = &'a R>,
-    nullable: bool,
-    mut put: impl FnMut(&R, &mut Vec<u8>) -> bool,
-) {
-    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(BLOCK);
-    let mut defs: Vec<i16> = Vec::with_capacity(BLOCK);
-    let mut vals: Vec<ByteArray> = Vec::with_capacity(BLOCK);
-    loop {
-        let mut arena: Vec<u8> = Vec::with_capacity(BLOCK * 12);
-        spans.clear();
-        defs.clear();
-        for r in rows.by_ref().take(BLOCK) {
-            let start = arena.len();
-            let present = put(r, &mut arena);
-            if present {
-                assert!(std::str::from_utf8(&arena[start..]).is_ok(), "IDs must be UTF-8");
-                spans.push((start, arena.len()));
+struct Output {
+    sink: TrackedWrite<File>,
+    schema: Arc<SchemaDescriptor>,
+    groups: Vec<RowGroupMetaData>,
+    buf: Vec<u8>,
+}
+impl Output {
+    fn new(path: &Path, schema: Arc<SchemaDescriptor>) -> Self {
+        let mut sink = TrackedWrite::new(File::create(path).expect("create parquet"));
+        sink.write_all(b"PAR1").expect("magic");
+        Self {
+            sink,
+            schema,
+            groups: vec![],
+            buf: Vec::new(),
+        }
+    }
+    fn column<R>(
+        &mut self,
+        index: usize,
+        rows: &[R],
+        optional: bool,
+        mut put: impl FnMut(&R, &mut Vec<u8>) -> bool,
+    ) -> ColumnChunkMetaData {
+        let start = self.sink.bytes_written();
+        let mut cursor = 0;
+        while cursor < rows.len() {
+            self.buf.clear();
+            if optional {
+                self.buf.resize(LEVEL_RESERVE, 0);
             }
-            defs.push(present as i16);
+            let mut n = 0;
+            while cursor < rows.len() && n < GROUP_ROWS && (n == 0 || self.buf.len() < PAGE_BYTES) {
+                let before = self.buf.len();
+                let present = put(&rows[cursor], &mut self.buf);
+                assert!(optional || present, "null in required column");
+                // A long field can cross the page limit. Retry it on a fresh
+                // page rather than letting an otherwise valid page overflow.
+                if self.buf.len() > i32::MAX as usize && n != 0 {
+                    self.buf.truncate(before);
+                    break;
+                }
+                if optional && present {
+                    self.buf[7 + n / 8] |= 1 << (n % 8);
+                }
+                n += 1;
+                cursor += 1;
+            }
+            if optional {
+                // Parquet V1: four-byte level-stream length, then one hybrid
+                // bit-packed run (padded to a multiple of eight values).
+                let level_bytes = n.div_ceil(8);
+                let mut header = [0u8; 3];
+                let h = varint(level_bytes * 2 + 1, &mut header);
+                let prefix = 4 + h + level_bytes;
+                self.buf.copy_within(7..7 + level_bytes, 4 + h);
+                self.buf[4..4 + h].copy_from_slice(&header[..h]);
+                self.buf[..4].copy_from_slice(&(u32::try_from(h + level_bytes).unwrap()).to_le_bytes());
+                self.buf.copy_within(LEVEL_RESERVE.., prefix);
+                self.buf.truncate(prefix + self.buf.len() - LEVEL_RESERVE);
+            }
+            let data = Bytes::from(std::mem::take(&mut self.buf));
+            let size = data.len();
+            assert!(size <= i32::MAX as usize, "Parquet page exceeds format limit");
+            let page = Page::DataPage {
+                buf: data.clone(),
+                num_values: n as u32,
+                encoding: Encoding::PLAIN,
+                def_level_encoding: Encoding::RLE,
+                rep_level_encoding: Encoding::RLE,
+                statistics: None,
+            };
+            SerializedPageWriter::new(&mut self.sink)
+                .write_page(CompressedPage::new(page, size))
+                .expect("write page");
+            self.buf = Vec::from(data.try_into_mut().expect("page buffer exclusively owned"));
         }
-        if defs.is_empty() {
-            return;
-        }
-        let shared = Bytes::from(arena);
-        vals.clear();
-        vals.extend(spans.iter().map(|&(a, b)| ByteArray::from(shared.slice(a..b))));
-        let levels = nullable.then_some(&defs[..]);
-        cw.typed::<ByteArrayType>()
-            .write_batch(&vals, levels, None)
-            .expect("write column");
+        let size = i64::try_from(self.sink.bytes_written() - start).expect("column size");
+        ColumnChunkMetaData::builder(self.schema.column(index))
+            .set_encodings(vec![Encoding::PLAIN, Encoding::RLE])
+            .set_num_values(i64::try_from(rows.len()).expect("row count"))
+            .set_data_page_offset(i64::try_from(start).expect("file offset"))
+            .set_total_compressed_size(size)
+            .set_total_uncompressed_size(size)
+            .build()
+            .expect("column metadata")
+    }
+    fn group(&mut self, rows: usize, columns: Vec<ColumnChunkMetaData>) {
+        let bytes = columns.iter().map(|c| c.uncompressed_size()).sum();
+        self.groups.push(
+            RowGroupMetaData::builder(self.schema.clone())
+                .set_column_metadata(columns)
+                .set_total_byte_size(bytes)
+                .set_num_rows(i64::try_from(rows).expect("row count"))
+                .build()
+                .expect("row group"),
+        );
+    }
+    fn finish(mut self) {
+        let rows = self.groups.iter().map(|g| g.num_rows()).sum();
+        let metadata = ParquetMetaData::new(
+            FileMetaData::new(1, rows, Some("shopping_sessions".into()), None, self.schema, None),
+            self.groups,
+        );
+        // The metadata writer owns an internal buffered writer and does not
+        // expose its final flush error. Buffer the footer in memory, then
+        // explicitly write and flush the real file so disk errors propagate.
+        let mut footer = Vec::new();
+        ParquetMetaDataWriter::new(&mut footer, &metadata)
+            .finish()
+            .expect("footer");
+        assert!(footer.len() - 8 <= u32::MAX as usize, "Parquet footer too large");
+        self.sink.write_all(&footer).expect("write footer");
+        self.sink.flush().expect("flush parquet");
     }
 }
 
-fn next<'a, W: Write + Send>(rg: &'a mut SerializedRowGroupWriter<'_, W>) -> SerializedColumnWriter<'a> {
-    rg.next_column().expect("column").expect("schema has more columns")
-}
-
-fn close(cw: SerializedColumnWriter<'_>) {
-    cw.close().expect("close column");
-}
-
-fn file(path: &Path, schema: TypePtr) -> SerializedFileWriter<File> {
-    SerializedFileWriter::new(File::create(path).expect("create parquet"), schema, props()).expect("writer")
-}
-
-/// `user_daily`: shards are grouped into at most `parts` files, one thread each.
-/// `key` appends a person's name (byte-wise smallest of their IDs).
 pub fn user_daily(
     dir: &Path,
     shards: &[&[UserRow]],
@@ -155,105 +212,117 @@ pub fn user_daily(
     key: &(impl Fn(u64, &mut Vec<u8>) + Sync),
     cats: &[Vec<u8>],
 ) {
-    let per = shards.len().div_ceil(parts.max(1)).max(1);
+    let mut narrow = [true; 3];
+    for r in shards.iter().flat_map(|s| s.iter()) {
+        for (ok, value) in narrow.iter_mut().zip([r.sessions, r.events, r.revenue]) {
+            *ok &= i32::try_from(value).is_ok();
+        }
+    }
     let sch = schema(vec![
         string("user_id", false),
-        date("day"),
-        long("sessions"),
-        long("events"),
-        long("revenue_cents"),
+        date(),
+        integer("sessions", narrow[0]),
+        integer("events", narrow[1]),
+        integer("revenue_cents", narrow[2]),
         string("top_category", true),
     ]);
-    // part-0 always exists so the table is never an empty folder.
+    let per = shards.len().div_ceil(parts.max(1)).max(1);
     let groups: Vec<&[&[UserRow]]> = if shards.is_empty() {
-        vec![&[][..]]
+        vec![&[]]
     } else {
         shards.chunks(per).collect()
     };
-    groups.par_iter().enumerate().for_each(|(i, group)| {
-        let n: usize = group.iter().map(|s| s.len()).sum();
-        if n == 0 && i > 0 {
+    groups.par_iter().enumerate().for_each(|(i, shards)| {
+        if i > 0 && shards.iter().all(|s| s.is_empty()) {
             return;
         }
-        let rows = || group.iter().flat_map(|s| s.iter());
-        let mut w = file(&dir.join(format!("part-{i}.parquet")), sch.clone());
-        if n > 0 {
-            let mut rg = w.next_row_group().expect("row group");
-            let mut c = next(&mut rg);
-            strings(&mut c, rows(), false, |r, out| {
-                key(r.person, out);
+        let mut out = Output::new(&dir.join(format!("part-{i}.parquet")), sch.clone());
+        let mut iter = shards.iter().flat_map(|s| s.iter());
+        let mut batch = Vec::with_capacity(GROUP_ROWS);
+        loop {
+            batch.clear();
+            batch.extend(iter.by_ref().take(GROUP_ROWS));
+            if batch.is_empty() {
+                break;
+            }
+            let mut cols = Vec::with_capacity(6);
+            cols.push(out.column(0, &batch, false, |r, b| {
+                text(b, |b| key(r.person, b));
                 true
-            });
-            close(c);
-            let mut c = next(&mut rg);
-            fixed::<Int32Type, _>(&mut c, rows(), |r| r.day);
-            close(c);
-            let mut c = next(&mut rg);
-            fixed::<Int64Type, _>(&mut c, rows(), |r| r.sessions);
-            close(c);
-            let mut c = next(&mut rg);
-            fixed::<Int64Type, _>(&mut c, rows(), |r| r.events);
-            close(c);
-            let mut c = next(&mut rg);
-            fixed::<Int64Type, _>(&mut c, rows(), |r| r.revenue);
-            close(c);
-            let mut c = next(&mut rg);
-            strings(&mut c, rows(), true, |r, out| match r.top {
+            }));
+            cols.push(out.column(1, &batch, false, |r, b| {
+                b.extend_from_slice(&r.day.to_le_bytes());
+                true
+            }));
+            cols.push(out.column(2, &batch, false, |r, b| {
+                int(b, r.sessions, narrow[0]);
+                true
+            }));
+            cols.push(out.column(3, &batch, false, |r, b| {
+                int(b, r.events, narrow[1]);
+                true
+            }));
+            cols.push(out.column(4, &batch, false, |r, b| {
+                int(b, r.revenue, narrow[2]);
+                true
+            }));
+            cols.push(out.column(5, &batch, true, |r, b| match r.top {
                 Some(t) => {
-                    out.extend_from_slice(&cats[t as usize]);
+                    text(b, |b| b.extend_from_slice(&cats[t as usize]));
                     true
                 }
                 None => false,
-            });
-            close(c);
-            rg.close().expect("close row group");
+            }));
+            out.group(batch.len(), cols);
         }
-        w.close().expect("close file");
+        out.finish();
     });
 }
 
-/// One `campaign_daily` row.
 pub struct CampRow<'a> {
     pub campaign: &'a [u8],
     pub channel: &'a [u8],
     pub day: i32,
     pub counts: [i64; 4],
 }
-
 pub fn campaign_daily(path: &Path, rows: &[CampRow<'_>]) {
+    let mut narrow = [true; 4];
+    for r in rows {
+        for (ok, value) in narrow.iter_mut().zip(r.counts) {
+            *ok &= i32::try_from(value).is_ok();
+        }
+    }
     let sch = schema(vec![
         string("campaign_id", false),
         string("channel", false),
-        date("day"),
-        long("sessions"),
-        long("purchasing_sessions"),
-        long("revenue_cents"),
-        long("assisted_sessions"),
+        date(),
+        integer("sessions", narrow[0]),
+        integer("purchasing_sessions", narrow[1]),
+        integer("revenue_cents", narrow[2]),
+        integer("assisted_sessions", narrow[3]),
     ]);
-    let mut w = file(path, sch);
-    if !rows.is_empty() {
-        let mut rg = w.next_row_group().expect("row group");
-        let mut c = next(&mut rg);
-        strings(&mut c, rows.iter(), false, |r, out| {
-            out.extend_from_slice(r.campaign);
+    let mut out = Output::new(path, sch);
+    for batch in rows.chunks(GROUP_ROWS) {
+        let mut cols = Vec::with_capacity(7);
+        cols.push(out.column(0, batch, false, |r, b| {
+            text(b, |b| b.extend_from_slice(r.campaign));
             true
-        });
-        close(c);
-        let mut c = next(&mut rg);
-        strings(&mut c, rows.iter(), false, |r, out| {
-            out.extend_from_slice(r.channel);
+        }));
+        cols.push(out.column(1, batch, false, |r, b| {
+            text(b, |b| b.extend_from_slice(r.channel));
             true
-        });
-        close(c);
-        let mut c = next(&mut rg);
-        fixed::<Int32Type, _>(&mut c, rows.iter(), |r| r.day);
-        close(c);
+        }));
+        cols.push(out.column(2, batch, false, |r, b| {
+            b.extend_from_slice(&r.day.to_le_bytes());
+            true
+        }));
         for q in 0..4 {
-            let mut c = next(&mut rg);
-            fixed::<Int64Type, _>(&mut c, rows.iter(), |r| r.counts[q]);
-            close(c);
+            cols.push(out.column(3 + q, batch, false, |r, b| {
+                int(b, r.counts[q], narrow[q]);
+                true
+            }));
         }
-        rg.close().expect("close row group");
+        out.group(batch.len(), cols);
     }
-    w.close().expect("close file");
+    out.finish();
 }

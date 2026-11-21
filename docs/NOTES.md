@@ -1,5 +1,26 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Direct PLAIN page experiment — 2026-11-21
+
+Isolated candidate on `5fd0d05`: values are encoded directly into reusable page
+buffers, using parquet-rs public page and footer serialization. Row groups are
+limited to 65,536 rows; pages also stop after approximately 1 MiB, except for
+an individually larger field. Nullable category uses hybrid bit-packed
+definition levels. Integer widths are chosen once per whole table.
+
+Validation: 40 binary tests, 19 Rust tests, 10 dirty seeds (20k each), 36/36
+official fixtures, both official dev comparisons, six official generator
+comparisons (seeds 2, 7, 15; 10k and 100k, including leap day). PyArrow and
+Polars agree on dev and an independently checked 200,001-row test with multiple
+row groups, multi-page nullable values, Unicode, embedded NUL and a 1.1 MB ID;
+empty tables and cross-file 64-bit fallback are also checked.
+
+Nine alternating native pairs on the 1M dev set (8 workers, M2 Pro): median
+0.0592 → 0.0570 s, 3.7% less. Written-phase medians were both 0.008 s;
+this small, noisy result does **not** establish a practice-scale speedup. No
+20M, Docker or scorer run was performed for this experiment; the required
+practice-size acceptance threshold remains unverified.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.
