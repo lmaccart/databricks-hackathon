@@ -1,5 +1,15 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Experimental bounded anonymous input — 2026-11-21
+
+Unmeasured Linux-only candidate, off by default. `SS_INPUT_VM=huge` selects event files first, largest first, then links and clicks, only when each whole file is at least 16 MiB and fits in the remaining 512 MiB logical input-buffer budget. Oversized files, small files, and failed allocations/advice/reads use the original file mmap. Parallel 2 MiB `pread` ranges fill anonymous memory after `MADV_HUGEPAGE`, before the existing chunk traversal. This faults the destination in while copying; it does not populate file-mapping page tables and does not avoid the kernel's file cache. Inputs are retained because parsed IDs can reference their bytes; the cap is for their total logical lengths, not all process memory or page-cache residency.
+
+`SS_VM_DIAG=1` logs cumulative `getrusage(RUSAGE_SELF)` faults and Linux peak RSS at start, after inputs, links, events, clicks, and output. `anon_files` and `anon_bytes` confirm successful advised copies, while `fallback_failures` counts attempted copies that failed; excluded files are not failures. Advice success **does not establish actual huge pages**: kernel version, THP policy, VMA alignment, memory fragmentation, and seccomp all matter. Inspect `/proc/<pid>/smaps` `AnonHugePages` for these anonymous VMAs while running, if accessible; a rollup alone includes other allocations. No privileges or NUMA assumptions. `MADV_HUGEPAGE` is a hint, not hugetlb, and denied advice silently reverts to mmap.
+
+For native Linux, compare default vs `SS_INPUT_VM=huge` with five alternating pairs on 20M, and verify both outputs and 60M peak memory. First use diagnostics to confirm nonzero `anon_files` and sensible phase fault deltas; then disable diagnostics for timing. If all eligible files exceed the budget, no copy occurs; if the hint is accepted but `AnonHugePages` stays zero, THP did not materialize. This path adds input copying and setup work, so no speedup is asserted; reject it if it fails the >3% gate.
+
+Local Mac: 21 Rust tests, 38 reference cases, 38 binary cases, and ten 20k dirty seeds passed. Linux x86-64 production and test code type-checked using `cargo check -Z build-std` (no Linux runtime). Official fixtures and dev checks could not run: the starter and dev data are absent from this worktree. Per request, no local Docker or large dataset runs.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 mod dims;
 mod events;
+mod input;
 mod links;
 mod output;
 mod person;
@@ -83,24 +84,6 @@ fn parse_price(p: &[u8]) -> Option<u32> {
 }
 
 // ------------------------------------------------------------------ inputs
-
-fn mmap_files(dir: &Path) -> Vec<(PathBuf, Mmap)> {
-    let mut out = Vec::new();
-    let rd = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-    for e in rd {
-        let p = e.expect("read directory entry").path();
-        if p.extension().is_some_and(|x| x == "csv") {
-            let meta = p.metadata().unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-            if !meta.is_file() || meta.len() == 0 {
-                continue;
-            }
-            let f = File::open(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-            let m = unsafe { Mmap::map(&f).expect("mmap") };
-            out.push((p, m));
-        }
-    }
-    out
-}
 
 fn chunks_for<'a>(files: &'a [(PathBuf, Mmap)], cols: &[&str]) -> Vec<Chunk<'a>> {
     let mut v: Vec<Chunk> = files.iter().flat_map(|(p, m)| chunks_of(&m[..], cols, p)).collect();
@@ -537,9 +520,12 @@ fn main() {
     let cm = unsafe { Mmap::map(&cf).unwrap() };
     let sm = read_small(&pm, &cm, &data.join("products.csv"), &data.join("campaigns.csv"));
 
-    let link_files = mmap_files(&data.join("links"));
-    let event_files = mmap_files(&data.join("events"));
-    let click_files = mmap_files(&data.join("clicks"));
+    let mut inputs = input::Inputs::new();
+    inputs.report("start");
+    let event_files = inputs.files(&data.join("events"));
+    let link_files = inputs.files(&data.join("links"));
+    let click_files = inputs.files(&data.join("clicks"));
+    inputs.report("inputs");
     let link_chunks = chunks_for(&link_files, &["user_id_a", "user_id_b"]);
     let ev_chunks = chunks_for(
         &event_files,
@@ -555,10 +541,12 @@ fn main() {
     );
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
     let names = person_names(&link_chunks);
+    inputs.report("links");
     let packing = Packing::new(ws, we, names.count);
     log(&format!("links: {} linked ids", names.count));
 
     let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, &log);
+    inputs.report("events");
     log("events deduped");
 
     let cl_by_person = cl_chunks
@@ -566,6 +554,7 @@ fn main() {
         .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names, packing.is_some()))
         .collect();
     log("clicks routed");
+    inputs.report("clicks");
 
     let len =
         |e: &Payload| e.packed.times.len() + e.packed.purchases.len() + e.wide.times.len() + e.wide.purchases.len();
@@ -632,6 +621,7 @@ fn main() {
         },
     );
     log("written");
+    inputs.report("written");
     // Everything is on disk; skip tearing down the shard tables and mmaps.
     std::process::exit(0);
 }
