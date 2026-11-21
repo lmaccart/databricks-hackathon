@@ -8,11 +8,12 @@ The printed track page times **container start to exit** on eight pinned hyperth
 
 ## Correctness audit
 
-- Both implementations pass the **36 official hand-written fixtures** and the local test suite. On the native dev run, both independent comparers found **117,038 user rows and 27,400 campaign rows**, with zero missing, extra, differing or duplicate keys. Stdout: zero bytes. Ten kit-generated 20k-event seeds also matched the oracle.
+- Both implementations pass the **36 official hand-written fixtures** and the local test suite. On the native dev run, both independent comparers found **117,038 user rows and 27,400 campaign rows**, with zero missing, extra, differing or duplicate keys. Stdout: zero bytes. The Python oracle independently matched the published dev answer as well. Ten kit-generated 20k-event seeds also matched the oracle.
 - Both implementations previously returned success if a required part directory could not be enumerated. They now fail with the input error. The regression test uses a file where the directory should be, so it works regardless of uid.
 - The Python oracle used `int()` on unbounded digit strings. A valid timestamp or price padded with 5,000 zeros crashed it on current Python. Strip leading zeros and bound conversion by significant length; the Rust parser already handled this input. A regression also covers an enormous out-of-window F3 and an over-limit purchase.
 - The kit comparer converted a numeric Parquet ID to a string and could report a match that the scorer rejected. It now checks string types and keeps null distinct from an empty Parquet string. Local edge tests now detect duplicate keys before indexing outputs by key.
 - Use a fresh output directory for each run. Reusing the same directory with fewer Rayon workers can leave extra `part-*.parquet` from a previous run. The official harness and the new native benchmark use fresh directories.
+- Docker parity: built the final `linux/amd64` source snapshot in 114.90 s (cached layers, release binary recompiled). Image: 29,596,367 bytes. The official runner passed at uid 1000, read-only root, no network, `--cpus 8 --memory 24g --memory-swap 24g`, with zero stdout and an exact dev-answer match. Local run: 1.01 s, emulated on an ARM64 Docker VM with only 7.75 GiB physically allocated; this exercises the container contract, not full-scale Linux memory capacity.
 
 ## Native scale evidence
 

@@ -16,7 +16,7 @@ Each task is sized for one agent session. Do them in order; T1 to T4 decide whet
 - [x] **T3. Pass the dev set.** Both checkers matched on seed 1, 1M events/250k clicks, 117,038 user rows and 27,400 campaign rows (`cfdc59e`).
   *Accept:* zero missing / extra / differing rows in both tables.
 
-- [ ] **T4. Docker parity.** Build `docker build --platform linux/amd64 -t ss .` from a clean clone. Run it the way the scorer does:
+- [x] **T4. Docker parity.** Clean tracked-source snapshot, Rust source blob `a02e4eb`; amd64 build 114.90 s, 29.6 MB image; official restricted dev run 1.01 s, zero stdout, exact match. Docker VM memory caveat in `docs/NOTES.md`. Reproduce with:
   ```
   docker run --rm --network none --read-only --tmpfs /tmp:size=64m --user 1000 \
     --cpus 8 --memory 24g --memory-swap 24g \
