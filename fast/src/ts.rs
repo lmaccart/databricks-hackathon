@@ -9,6 +9,7 @@ use crate::BAD;
 
 const LO7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
 const HI: u64 = 0x8080_8080_8080_8080;
+const DAY_MS: i64 = 86_400_000;
 /// Per-byte addend: a byte passes if it is at most 9 (digit) or exactly 0 (literal).
 const D: u8 = 0x7F - 9;
 const L: u8 = 0x7F;
@@ -205,28 +206,108 @@ struct CivilDay {
     midnight_seconds: i64,
 }
 
+/// The month at the manifest midpoint and its immediate neighbors cover
+/// common ingest dates without a per-day lookup.
+struct IngestMonth {
+    prefix: u64,
+    rank_base: u8,
+    last_day: u8,
+}
+
+/// Consecutive UTC day rank plus six BCD clock digits, in chronological order.
+#[derive(Clone, Copy)]
+pub struct MonthOrder(u32);
+
+impl MonthOrder {
+    pub fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[inline(always)]
+    fn midnight(self, origin_ms: i64) -> i64 {
+        origin_ms + i64::from(self.0 >> 22) * DAY_MS
+    }
+
+    #[inline]
+    fn clock_ms(self) -> i64 {
+        // Exclude the two day bits immediately above the hour tens nibble.
+        const TENS: u32 = 0x030f0f;
+        const ONES: u32 = 0x0f0f0f;
+        let pairs = ((self.0 >> 4) & TENS) * 10 + (self.0 & ONES);
+        i64::from((pairs >> 16) * 3_600_000 + ((pairs >> 8) & 255) * 60_000 + (pairs & 255) * 1000)
+    }
+}
+
 /// Immutable exact date lookup derived from the manifest. A miss always
 /// falls back to the complete Gregorian parser, including for ingest claims.
 pub struct ManifestClock {
     days: [Vec<CivilDay>; 32],
+    ingest_months: [IngestMonth; 3],
+    ingest_origin_ms: i64,
+}
+
+fn ingest_month(day: i64, y: i64, m: i64, origin: i64) -> IngestMonth {
+    if !(0..=9999).contains(&y) {
+        // A non-ASCII prefix cannot validate any date: last_day is zero.
+        return IngestMonth {
+            prefix: 0,
+            rank_base: 0,
+            last_day: 0,
+        };
+    }
+    let (yn, mn) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    IngestMonth {
+        prefix: load8(format!("{y:04}-{m:02}-").as_bytes(), 0),
+        rank_base: (day - 1 - origin) as u8,
+        last_day: (days_from_civil(yn, mn, 1) - day) as u8,
+    }
+}
+
+fn civil_from_days(day: i64) -> (i64, i64, i64) {
+    let z = day + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    (y + i64::from(m <= 2), m, d)
 }
 
 impl ManifestClock {
     pub fn new(ws: i64, we: i64) -> Self {
-        const DAY: i64 = 86_400_000;
         const LIMIT: i64 = 256;
         let first_valid = days_from_civil(0, 1, 1);
         let last_valid = days_from_civil(9999, 12, 31);
         let lo = ws
-            .saturating_sub(8 * DAY)
-            .div_euclid(DAY)
+            .saturating_sub(8 * DAY_MS)
+            .div_euclid(DAY_MS)
             .clamp(first_valid, last_valid);
         let hi = we
-            .saturating_add(2 * DAY)
-            .div_euclid(DAY)
+            .saturating_add(2 * DAY_MS)
+            .div_euclid(DAY_MS)
             .clamp(first_valid, last_valid);
+        let mid = ws.midpoint(we).div_euclid(DAY_MS).clamp(first_valid, last_valid);
+        let (y, m, d) = civil_from_days(mid);
+        let month_start = mid - d + 1;
+        let (yp, mp) = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
+        let (yn, mn) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        let previous_start = days_from_civil(yp, mp, 1);
+        let origin = previous_start - 1;
         let mut clock = Self {
             days: std::array::from_fn(|_| Vec::new()),
+            ingest_months: [
+                ingest_month(month_start, y, m, origin),
+                ingest_month(previous_start, yp, mp, origin),
+                ingest_month(days_from_civil(yn, mn, 1), yn, mn, origin),
+            ],
+            ingest_origin_ms: origin * DAY_MS,
         };
         // Very wide windows get both ends, with all other dates using fallback.
         if hi - lo >= LIMIT {
@@ -245,17 +326,7 @@ impl ManifestClock {
     }
 
     fn add_day(&mut self, day: i64) {
-        // Inverse proleptic Gregorian conversion, valid for years 0000..9999.
-        let z = day + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z - era * 146_097;
-        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = mp + if mp < 10 { 3 } else { -9 };
-        let y = y + i64::from(m <= 2);
+        let (y, m, d) = civil_from_days(day);
         let date = format!("{y:04}-{m:02}-{d:02}");
         let bytes = date.as_bytes();
         self.days[d as usize].push(CivilDay {
@@ -263,6 +334,58 @@ impl ManifestClock {
             last: u16::from_le_bytes([bytes[8], bytes[9]]),
             midnight_seconds: day * 86_400,
         });
+    }
+
+    #[inline(always)]
+    pub fn month_order(&self, s: &[u8; 20]) -> Option<MonthOrder> {
+        let prefix = load8(s, 0);
+        let month = if prefix == self.ingest_months[0].prefix {
+            &self.ingest_months[0]
+        } else if prefix == self.ingest_months[1].prefix {
+            &self.ingest_months[1]
+        } else if prefix == self.ingest_months[2].prefix {
+            &self.ingest_months[2]
+        } else {
+            return None;
+        };
+        // Byte limits validate the separators, each ASCII digit, and the
+        // minute/second tens together. Month length was established once.
+        const TWO: u8 = 0x7f - 2;
+        const THREE: u8 = 0x7f - 3;
+        const FIVE: u8 = 0x7f - 5;
+        const SHAPE: u64 = word(b"00T00:00");
+        const LIMITS: u64 = word(&[THREE, D, L, TWO, D, L, FIVE, D]);
+        let a = load8(s, 8) ^ SHAPE;
+        let z = u32::from_le_bytes(s[16..20].try_into().unwrap()) as u64 ^ T_F1;
+        let day = (a as u8).wrapping_mul(10).wrapping_add((a >> 8) as u8);
+        let hour = (((a >> 24) & 15) << 4) | ((a >> 32) & 15);
+        if !(fits(a, LIMITS) & fits(z, word(&[L, FIVE, D, L, 0, 0, 0, 0])))
+            || day.wrapping_sub(1) >= month.last_day
+            || hour > 0x23
+        {
+            return None;
+        }
+        let hms = (hour << 16) | ((a >> 36) & 0xf000) | ((a >> 48) & 0xf00) | ((z >> 4) & 0xf0) | (z >> 16);
+        Some(MonthOrder((u32::from(month.rank_base + day) << 22) | hms as u32))
+    }
+
+    #[inline(always)]
+    pub fn month_on_time(&self, order: MonthOrder, event_ms: i64) -> bool {
+        let midnight = order.midnight(self.ingest_origin_ms);
+        event_ms >= midnight || Self::month_on_prior_day(order, event_ms, midnight - DAY_MS)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn month_on_prior_day(order: MonthOrder, event_ms: i64, prior_midnight: i64) -> bool {
+        // Prior UTC day is the only day needing the ingest clock. An earlier
+        // event day is inevitably late; the comparison keeps F3's ms residue.
+        event_ms >= prior_midnight && order.clock_ms() <= event_ms - prior_midnight
+    }
+
+    #[inline]
+    pub fn month_order_ms(&self, order: MonthOrder) -> i64 {
+        order.midnight(self.ingest_origin_ms) + order.clock_ms()
     }
 
     /// `s` has the F1 length and a date separator at byte 4.
@@ -464,6 +587,72 @@ mod tests {
             (if ms == BAD { i64::MAX } else { ms }, seconds),
             "{s:?}"
         );
+    }
+
+    #[test]
+    fn month_clock_commits_only_exact_dates_and_lazily_checks_previous_day() {
+        for (months, sample) in [
+            (["0000-01-", "0000-02-", "0000-03-"], "0000-02-29T12:34:56Z"),
+            (["1900-01-", "1900-02-", "1900-03-"], "1900-02-28T12:34:56Z"),
+            (["1969-11-", "1969-12-", "1970-01-"], "1969-12-31T12:34:56Z"),
+            (["2000-01-", "2000-02-", "2000-03-"], "2000-02-29T12:34:56Z"),
+            (["9999-11-", "9999-12-", "10000-01-"], "9999-12-31T12:34:56Z"),
+        ] {
+            let mid = want(sample.as_bytes());
+            assert_ne!(mid, BAD);
+            let clock = ManifestClock::new(mid - 1, mid + 1);
+            let check = |raw: &[u8; 20]| {
+                let expected = want(raw);
+                let order = clock.month_order(raw);
+                assert_eq!(
+                    order.is_some(),
+                    months.iter().any(|p| raw.starts_with(p.as_bytes())) && expected != BAD,
+                    "{raw:?}"
+                );
+                if let Some(order) = order {
+                    assert_eq!(clock.month_order_ms(order), expected);
+                    for delta in [-2 * DAY_MS, -DAY_MS - 1, -DAY_MS, -DAY_MS + 1, 0, DAY_MS] {
+                        assert_eq!(clock.month_on_time(order, expected + delta), delta >= -DAY_MS);
+                    }
+                }
+            };
+            let base: [u8; 20] = sample.as_bytes().try_into().unwrap();
+            for pos in 0..base.len() {
+                for byte in 0..=255 {
+                    let mut raw = base;
+                    raw[pos] = byte;
+                    check(&raw);
+                }
+            }
+            let mut prev = None;
+            for second in 0..86_400 {
+                let raw = format!(
+                    "{}T{:02}:{:02}:{:02}Z",
+                    &sample[..10],
+                    second / 3600,
+                    second / 60 % 60,
+                    second % 60
+                );
+                let raw = raw.as_bytes().try_into().unwrap();
+                check(raw);
+                let order = clock.month_order(raw).unwrap().bits();
+                assert!(prev.is_none_or(|prev| prev < order));
+                prev = Some(order);
+            }
+            let mut prev = None;
+            for month in months {
+                for day in 1..=31 {
+                    let raw = format!("{month}{day:02}T00:00:00Z");
+                    if let Ok(raw) = raw.as_bytes().try_into() {
+                        check(raw);
+                        if let Some(order) = clock.month_order(raw) {
+                            assert!(prev.is_none_or(|prev| prev < order.bits()));
+                            prev = Some(order.bits());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

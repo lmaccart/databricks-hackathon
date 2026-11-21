@@ -63,7 +63,7 @@ fn fixed<const N: usize>(s: &[u8], q: bool) -> Option<(&[u8; N], &[u8])> {
 }
 
 #[inline(always)]
-fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [u8])> {
+fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, u64, bool, &'a [u8])> {
     let (q, b) = quoted(s);
     let (ts, rest) = if *b.get(4)? != b'-' {
         let (body, rest) = fixed::<13>(b, q)?;
@@ -84,8 +84,12 @@ fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [
     }
     let (q, rest) = quoted(rest);
     let (body, rest) = fixed::<20>(rest, q)?;
+    if let Some(order) = clock.month_order(body) {
+        return Some((ts, Claim::month(order), clock.month_on_time(order, ts), rest));
+    }
     let seconds = clock.event_f1_seconds(body);
-    (seconds != BAD).then_some((ts, seconds, rest))
+    // Typed event forms keep this difference within i64 even in year 0000.
+    (seconds != BAD).then(|| (ts, seconds as u64, seconds * 1000 - ts <= DAY, rest))
 }
 
 #[inline(always)]
@@ -203,19 +207,17 @@ fn suffix<'a>(s: &'a [u8], purchase: bool, sm: &Small) -> Option<(Option<PriceCa
 fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestClock)) -> Option<(Pending, &'a [u8])> {
     let (eid, s) = id(s)?;
     let (uid, s) = id(s)?;
-    let (ts, seconds, s) = timestamps(s, clock)?;
+    let (ts, claim_order, on_time, s) = timestamps(s, clock)?;
     let (purchase, s) = event_type(s)?;
     let (payload, rest) = suffix(s, purchase, sm)?;
     let mut e = Pending {
         claim_key: links::mix(eid),
         ts,
-        claim_order: seconds as u64, // same exact F1 seconds encoding as Claim::order
+        claim_order,
         ..Default::default()
     };
-    // The accepted forms (four-digit civil year or 13 digits) make the
-    // millisecond difference safe in i64, including pre-epoch ingest.
     if (ws..we).contains(&ts)
-        && seconds * 1000 - ts <= DAY
+        && on_time
         && let Some((price, cat)) = payload
     {
         e.uid = uid;

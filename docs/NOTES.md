@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round-four typed ingest clock candidate — 2026-11-21
+
+The typed reader validates ingest against three manifest-derived `YYYY-MM-` prefixes and their Gregorian month lengths. The day-of-month is affine within a matching month: there is no indexed date or minute lookup for that ingest. The claim stores a consecutive UTC day rank followed by the validated BCD clock, so compact duplicates across months compare directly. Lateness compares the event instant to the ingest midnight first and decodes the clock only for an event on the previous UTC day. Off-anchor dates and malformed/irregular spellings still use the original Gregorian or strict CSV path. Mixed claims are converted only on an exact ID match; no input rows are reread.
+
+Unlike `2ce94e5`, this leaves the scored typed event path and its date lookup untouched and uses month arithmetic instead of an ingest day-slot table. It does not require the event and ingest to share an F1 date or hour (`0c45279`), change the pipeline's time units (`978cc69`), or add prefix decode tables (`7bab74b`).
+
+Validation: 22 Rust tests, 40 edge tests against each implementation, 36/36 official fixtures against each, all 144,438 official dev rows exact, 10 kit dirty seeds at 20k events, and three official 10k-event seeds including the leap-day window. Five alternating native ARM64 pairs on the 1M-event dev set: one worker 0.180 → 0.178 s (1.2% lower); four workers 0.072 → 0.074 s (2.6% higher, noisy). No 20M or Docker runs; these results do not establish a scorer speedup.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).

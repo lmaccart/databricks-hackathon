@@ -2,6 +2,7 @@
 //! stream of claims (ID, ingest time, payload location) decides which payloads
 //! must be removed. In particular, an invalid copy has a claim but no payload.
 use super::*;
+use crate::ts::MonthOrder;
 use std::hash::{BuildHasherDefault, Hasher};
 
 mod word;
@@ -20,12 +21,20 @@ const KEY_BITS: u32 = u64::BITS - NS.trailing_zeros();
 const KEY_MASK: u64 = (1 << KEY_BITS) - 1;
 const TARGET_HI_BITS: u32 = 32 - NS.trailing_zeros();
 const TARGET_HI_MASK: u64 = (1 << TARGET_HI_BITS) - 1;
-// Signed 39-bit seconds cover every four-digit F1 year. In the 40-bit field,
-// the two high bits are 00/11 for seconds and 01 for a side-table index.
+// In the 40-bit field, 00/11 are signed epoch seconds, 01 indexes the
+// exceptional millis side table, and 10 is a month-relative civil order.
 const SPILL_TAG: u64 = 1 << 38;
+const MONTH_TAG: u64 = 2 * SPILL_TAG;
+#[cfg(test)]
+const ORDER_MASK: u64 = 4 * SPILL_TAG - 1;
 const _: () = assert!(std::mem::size_of::<Claim>() == 16 && ((CHUNK / 6 + 1) as u64) < SPILL_TAG);
 
 impl Claim {
+    #[inline(always)]
+    fn month(order: MonthOrder) -> u64 {
+        MONTH_TAG | u64::from(order.bits())
+    }
+
     #[inline]
     fn order(ingest: i64, seconds: i64, spill: &mut Vec<i64>) -> u64 {
         if seconds != BAD {
@@ -57,13 +66,38 @@ impl Claim {
     }
 
     #[inline]
-    fn ingest(self, spill: &[i64]) -> i64 {
-        let order = (self.order_and_target as i64) >> TARGET_HI_BITS;
-        if order >= SPILL_TAG as i64 {
-            spill[(order as u64 ^ SPILL_TAG) as usize]
-        } else {
-            order * 1000
+    fn raw_order(self) -> u64 {
+        self.order_and_target >> TARGET_HI_BITS
+    }
+
+    #[inline]
+    fn ingest(order: u64, spill: &[i64], clock: &ManifestClock) -> i64 {
+        match order & (SPILL_TAG | MONTH_TAG) {
+            SPILL_TAG => spill[(order ^ SPILL_TAG) as usize],
+            MONTH_TAG => clock.month_order_ms(MonthOrder::from_bits(order as u32)),
+            _ => (((order << TARGET_HI_BITS) as i64) >> TARGET_HI_BITS) * 1000,
         }
+    }
+
+    #[inline]
+    fn earlier(a: (u64, Location), b: (u64, Location), spills: &[Vec<i64>], clock: &ManifestClock) -> bool {
+        // Same encoding is directly comparable, except per-batch spill indexes.
+        if (a.0 ^ b.0) & (SPILL_TAG | MONTH_TAG) == 0 && a.0 & (SPILL_TAG | MONTH_TAG) != SPILL_TAG {
+            a.0 < b.0
+        } else {
+            Self::earlier_mixed(a, b, spills, clock)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn earlier_mixed(
+        (a, a_loc): (u64, Location),
+        (b, b_loc): (u64, Location),
+        spills: &[Vec<i64>],
+        clock: &ManifestClock,
+    ) -> bool {
+        Self::ingest(a, &spills[a_loc.batch], clock) < Self::ingest(b, &spills[b_loc.batch], clock)
     }
 }
 
@@ -119,15 +153,24 @@ fn decode_fields<'a>(
         return None;
     }
     let claim_key = links::mix(codec.key(r[0]));
-    let (ingest, seconds) = clock.ingest_for_claim(r[3]);
     let ts = clock.parse_ts(r[2]);
+    let in_window = (ws..we).contains(&ts);
+    let (claim_order, on_time) = if let Some(order) = r[3].try_into().ok().and_then(|s| clock.month_order(s)) {
+        (Claim::month(order), in_window && clock.month_on_time(order, ts))
+    } else {
+        let (ingest, seconds) = clock.ingest_for_claim(r[3]);
+        (
+            Claim::order(ingest, seconds, spill),
+            in_window && ingest.saturating_sub(ts) <= DAY,
+        )
+    };
     let mut next = Pending {
         claim_key,
         ts,
-        claim_order: Claim::order(ingest, seconds, spill),
+        claim_order,
         ..Default::default()
     };
-    if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
+    if !r[1].is_empty() && !r[5].is_empty() && on_time {
         let purchase = match r[4] {
             b"purchase" => parse_price(r[6]),
             b"view" | b"cart" => Some(0),
@@ -232,7 +275,7 @@ fn prefetch(bloom: &[(u64, u64)], c: Claim, mask: usize) {
     let _ = ptr;
 }
 
-fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location> {
+fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>], clock: &ManifestClock) -> Vec<Location> {
     let n: usize = parts.iter().map(|(_, v)| v.len()).sum();
     // Local blocked Bloom: the second occurrence of any ID necessarily finds
     // both bits already set and marks it suspect. False positives go to an
@@ -274,15 +317,15 @@ fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location>
                 batch,
                 target: c.target(),
             };
-            let ingest = c.ingest(&spills[batch]);
+            let entry = (c.raw_order(), loc);
             let lost = match best.entry(c.key()) {
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((ingest, loc));
+                    e.insert(entry);
                     continue;
                 }
                 std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if ingest < e.get().0 {
-                        e.insert((ingest, loc)).1
+                    if Claim::earlier(entry, *e.get(), spills, clock) {
+                        e.insert(entry).1
                     } else {
                         loc
                     }
@@ -321,7 +364,10 @@ pub(super) fn by_person<'a>(
             }
         }
     }
-    let removals: Vec<_> = claims.into_par_iter().map(|parts| losers(parts, &spills)).collect();
+    let removals: Vec<_> = claims
+        .into_par_iter()
+        .map(|parts| losers(parts, &spills, window.2))
+        .collect();
     let mut by_batch: Vec<Vec<u32>> = (0..payloads.len()).map(|_| Vec::new()).collect();
     for locations in removals {
         for loc in locations {
@@ -368,7 +414,12 @@ mod tests {
         assert_eq!(probe(later, 1023), probe(distinct, 1023));
         let mut spill = Vec::new();
         let invalid = Claim::new(id, NONE, Claim::order(1234, BAD, &mut spill));
-        let lost = losers(vec![(0, vec![later, distinct]), (1, vec![invalid])], &[vec![], spill]);
+        let clock = ManifestClock::new(0, DAY);
+        let lost = losers(
+            vec![(0, vec![later, distinct]), (1, vec![invalid])],
+            &[vec![], spill],
+            &clock,
+        );
         assert_eq!(lost.len(), 1);
         assert_eq!((lost[0].batch, lost[0].target), (0, 0));
     }
@@ -392,8 +443,14 @@ mod tests {
                     b"not a timestamp",
                 ] {
                     let (ms, secs) = clock.ingest_for_claim(s);
-                    let claim = Claim::new(mixed, target, Claim::order(ms, secs, &mut spill));
-                    assert_eq!(claim.ingest(&spill), ts::parse_ingest(s));
+                    let order = s
+                        .try_into()
+                        .ok()
+                        .and_then(|s| clock.month_order(s))
+                        .map_or_else(|| Claim::order(ms, secs, &mut spill), Claim::month);
+                    let claim = Claim::new(mixed, target, order);
+                    assert_eq!(claim.raw_order(), order & ORDER_MASK);
+                    assert_eq!(Claim::ingest(claim.raw_order(), &spill, &clock), ts::parse_ingest(s));
                     assert_eq!(claim.target(), target);
                     let reconstructed = claim.key() | ((mixed >> KEY_BITS) << KEY_BITS);
                     assert_eq!(id, codec.bytes(links::unmix(reconstructed), &mut [0; 9]));

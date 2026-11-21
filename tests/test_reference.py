@@ -90,6 +90,51 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_civil_ingest_across_utc_day_and_claim_encodings(self):
+        midnight = "2028-03-01T00:00:00Z"
+        leap = "2028-02-29T00:00:00Z"
+
+        def row(eid, uid, ts, ingest):
+            return ev(eid, uid, ts, pid="item-07", ingest=ingest)
+
+        events = [
+            row("event0001", "f1exact1", leap, midnight),
+            row("event0002", "f1late02", leap, "2028-03-01T00:00:01Z"),
+            row("event0003", "f2exact3", "2028-02-28T23:30:00-00:30", midnight),
+            row("event0004", "f3late04", str(ms(leap) - 1), midnight),
+            row("event0005", "f3early5", str(ms(leap) + 1), midnight),
+            row("event0006", "f1prior6", midnight, "1900-03-01T00:00:00Z"),
+            row("event0007", "f1later7", leap, "9999-01-01T00:00:00Z"),
+            row("event0008", "f1valid8", leap, leap),
+            row("event0009", "f2loser9", leap, "2028-02-29T00:00:00+00:00"),
+            row("event0010", "f3lose10", leap, str(ms(leap) + 1)),
+            row("event0011", "f1lose11", leap, leap),
+            row("event0012", "badbyte1", leap, leap).encode().replace(
+                b"29T00:00:00Z,view", b"29T00:\xff0:00Z,view"
+            ),
+            row("event0013", "badbyte2", leap, leap).encode() + b'"\xff',
+            row("event0014", "f1same14", leap, "2028-02-29T23:59:59Z"),
+            row("event0015", "f1next15", midnight, "2028-03-02T00:00:01Z"),
+            row("event0016", "f1next16", midnight, "2028-03-02T00:00:00Z"),
+            row("event0017", "f1lose17", leap, leap),
+            row("event0018", "f1lose18", midnight, "2028-03-02T00:00:00Z"),
+        ]
+        copies = [
+            row("event0008", "", leap, "1900-02-29T00:00:00Z"),  # bad ingest sorts last
+            row("event0009", "f2loser9", leap, leap),  # equal instant through strict fallback
+            row("event0010", "", leap, leap),
+            row("event0011", "", leap, str(ms(leap) - 1)),
+            row("event0013", "goodby13", leap, "2028-02-29T00:00:01Z"),
+            row("event0017", "", leap, "0000-02-29T23:59:59Z"),
+            row("event0017", "", leap, "0000-02-29T23:59:59Z"),  # equal invalid winners
+            row("event0018", "", midnight, "2028-02-29T23:59:59Z"),
+        ]
+        users, _ = run_case(events, products=("item-07,shoes",), extra={"events/part-1.csv": copies},
+                            window=("2028-02-27T00:00:00Z", "2028-03-04T00:00:00Z"))
+        self.assertEqual({key[0] for key in users},
+                         {"f1exact1", "f2exact3", "f3early5", "f1prior6", "f1valid8",
+                          "f2loser9", "goodby13", "f1same14", "f1next16"})
+
     def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
         stamp = "2026-10-03T10:00:00Z"
         early = "2026-10-03T09:59:59Z"
