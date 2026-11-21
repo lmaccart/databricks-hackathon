@@ -4,16 +4,16 @@ Each task is sized for one agent session. Do them in order; T1 to T4 decide whet
 
 ## Phase A: get an official green check (do first, today)
 
-- [ ] **T0. Set up the repo.** Create a public GitHub repo (MIT license). Copy `fast/` contents to the repo root (so `Dockerfile` is at the root), plus `reference/`, `tools/`, `tests/`, `docs/`. Add the README credits for open-source crates. No data files.
+- [x] **T0. Set up the repo.** Public MIT repository; root Dockerfile builds `fast/` in place. Credits in README; generated/downloaded data excluded. `2880f71`.
   *Accept:* `git ls-files` shows Dockerfile at root; repo < 1 MB; `.gitignore` has `target/`.
 
-- [ ] **T1. Pull in the official files.** From the track page download `rules.md`, `starter-duckdb.zip` (or any starter), `dev-answer.zip`, `generator.zip` into `vendor/` (gitignored except rules.md). Diff the official `rules.md` against `docs/rules-transcribed.md`; if anything differs, the official text wins: update the reference and the binary, then re-run `tests/`.
+- [x] **T1. Pull in the official files.** `2880f71`: imported official rules; only formatting and transcription preface differ. Archives unpacked into ignored `vendor/`.
   *Accept:* `docs/rules.md` is the official file; any diff is written down in `docs/NOTES.md`.
 
-- [ ] **T2. Run the 36 starter fixtures** against `reference/pipeline.py` and the binary. Read the starter's test scripts to see how fixtures are laid out and checked (expected outputs, harness command). Wire both implementations into that harness (`SS_BIN` style or the starter's own entrypoint contract).
+- [x] **T2. Run the 36 starter fixtures.** Both implementations passed 36/36; repeat with `make fixtures` (`cfdc59e`).
   *Accept:* 36/36 pass for both. Any failure: find the rules.md sentence, fix, add a case to `tests/test_reference.py`.
 
-- [ ] **T3. Pass the dev set.** Build the generator (`cargo build --release` in the unzipped generator), generate the 1M-event dev set with seed 1 exactly as the starter's Makefile does, unzip `dev-answer.zip`, run the binary, then `make check-dev` and `python3 tools/compare_outputs.py <dev-answer-dir> <output-dir>`.
+- [x] **T3. Pass the dev set.** Both checkers matched on seed 1, 1M events/250k clicks, 117,038 user rows and 27,400 campaign rows (`cfdc59e`).
   *Accept:* zero missing / extra / differing rows in both tables.
 
 - [ ] **T4. Docker parity.** Build `docker build --platform linux/amd64 -t ss .` from a clean clone. Run it the way the scorer does:

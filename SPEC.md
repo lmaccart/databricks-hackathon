@@ -8,7 +8,7 @@ Why Rust (not Spark / DuckDB / Polars):
 - The leaders sit at 0.75 to 1.0 s on 20M events. That is only reachable with a hand-written, parallel, allocation-light parser and hash-partitioned group-bys.
 - The rules (byte-wise strings, exact quoting, dedup-before-validate, distinct-timestamp gaps) are easier to get exactly right in explicit code than in SQL with CSV readers that "helpfully" trim, cast or unquote.
 
-This kit already contains a working v1 (`fast/`) that matches the kit's reference on every kit test and 17 random dirty datasets, and runs a 2M-event kit dataset in 0.59 s on 4 cores. It has **not** yet been run against the organizers' fixtures, dev answer or generator. That is task T1.
+The original kit reported a 0.59 s native run on a 2M-event kit dataset. Current official fixture, dev-answer, scale and timing results are in [docs/NOTES.md](docs/NOTES.md).
 
 ## Definition of done
 1. `make check-dev` from the starter passes with our binary (zero missing / extra / differing rows on the 1M dev set).

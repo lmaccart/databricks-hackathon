@@ -2,7 +2,7 @@
 
 Source (read 2026-11-21): https://www.joinbuilders.org/buildathon/tracks/shopping-sessions
 Event page: https://www.joinbuilders.org/buildathon
-Full spec: `rules.md` from the track page (kit copy: `docs/rules-transcribed.md`; the official file wins).
+Full spec: [official rules.md](docs/rules.md), checked against the original kit transcription.
 
 ## The task in one line
 Turn ~60 million messy click-stream CSV events into two exact daily Parquet tables. **Fastest correct pipeline wins.**

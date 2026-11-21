@@ -19,7 +19,7 @@
 ## Files
 - `fast/src/main.rs`: the whole v1 pipeline (~700 lines).
 - `fast/Cargo.toml`: rayon, memchr, memmap2, ahash, serde_json, arrow-array, arrow-schema, parquet (no compression codecs).
-- `fast/Dockerfile`: two-stage build (rust slim → debian slim), runs as uid 1000.
+- `Dockerfile`: root two-stage build (Rust slim → Debian slim), runs as uid 1000.
 - `reference/pipeline.py`: slow, literal oracle. Any disagreement = a bug in one of them; rules.md decides which.
 - `tools/compare_outputs.py`: missing / extra / differing rows, schema check, rules.md self-check.
 - `tools/mini_gen.py`: kit-made dirty data for quick diffs (the official generator is the real test).
@@ -40,8 +40,8 @@
 | No `-C target-cpu=native` | The scoring CPU is unknown; an illegal instruction is a crash. |
 
 ## Data shapes (for memory planning at 60M events)
-- `EvRow` ≈ 56 bytes → ~3.6 GB for 64M rows incl. duplicates. Freed after dedup.
-- `PEv` ≈ 40 bytes → ~2.4 GB. Clicks are smaller. Peak should stay < 10 GB. Measure with `/usr/bin/time -v`.
+- On a 64-bit target, `EvRow` has two fat slices, two i64s, two u32s and two one-byte fields: 64 bytes including alignment. At 64M records its payload alone is ~4.1 GB, before spare capacity or the dedup table.
+- `PEv` is 48 bytes and `PCl` is 56 bytes on that layout. The original per-person buckets can coexist with the gathered sort vectors. See [measured RSS and its limitations](docs/NOTES.md) rather than adding only the compact payload sizes.
 
 ## Where the time goes (v1, 2M kit events, 4 threads: 0.59 s total)
 links 0.04 s · parse events 0.18 s · dedup 0.10 s · clicks 0.05 s · sessions 0.16 s · write 0.03 s.
