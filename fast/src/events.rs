@@ -203,7 +203,7 @@ fn probe(c: Claim, mask: usize) -> (usize, u64) {
 
 #[inline]
 fn prefetch(bloom: &[(u64, u64)], c: Claim, mask: usize) {
-    let ptr = &bloom[probe_index(c, mask)] as *const _;
+    let ptr: *const (u64, u64) = &bloom[probe_index(c, mask)];
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
