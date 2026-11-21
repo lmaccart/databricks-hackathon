@@ -627,6 +627,25 @@ class Clicks(unittest.TestCase):
         self.assertEqual(c[("c_2", d)]["sessions"], 1)
         self.assertEqual(c[("organic", d)]["sessions"], 1)
 
+    def test_many_tied_assists_expire_without_credit_rows(self):
+        first = WS_MS + 12 * HOUR
+        second = first + 7 * DAY + 30 * MIN + 1
+        campaigns = tuple(f"c_{i:02},channel" for i in range(12))
+        clicks = [f"{'a' if i == 0 else 'b'}_{i:02},u1,c_{i:02},{first - 7 * DAY}"
+                  for i in range(12)]
+        events = [ev("e1", "u1", str(first)), ev("e2", "u1", str(second))]
+        _, rows = run_case(events=events, clicks=clicks, links=["a_canonical,u1"], campaigns=campaigns)
+
+        first_day = "2026-10-01"
+        second_day = "2026-10-08"
+        for i in range(12):
+            row = rows[(f"c_{i:02}", first_day)]
+            self.assertEqual(row["assisted_sessions"], 1)
+            self.assertEqual(row["sessions"], int(i == 0))  # byte-smallest click ID gets credit
+            self.assertNotIn((f"c_{i:02}", second_day), rows)  # the whole click set expired
+        self.assertEqual(rows[("organic", second_day)]["sessions"], 1)
+        self.assertEqual(rows[("organic", second_day)]["assisted_sessions"], 0)
+
     def test_clicks_follow_links(self):
         s = ms("2026-10-09T12:00:00Z")
         u, c = run_case(events=[ev("e1", "phone", str(s), "purchase", "p1", "1234")],

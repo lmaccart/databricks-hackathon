@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Campaign folds ported to physical-slot gridranges — 2026-11-21
+
+Ported the `edd5c36` campaign/day sink to the `0558eaa` ranked-range and typed-output pipeline without replacing those changes. `Reduce::person` sends both ranked and wide sessions to the same worker-local sink. Dense assists plus directly indexed sparse credit triples are enabled only within the manifest-derived, worker-bounded 32 MiB grid; arbitrary spans/dimensions retain per-shard hash maps. Broadcast creates one fold per Rayon worker, and heavy-first owners are claimed dynamically. The donor reportedly won 10/10 AMD pairs with 6.4–7.9% incremental savings; this integration was not locally timed (and no local input exceeded 1M events). Validation: 45 Python edge cases, 28 Rust tests, 45 binary cases, 36 official fixtures, 10 dirty seeds, both dev comparers (117,038 user / 27,400 campaign rows), and schema self-check passed; clippy clean.
+
 ## Round four: slot-indexed range reduction — 2026-11-21
 
 Port of `be4a89c` onto `4933dbe` for a direct final-scale comparison. The flat CAS graph is unchanged: the physical slot anchors identity and `slot & 255` still selects its owner. The range path indexes the owner-local histogram by `slot >> 8`, without a rank remap or another hash. Compact offsets and exact bins feed the same `finish_user_day` and `finish_person` calls as the full-width path. The columnar writer is unchanged from `4ad0e5d`. Singletons that cannot claim a slot and windows too wide for a 32-bit offset keep full-width time and exact identity. The prior standalone range branch reportedly won all ten 20M pairs by 3.5% / 2.5% against `a32d0b7`; those figures are not timings for this integration.
