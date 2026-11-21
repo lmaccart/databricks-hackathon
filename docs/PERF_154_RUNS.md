@@ -2,7 +2,7 @@
 
 These are hosted CI comparisons, not organizer times. Each row comes from a completed job with timings on **both** 20M seeds. Each arrow is control → candidate, in seconds; parentheses are candidate wins / pairs. The last two columns are full `docker run`; a dash means that scope was not run. CPU models vary, so compare across an arrow, not down a column.
 
-**44 two-seed jobs**, **35 distinct candidate revisions** including diagnostic controls. [Interpretation and practice pick](PERF_154.md).
+**56 two-seed jobs**, **43 distinct candidate revisions** including diagnostic controls. [Interpretation and practice pick](PERF_154.md).
 
 | CI run | Candidate / control | CPU | 20M seed 7 native | 20M seed 15 native | 20M Docker | 60M Docker |
 |---|---|---|---:|---:|---:|---:|
@@ -49,4 +49,16 @@ These are hosted CI comparisons, not organizer times. Each row comes from a comp
 | [grid-pack](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936299807) | `edd5c36` / `4ad0e5d` | Intel Xeon Platinum 8370C | 2.125 → 1.936 (5/5) | 2.103 → 1.928 (5/5) | 2.281 → 2.090 (5/5) | 6.923 → 6.480 (3/3) |
 | [meter-ranges](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936375552) | `f669c11` / `0558eaa` | Intel Xeon 6975P-C | 1.496 → 1.476 (4/5) | 1.454 → 1.434 (4/5) | 1.602 → 1.593 (3/5) | 4.779 → 4.719 (2/3) |
 | [stripe-claims](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936377632) | `1e1de5d` / `4933dbe` | Intel Xeon 6975P-C | 1.500 → 1.580 (0/5) | 1.492 → 1.560 (0/5) | — | — |
+| [mimalloc3](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936526432) | `29ccc90` / `0558eaa` | Intel Xeon 6975P-C | 1.463 → 1.267 (5/5) | 1.462 → 1.280 (5/5) | 1.614 → 1.404 (5/5) | 4.801 → 4.174 (3/3) |
 | [hot-scatter](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936599146) | `a580c30` / `0558eaa` | Intel Xeon 6975P-C | 1.484 → 1.489 (1/5) | 1.449 → 1.452 (1/5) | — | — |
+| [gridrange-vs-scored](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936619511) | `d754296` / `7fd1b76` | Intel Xeon 6975P-C | 1.679 → 1.372 (5/5) | 1.639 → 1.340 (5/5) | 1.779 → 1.471 (5/5) | 5.512 → 4.448 (3/3) |
+| [gridrange](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936619619) | `d754296` / `0558eaa` | Intel Xeon 6975P-C | 1.481 → 1.364 (5/5) | 1.419 → 1.296 (5/5) | 1.573 → 1.455 (5/5) | 4.731 → 4.474 (3/3) |
+| [grid-on-allocation](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936631125) | `7619fa6` / `f669c11` | Intel Xeon Platinum 8370C | 1.976 → 1.859 (5/5) | 1.953 → 1.810 (5/5) | 2.072 → 1.928 (5/5) | 6.378 → 6.181 (3/3) |
+| [allocation-on-grid](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936631348) | `7619fa6` / `d754296` | Intel Xeon 6973P-C | 1.564 → 1.529 (4/5) | 1.527 → 1.510 (2/5) | 2.044 → 1.990 (4/5) | 5.968 → 5.932 (3/3) |
+| [compactdir](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936657547) | `7b9d1c9` / `0558eaa` | Intel XEON PLATINUM 8573C | 1.896 → 1.891 (1/5) | 1.848 → 1.830 (3/5) | — | — |
+| [range-on-grid](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936740314) | `7619fa6` / `ff3cc6b` | Intel Xeon 6975P-C | 1.386 → 1.372 (5/5) | 1.401 → 1.362 (5/5) | 1.517 → 1.488 (5/5) | 4.642 → 4.598 (3/3) |
+| [folds-vs-allocator](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937040599) | `14ccc10` / `29ccc90` | AMD EPYC 7763 | 1.425 → 1.321 (5/5) | 1.402 → 1.297 (5/5) | 1.577 → 1.482 (5/5) | 4.827 → 4.482 (3/3) |
+| [allocator-on-grid](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937041255) | `894f6a7` / `7619fa6` | Intel Xeon 6975P-C | 1.327 → 1.150 (5/5) | 1.293 → 1.142 (5/5) | 1.434 → 1.254 (5/5) | 4.490 → 3.868 (3/3) |
+| [allocator-reserves](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937042928) | `894f6a7` / `14ccc10` | AMD EPYC 7763 | 1.329 → 1.310 (5/5) | 1.311 → 1.303 (2/5) | 1.487 → 1.481 (3/5) | 4.619 → 4.523 (3/3) |
+| [keep-pages](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937148686) | `f73e16d` / `14ccc10` | Intel Xeon 6975P-C | 1.130 → 1.120 (4/5) | 1.133 → 1.113 (5/5) | 1.245 → 1.231 (5/5) | 3.811 → 3.663 (3/3) |
+| [huge-aligned](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937148704) | `6a18c94` / `14ccc10` | Intel Xeon 6975P-C | 1.180 → 1.171 (4/5) | 1.153 → 1.145 (3/5) | 1.296 → 1.277 (4/5) | 3.886 → 3.815 (3/3) |

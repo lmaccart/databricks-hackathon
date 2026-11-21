@@ -111,6 +111,7 @@ Each row compares a component with and without the other change on the **same** 
 | [Add worker-local campaign/day counts to the right-sized direct ranges](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936631125) | 2.072 → **1.928** | 6.378 → **6.181** |
 | [Add allocation hints to direct ranges + worker-local counters (`7619fa6` vs `d754296`)](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936631348) | 2.044 → 1.990 | 5.968 → 5.932 |
 | [Direct ranges vs global temporal sort, identical graph, hints and campaign reduction](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936740314) | 1.517 → 1.488 | 4.642 → 4.598 |
+| [Add linked mimalloc 3 to direct ranges, allocation hints and worker-local counts](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937041255) | 1.434 → **1.254** | 4.490 → **3.868** |
 
 The initial singleton technique by itself added almost nothing to the columns in the two full-Docker comparisons on the Xeon 8370C. Replacing the graph construction as well made a measurable difference on the 6975P-C: every pair favored physical slots, including all three final-scale pairs. Keeping a slot as the union node eliminates endpoint sorting/deduplication and gives the parser a direct rank to write.
 
@@ -121,6 +122,8 @@ On that holdout, the 6,601,416 user-day rows occupied 283,929,323 bytes in the s
 The linked Linux allocator won more than a library microbenchmark: every practice and final-scale pair favored it over the same direct-range application using the system allocator. In the seed-7 process comparison the event parse interval fell from 0.704 to 0.610 s, sessions from 0.366 to 0.310 s, and time outside the program's own timer from 0.041 to 0.020 s. This is a **different version and workload** from the earlier Debian mimalloc v2 preload experiment.
 
 `14ccc10` also passed a third, differently shaped input in a clean tracked-source Linux/amd64 image: **21M events, 3.7M clicks, seed 2468113**, under **6 GiB, no swap**. All 2,350,590 user-days and 28,014 campaign-days matched the scored control; stdout was empty. The eight-worker process peaked at **2.82 GiB RSS** and the cgroup at **3.05 GiB** including charged cache. This ran through Docker Desktop's amd64 emulation: useful for packaging and output verification, not scorer timing.
+
+The alternative with live allocation hints (`894f6a7`) also matched all 2,378,604 rows on this odd-sized input at **2.64 GiB RSS**. Emulated start-to-exit medians were **1.227 s without vs 1.260 s with hints**, with hints winning 2/5 pairs. Both images were about 116 MB as reported by Docker, run as uid 1000, and link the allocator into the executable; no preload or runtime package installation is necessary.
 
 For `7619fa6` on the M2 Pro, eight-worker native medians vs `7fd1b76` were **0.622 → 0.502 s**, **0.599 → 0.479 s**, and **1.753 → 1.409 s** on the independent 60M seed (all 15 pairs won). A separate same-executable comparison of four versus eight workers went **0.708 → 0.476 s** on seed 7 and **2.322 → 1.471 s** on the 60M holdout: 1.49× and 1.58× throughput, not 2×. This host has eight performance cores and four efficiency cores; these measured ratios do not predict the speed of eight pinned x86 hyperthreads.
 
