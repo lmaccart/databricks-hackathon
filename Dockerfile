@@ -6,7 +6,7 @@ WORKDIR /src
 COPY fast/Cargo.toml fast/Cargo.lock ./fast/
 COPY fast/src ./fast/src
 COPY tools/pgo_build.sh tools/pgo_generate.rs ./tools/
-ARG PGO=0
+ARG PGO=1
 RUN if [ "$PGO" = 1 ]; then \
       rustup component add llvm-tools-preview && sh tools/pgo_build.sh /src/shopping_sessions; \
     elif [ "$PGO" = 0 ]; then \
