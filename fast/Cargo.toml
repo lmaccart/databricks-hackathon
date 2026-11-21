@@ -3,6 +3,10 @@ name = "shopping_sessions"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Test the same vector algorithm on non-x86 machines using a lane model.
+vector-sort-model = []
+
 [dependencies]
 ahash = "0.8.12"
 bytes = "1"

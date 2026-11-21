@@ -39,6 +39,7 @@ impl Packing {
 
 pub(super) trait Temporal: Copy + Ord {
     type Layout: Copy;
+    fn sort_keys(keys: &mut [Self]);
     fn person(self, layout: Self::Layout) -> u64;
     fn ts(self, layout: Self::Layout) -> i64;
     // Only compared within one person's ordered keys.
@@ -48,6 +49,11 @@ pub(super) trait Temporal: Copy + Ord {
 
 impl Temporal for Wide {
     type Layout = ();
+
+    #[inline]
+    fn sort_keys(keys: &mut [Self]) {
+        keys.sort_unstable();
+    }
 
     #[inline]
     fn person(self, (): ()) -> u64 {
@@ -72,6 +78,11 @@ impl Temporal for Wide {
 
 impl Temporal for u64 {
     type Layout = Packing;
+
+    #[inline]
+    fn sort_keys(keys: &mut [Self]) {
+        super::simd_sort::sort_u64(keys);
+    }
 
     #[inline]
     fn person(self, pack: Packing) -> u64 {

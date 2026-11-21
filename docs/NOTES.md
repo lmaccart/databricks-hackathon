@@ -1,5 +1,15 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Experimental AVX2 temporal-key sort — 2026-11-21
+
+Candidate only; neither correctness on actual AVX2 instructions nor a speedup has been established. No 20M timing was run locally as requested. Parent must run the real AVX2 tests and paired Linux benchmark before considering it.
+
+Packed linked-event `u64` keys use runtime AVX2 dispatch (with OS feature detection) for at least 128 keys, otherwise `sort_unstable`. The AVX2 kernel partitions four unsigned 64-bit lanes via a 16-entry permutation LUT and bounded masked stores, uses median-of-nine samples, alternates a scratch buffer, and falls back to standard sort for exhausted depth or degenerate partitions. Wide keys, purchases, and clicks remain unchanged. It adds no dependency and requires no ISA flags for the process.
+
+On ARM, a test-only `vector-sort-model` feature executes the same partition and recursion with modeled vector operations; it is not an actual AVX2 instruction test and is not enabled by default. All 23 Rust tests passed, including sorted/reversed/random/duplicate keys, the network and LUT, unaligned input, and guard-page boundaries. The modeled candidate and native fallback both passed 38 Python cases, all 36 official fixtures, and both dev-answer comparers. The modeled candidate matched 10 kit-dirty seeds (30k events) and 43 official-generator oracle comparisons (20 seeds at 10k and 100k, and seeds 1, 7 and 15 at 1M). Leap-day seed 15 matched. Offline cross-build and fallback tests passed on x86-64 Rosetta, but Rosetta reports no AVX2: direct AVX2 and AVX2 guard-page tests explicitly skipped.
+
+On an AVX2-capable Linux host, first run `CARGO_BUILD_JOBS=2 cargo test --locked --release simd_sort::tests -- --nocapture` in `fast/` and confirm neither AVX2 test prints a skip; then repeat fixtures, dev and dirty comparisons on the default binary. Benchmark with paired 20M runs; retain only if exact and faster. The feature-model build is only for exercising the algorithm on non-x86 (`cargo build --release --features vector-sort-model`).
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

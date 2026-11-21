@@ -23,6 +23,7 @@ mod events;
 mod links;
 mod output;
 mod person;
+mod simd_sort;
 mod stream;
 use links::{Identity, People, person_names};
 use person::Codec;
@@ -348,7 +349,7 @@ fn process_stream<T: Temporal>(
         evs.extend(s.purchases.iter().map(|p| p.key));
         purchases.extend_from_slice(&s.purchases);
     }
-    evs.sort_unstable();
+    T::sort_keys(&mut evs);
     purchases.sort_unstable_by_key(|p| p.key);
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
     let ncamp = sm.camp_names.len();
