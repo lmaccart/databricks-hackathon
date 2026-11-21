@@ -11,6 +11,12 @@ fn fixed<const N: usize>(s: &[u8], q: bool) -> Option<(&[u8; N], &[u8])> {
 }
 
 #[inline(always)]
+fn fixed_ingest(s: &[u8]) -> Option<(&[u8; 20], &[u8])> {
+    let (q, s) = quoted(s);
+    fixed::<20>(s, q)
+}
+
+#[inline(always)]
 fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [u8])> {
     let (q, b) = quoted(s);
     let (ts, rest) = if *b.get(4)? != b'-' {
@@ -18,11 +24,11 @@ fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [
         (ManifestClock::event_f3(body), rest)
     } else if *b.get(19)? == b'Z' {
         let (body, rest) = fixed::<20>(b, q)?;
-        let sec = clock.event_f1_seconds(body);
-        if sec == BAD {
-            return None;
-        }
-        (sec * 1000, rest)
+        let (ingest, rest) = fixed_ingest(rest)?;
+        // Preserve the strict retry: neither an invalid event nor an unusual
+        // ingest may skip the ordinary decoder's duplicate claim.
+        let (sec, seconds) = clock.event_f1_pair(body, ingest)?;
+        return Some((sec * 1000, seconds, rest));
     } else {
         let (body, rest) = fixed::<25>(b, q)?;
         (ManifestClock::event_f2(body), rest)
@@ -30,8 +36,7 @@ fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [
     if ts == BAD {
         return None;
     }
-    let (q, rest) = quoted(rest);
-    let (body, rest) = fixed::<20>(rest, q)?;
+    let (body, rest) = fixed_ingest(rest)?;
     let seconds = clock.event_f1_seconds(body);
     (seconds != BAD).then_some((ts, seconds, rest))
 }
