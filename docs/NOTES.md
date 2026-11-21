@@ -13,8 +13,11 @@ Leif reports **5.03 s** for `cc9f33e`. At the user-reported 0.68 s lead that is 
 | Candidate vs control | Control | Candidate | Wall time reduction |
 |---|---:|---:|---:|
 | Exact 64-bit person keys vs `cc9f33e` | 1.909 s | 1.489 s | 22.0% |
+| Direct payload routing + small duplicate claims vs person keys | 1.556 s | 1.253 s | 19.5% |
 
 Short ASCII person names are byte-packed, reversible keys; non-ASCII, long names and IDs ending in NUL are assigned exact interned keys in a disjoint namespace. Canonical names are still chosen by comparing original bytes. Session-event records shrink from 48 to 24 bytes and the comparator no longer follows string pointers. Zero-padded IDs, mixed case, embedded NUL and long names are covered by the suite.
+
+The event parser now sends valid payloads directly to the eventual person shard. Independently, **every** syntactically valid, identified copy sends a small claim to the event-ID shard, including copies with invalid contents. A blocked Bloom filter proves most IDs unique; collisions only cause extra exact-map work. Every real duplicate necessarily sets its “repeated” bits on its second sighting, so the second scan includes *all* copies of that ID in exact earliest-ingest selection. Only losing payload locations are removed. A purchase is the only event that probes the product catalog.
 
 ## What the official material established
 

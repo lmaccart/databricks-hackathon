@@ -17,7 +17,10 @@ pub fn inline(bytes: &[u8]) -> Option<u64> {
         return None;
     }
     let (word, tail) = if bytes.len() >= 8 {
-        (u64::from_be_bytes(bytes[..8].try_into().unwrap()), bytes.get(8).copied().unwrap_or(0))
+        (
+            u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+            bytes.get(8).copied().unwrap_or(0),
+        )
     } else {
         let mut tmp = [0; 8];
         tmp[..bytes.len()].copy_from_slice(bytes);
@@ -46,7 +49,10 @@ pub struct Codec<'a> {
 
 impl<'a> Codec<'a> {
     pub fn new() -> Self {
-        Self { long: std::array::from_fn(|_| RwLock::default()), hash: rs() }
+        Self {
+            long: std::array::from_fn(|_| RwLock::default()),
+            hash: rs(),
+        }
     }
 
     #[inline]
@@ -73,7 +79,9 @@ impl<'a> Codec<'a> {
 
     #[inline]
     pub fn bytes<'b>(&self, key: u64, buf: &'b mut [u8; 9]) -> &'b [u8]
-    where 'a: 'b {
+    where
+        'a: 'b,
+    {
         if key & EXTERNAL != 0 {
             let names = self.long[(key as usize) & (LANES - 1)].read().unwrap();
             return names.by_index[((key ^ EXTERNAL) >> LANES.trailing_zeros()) as usize];

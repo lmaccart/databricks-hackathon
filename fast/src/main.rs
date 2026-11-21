@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 mod person;
+mod events;
 use person::Codec;
 
 const DAY: i64 = 86_400_000;
@@ -36,10 +37,6 @@ const MAX_PRICE: i64 = 10_000_000;
 const NS: usize = 256; // shards for every hash partition
 const CHUNK: usize = 8 << 20; // bytes per parse task
 const ORGANIC: u32 = u32::MAX;
-
-const T_VIEW: u8 = 1;
-const T_CART: u8 = 2;
-const T_PURCHASE: u8 = 3;
 
 type Map<K, V> = HashMap<K, V, RandomState>;
 
@@ -410,18 +407,6 @@ fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
 // ------------------------------------------------------------------ events & clicks
 
 #[derive(Clone, Copy)]
-struct EvRow<'a> {
-    eid: &'a [u8],
-    uid: &'a [u8],
-    ts: i64,
-    ingest: i64,
-    price: u32,
-    cat: u32,
-    etype: u8,
-    ok: bool,
-}
-
-#[derive(Clone, Copy)]
 struct PEv {
     person: u64,
     ts: i64,
@@ -442,75 +427,6 @@ type ClRow<'a> = (&'a [u8], &'a [u8], i64, u32); // click_id, user_id, ts, campa
 #[inline]
 fn shard(h: u64) -> usize {
     ((h >> 40) as usize) % NS
-}
-
-fn parse_events<'a>(c: &Chunk<'a>, sm: &Small, ws: i64, we: i64, hs: &RandomState) -> Vec<Vec<EvRow<'a>>> {
-    let mut b: Vec<Vec<EvRow>> = (0..NS).map(|_| Vec::new()).collect();
-    for_rows(c, |r| {
-        // event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
-        let eid = r[0];
-        if eid.is_empty() {
-            return;
-        }
-        let ingest = match parse_ts(r[3]) {
-            BAD => i64::MAX, // never happens per rules.md; such a copy can only lose or be late
-            t => t,
-        };
-        let uid = r[1];
-        let ts = parse_ts(r[2]);
-        let etype = match r[4] {
-            b"view" => T_VIEW,
-            b"cart" => T_CART,
-            b"purchase" => T_PURCHASE,
-            _ => 0,
-        };
-        let pid = r[5];
-        // validity of this copy; it only matters if this copy wins the dedup
-        let mut ok = !uid.is_empty() && ts != BAD && ts >= ws && ts < we && etype != 0 && !pid.is_empty();
-        let mut price = 0u32;
-        if ok && etype == T_PURCHASE {
-            match parse_price(r[6]) {
-                Some(p) => price = p,
-                None => ok = false,
-            }
-        }
-        if ok && ingest.saturating_sub(ts) > DAY {
-            ok = false; // late
-        }
-        let cat = if ok { *sm.product_cat.get(pid).unwrap_or(&sm.unknown_cat) } else { 0 };
-        b[shard(hs.hash_one(eid))].push(EvRow { eid, uid, ts, ingest, price, cat, etype, ok });
-    });
-    b
-}
-
-fn dedup_events<'a>(
-    parsed: &[Vec<Vec<EvRow<'a>>>],
-    s: usize,
-    names: &People<'a>,
-    hs: &RandomState,
-) -> Vec<Vec<PEv>> {
-    let n: usize = parsed.iter().map(|p| p[s].len()).sum();
-    let mut best: Map<&'a [u8], EvRow<'a>> = Map::with_capacity_and_hasher(n, rs());
-    for p in parsed {
-        for r in &p[s] {
-            best.entry(r.eid)
-                .and_modify(|cur| {
-                    if r.ingest < cur.ingest {
-                        *cur = *r;
-                    }
-                })
-                .or_insert(*r);
-        }
-    }
-    let mut out: Vec<Vec<PEv>> = (0..NS).map(|_| Vec::new()).collect();
-    for r in best.values() {
-        if !r.ok {
-            continue;
-        }
-        let person = names.resolve(r.uid);
-        out[shard(hs.hash_one(person))].push(PEv { person, ts: r.ts, price: r.price, cat: r.cat });
-    }
-    out
 }
 
 fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, hs: &RandomState) -> Vec<Vec<ClRow<'a>>> {
@@ -757,11 +673,7 @@ fn main() {
     let names = person_names(&link_chunks);
     log(&format!("links: {} linked ids", names.aliases.len()));
 
-    let ev_parsed: Vec<_> = ev_chunks.par_iter().map(|c| parse_events(c, &sm, ws, we, &hs)).collect();
-    log("events parsed");
-    let ev_by_person: Vec<Vec<Vec<PEv>>> =
-        (0..NS).into_par_iter().map(|s| dedup_events(&ev_parsed, s, &names, &hs)).collect();
-    drop(ev_parsed);
+    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, ws, we, &hs, &log);
     log("events deduped");
 
     let cl_parsed: Vec<_> = cl_chunks.par_iter().map(|c| parse_clicks(c, &sm, ws - WEEK, we, &hs)).collect();
