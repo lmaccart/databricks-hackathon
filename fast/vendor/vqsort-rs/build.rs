@@ -12,6 +12,9 @@ fn main() {
     println!("cargo:rerun-if-changed={}", source_path.display());
 
     let mut build = cc::Build::new();
+    if highway.version.starts_with("1.0.") {
+        build.define("HWY_USE_SORTER", None);
+    }
     build.cpp(true).file(source_path);
     for include in highway.include_paths {
         build.include(include);

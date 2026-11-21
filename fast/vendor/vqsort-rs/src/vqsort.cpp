@@ -1,6 +1,13 @@
 #include "hwy/contrib/sort/vqsort.h"
 #include "hwy/base.h"
 
+#ifdef HWY_USE_SORTER
+// Debian bookworm's 1.0 API keeps a small scratch area in each Sorter.
+// A sorter cannot be used by two concurrent Rayon tasks.
+static thread_local hwy::Sorter worker_sorter;
+#define VQSort worker_sorter
+#endif
+
 extern "C" {
 void vqsort_i16(int16_t *data, size_t len) {
   VQSort(data, len, hwy::SortAscending{});
