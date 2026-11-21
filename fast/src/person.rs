@@ -60,6 +60,12 @@ impl<'a> Codec<'a> {
         inline(bytes).unwrap_or_else(|| self.intern(bytes))
     }
 
+    #[inline]
+    pub fn less(&self, a: u64, b: u64) -> bool {
+        if (a | b) & EXTERNAL == 0 { a < b }
+        else { self.bytes(a, &mut [0; 9]) < self.bytes(b, &mut [0; 9]) }
+    }
+
     #[cold]
     fn intern(&self, bytes: &'a [u8]) -> u64 {
         let i = (self.hash.hash_one(bytes) as usize) & (LANES - 1);

@@ -19,14 +19,19 @@ Leif reports **5.03 s** for `cc9f33e`. At the user-reported 0.68 s lead that is 
 | Prefetch the canonical-name slot 16 rows ahead vs routing | 1.223 s | 1.089 s | 11.0% |
 | Typed Parquet writer + exit after explicit close vs prefetch | 1.073 s | 1.036 s | 3.4% |
 | Single-pass structural SIMD + fixed-word timestamp decoder vs writer | 0.949 s | 0.774 s | 18.5% |
+| Direct click routing + compact ID + tie resolution during the window scan (original assist counters) vs SIMD | 0.786 s | 0.723 s | 8.1% |
 
 The explicit prefetch hint dereferences no input and is issued only for an in-bounds slot in the live alias table. A small FIFO overlaps that lookup with the next rows' parsing. Other architectures can run the same FIFO without an ISA-specific hint.
 
 **Native Linux check, not Rosetta:** [GitHub Actions run 44864533547](https://github.com/lmaccart/databricks-hackathon/actions/runs/44864533547) used four workers on an Intel Xeon 6975P-C. `cc9f33e`: **6.385 s**; the rebuilt writer/prefetch checkpoint (`d2cd1b6`): **2.876 s**, or **2.22×** faster. All five candidate runs were 2.843–2.922 s, and the exact dev check passed. The harness times process start to exit on the runner, not an official eight-hyperthread container.
 
+**Allocator control:** identical amd64 executable under Rosetta, glibc vs Debian mimalloc: 3.534 vs 2.605 s across five interleaved full Docker runs. But on [native Intel](https://github.com/lmaccart/databricks-hackathon/actions/runs/44864914334), the identical-binary medians were 2.795 vs 2.721 s, only **2.6%**. No mimalloc dependency or preload in the submitted image. An emulation-only improvement is not enough.
+
 Rejected trials: a second round of hash bucketing before the session sorts gave 1.879 vs 1.836 s on the compact-key control. Direct click routing plus lazy interval assist counters gave 1.841 vs 1.572 s in a noisy batch. Neither result meets the five-run end-to-end acceptance threshold; retain the existing sorts and click path for that checkpoint.
 
 Shard/chunk sweep on the routing checkpoint (each is a five-pair candidate vs its own `256 shards / 8 MiB` control): 64/2 MiB: 1.412 vs 1.331 s; 64/8 MiB: 1.245 vs 1.215 s; 128/4 MiB: 1.255 vs 1.254 s; 32/2 MiB: 1.298 vs 1.271 s. None justify a parameter change.
+
+Other exact representations that passed correctness but missed the cutoff on the integrated native run: 16-byte claims with a lossless outlier table (0.998 vs 0.971 s); 16-byte session events selected only when time offsets/category IDs provably fit, with a wide fallback (0.776 vs 0.791 s); and an ingestion-month cache (1.114 vs 1.132 s). These remain experiments; production retains full-width timestamps.
 
 Opus also tried the opposite event layout, first scattering 40-byte source-span rows by event ID, then passing only frequency-filter collisions to a full byte comparison. On the unmodified scored pipeline this measured 2.149 → 1.927 s (10.3%). The integrated entry uses direct payload routing instead; these are alternative algorithms, not additive gains.
 

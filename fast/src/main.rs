@@ -7,7 +7,7 @@
 //!   1. links  -> union-find -> id -> person name
 //!   2. events -> payloads by person, claims by event ID
 //!   3. reject losing payloads after exact minimum-ingest selection on suspect IDs
-//!   4. clicks -> parse, validate, bucket by hash(click_id) -> dedup -> bucket by hash(person)
+//!   4. clicks -> parse, validate and bucket directly by person (identical copies are idempotent)
 //!   5. per person shard: sort, sessionize, credit, assists, aggregate
 //!   6. write Parquet in parallel
 
@@ -159,14 +159,12 @@ struct PEv {
 }
 
 #[derive(Clone, Copy)]
-struct PCl<'a> {
+struct PCl {
     person: u64,
     ts: i64,
-    cid: &'a [u8],
+    cid: u64,
     camp: u32,
 }
-
-type ClRow<'a> = (&'a [u8], &'a [u8], i64, u32); // click_id, user_id, ts, campaign index
 
 #[inline]
 fn shard(h: u64) -> usize {
@@ -200,8 +198,9 @@ fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
     rows
 }
 
-fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, hs: &RandomState) -> Vec<Vec<ClRow<'a>>> {
-    let mut b: Vec<Vec<ClRow>> = (0..NS).map(|_| Vec::new()).collect();
+fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<'a>) -> Vec<Vec<PCl>> {
+    let hint = reserve_per_shard(c.data);
+    let mut b: Vec<Vec<PCl>> = (0..NS).map(|_| Vec::with_capacity(hint)).collect();
     for_rows(c, |r| {
         // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
         let (cid, uid, camp) = (r[0], r[1], r[2]);
@@ -213,30 +212,10 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, hs: &RandomStat
         if ts == BAD || ts < lo || ts >= we {
             return;
         }
-        b[shard(hs.hash_one(cid))].push((cid, uid, ts, ci));
+        let person = names.resolve(uid);
+        b[shard(person)].push(PCl { person, ts, cid: names.codec.key(cid), camp: ci });
     });
     b
-}
-
-fn dedup_clicks<'a>(
-    parsed: &[Vec<Vec<ClRow<'a>>>],
-    s: usize,
-    names: &People<'a>,
-    _hs: &RandomState,
-) -> Vec<Vec<PCl<'a>>> {
-    let n: usize = parsed.iter().map(|p| p[s].len()).sum();
-    let mut seen: Map<&'a [u8], ()> = Map::with_capacity_and_hasher(n, rs());
-    let mut out: Vec<Vec<PCl>> = (0..NS).map(|_| Vec::new()).collect();
-    for p in parsed {
-        for &(cid, uid, ts, camp) in &p[s] {
-            if seen.insert(cid, ()).is_some() {
-                continue;
-            }
-            let person = names.resolve(uid);
-            out[shard(person)].push(PCl { person, ts, cid, camp });
-        }
-    }
-    out
 }
 
 // ------------------------------------------------------------------ sessions
@@ -275,15 +254,13 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
     best.map(|b| b as u32)
 }
 
-fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small) -> ShardOut {
+fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec) -> ShardOut {
     evs.sort_unstable_by_key(|e| (e.person, e.ts));
-    cls.sort_unstable_by(|a, b| {
-        a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| a.cid.cmp(b.cid))
-    });
+    cls.sort_unstable_by_key(|c| (c.person, c.ts));
     let ncamp = sm.camp_names.len();
     let mut users = Vec::new();
     let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
-    let mut cnt = vec![0u32; ncamp]; // clicks per campaign inside the current 7-day window
+    let mut cnt = vec![0usize; ncamp]; // copies enter and leave the window together
     let mut active: Vec<u32> = Vec::new(); // campaigns with cnt > 0
     let mut pos = vec![0u32; ncamp]; // index of a campaign inside `active`
     let mut catsum = vec![0i64; sm.cat_names.len()];
@@ -305,6 +282,7 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small) -> ShardOut {
         }
         let clicks = &cls[c0..ci];
         let (mut lo, mut hi) = (0usize, 0usize);
+        let mut latest = 0;
 
         let mut cur_day: i32 = i32::MIN;
         let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
@@ -342,6 +320,10 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small) -> ShardOut {
 
             // slide the click window to [start - 7d, start]
             while hi < clicks.len() && clicks[hi].ts <= start {
+                if hi == 0 || clicks[hi].ts != clicks[latest].ts
+                    || codec.less(clicks[hi].cid, clicks[latest].cid) {
+                    latest = hi;
+                }
                 let c = clicks[hi].camp as usize;
                 if cnt[c] == 0 {
                     pos[c] = active.len() as u32;
@@ -363,17 +345,9 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small) -> ShardOut {
                 }
                 lo += 1;
             }
-            let credit = if lo < hi {
-                // latest ts; among equal ts the smallest click_id (clicks are sorted by ts, cid)
-                let best = clicks[hi - 1].ts;
-                let mut q = hi - 1;
-                while q > lo && clicks[q - 1].ts == best {
-                    q -= 1;
-                }
-                clicks[q].camp
-            } else {
-                ORGANIC
-            };
+            // The entire latest timestamp run expires together. Identical
+            // copies change neither the tie winner nor campaign membership.
+            let credit = if lo < hi { clicks[latest].camp } else { ORGANIC };
             let e = camps.entry(ckey(credit, day)).or_insert([0; 4]);
             e[0] += 1;
             e[1] += purch as i64;
@@ -399,6 +373,13 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small) -> ShardOut {
 
 fn main() {
     let t0 = Instant::now();
+    // Some runtimes expose host CPU count despite the competition's quota.
+    // Respect an explicit Rayon setting for reproducible local comparisons.
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        if let Some(n) = std::env::var("NCPU").ok().and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 0) {
+            rayon::ThreadPoolBuilder::new().num_threads(n).build_global().expect("Rayon pool");
+        }
+    }
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let outd = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let log = |m: &str| eprintln!("[{:>7.3}s] {m}", t0.elapsed().as_secs_f64());
@@ -432,17 +413,14 @@ fn main() {
     let ev_by_person = events::by_person(&ev_chunks, &sm, &names, ws, we, &hs, &log);
     log("events deduped");
 
-    let cl_parsed: Vec<_> = cl_chunks.par_iter().map(|c| parse_clicks(c, &sm, ws - WEEK, we, &hs)).collect();
-    let cl_by_person: Vec<Vec<Vec<PCl>>> =
-        (0..NS).into_par_iter().map(|s| dedup_clicks(&cl_parsed, s, &names, &hs)).collect();
-    drop(cl_parsed);
-    log("clicks deduped");
+    let cl_by_person = cl_chunks.par_iter().map(|c| parse_clicks(c, &sm, ws - WEEK, we, &names)).collect();
+    log("clicks routed");
 
     let mut jobs: Vec<_> = by_destination(ev_by_person).into_iter()
         .zip(by_destination(cl_by_person)).collect();
     jobs.sort_unstable_by_key(|(e, c)| std::cmp::Reverse(
         e.iter().map(Vec::len).sum::<usize>() + c.iter().map(Vec::len).sum::<usize>()));
-    let outs: Vec<_> = jobs.into_par_iter().map(|(e, c)| process_shard(gather(e), gather(c), &sm)).collect();
+    let outs: Vec<_> = jobs.into_par_iter().map(|(e, c)| process_shard(gather(e), gather(c), &sm, &names.codec)).collect();
     log("sessions done");
 
     let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
