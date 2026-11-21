@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 2 standalone attribution walk — 2026-11-20 (Houston)
+
+- Invert the assist window into per-campaign runs of covered session starts. The credit scan extends a run if its last click covers the previous session; otherwise it emits the old run. Inclusive upper expiry is found by binary search, and a run contributes one bulk update per day it intersects. Zero-click, one-click and one-session people bypass the range walk. Category ranking/reset only touches purchased categories. Temporary dense scratch is byte-bounded with a sparse fallback; campaign/day output remains sparse.
+- Native Mac, eight workers, same 20M practice seed 7 and five alternating pairs (no warmups): **0.892 → 0.834 s** (−6.5%); median sort + session/attribution phase **0.198 → 0.183 s**. Other phases moved as well and individual pairs were noisy; this does not establish a scorer or 60M delta.
+- Exact on both official dev comparers, 36/36 starter fixtures, 32 Python tests on each implementation, ten 4k-event dirty-data seeds, and three 10k-event official-generator seeds (2, 7, and leap-day seed 15). The new regression covers a campaign expiring and returning on the same UTC day, duplicates, sparse dimensions, purchase ties, and an assist-only row.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.

@@ -341,6 +341,51 @@ class Clicks(unittest.TestCase):
         r = c[("c_2", "2026-10-09")]
         self.assertEqual((r["sessions"], r["purchasing_sessions"], r["revenue_cents"]), (1, 1, 1234))
 
+    def test_disjoint_assist_ranges_and_sparse_days(self):
+        # The same campaign expires, then returns on the same day. Its first
+        # two clicks overlap; a session strictly in the gap stays organic.
+        t = ms("2026-10-09T01:00:00Z")
+        past = t - 7 * DAY
+        starts = [t, t + HOUR, t + 2 * HOUR, t + 3 * HOUR, t + 22 * HOUR, t + DAY, t + 50 * DAY]
+        events = [ev(f"e{i}", "u", str(s)) for i, s in enumerate(starts)]
+        events += [
+            ev("buy1", "u", str(starts[4] + 70 * MIN), "purchase", "p1", "50"),
+            ev("buy2", "u", str(starts[4] + 80 * MIN), "purchase", "p2", "100"),
+            ev("bridge", "u", str(starts[4] + 45 * MIN)),
+            ev("bridge2", "u", str(starts[4] + 20 * MIN)),
+            # These are in the next session/day, tied by category totals.
+            ev("buy3", "u", str(starts[5]), "purchase", "p1", "100"),
+            ev("buy4", "u", str(starts[5]), "purchase", "unknown-product", "100"),
+            ev("one", "single", str(t)),
+        ]
+        u, c = run_case(events, [
+            f"old,u,c_1,{past - 1000}", f"edge,u,c_1,{past}",
+            f'"edge","u","c_1","{past}"',
+            f"10,u,c_2,{starts[3]}", f"2,u,c_1,{starts[3]}",
+            f"last,u,c_3,{starts[5] + 1}",
+            f"sc1,single,c_2,{t - 7 * DAY}", f"sc2,single,c_2,{t}",
+            f"sc4,single,c_2,{t - HOUR}", f"sc5,single,c_2,{t - 2 * HOUR}",
+            f"sc6,single,c_1,{t - 3 * HOUR}", f'"sc6",single,c_1,{t - 3 * HOUR}',
+            f"sc3,single,c_3,{t + 1}",
+        ], products=("p1,zzz", "p2,aaa", *(f"p{i},category{i}" for i in range(3, 6000))),
+            campaigns=("c_1,search", "c_2,social", "c_3,email",
+                       *(f"unused{i},email" for i in range(4000))),
+            window=(WS, "2027-02-01T00:00:00Z"))
+        expected = {
+            ("c_1", "2026-10-09"): (1, 0, 0, 4),
+            ("c_2", "2026-10-09"): (3, 1, 150, 3),
+            ("organic", "2026-10-09"): (2, 0, 0, 0),
+            ("c_1", "2026-10-10"): (0, 0, 0, 1),
+            ("c_2", "2026-10-10"): (1, 1, 200, 1),
+            ("organic", "2026-11-28"): (1, 0, 0, 0),
+        }
+        self.assertEqual({k: tuple(r[f] for f in ("sessions", "purchasing_sessions",
+                                                "revenue_cents", "assisted_sessions"))
+                          for k, r in c.items()}, expected)
+        self.assertEqual(u[("u", "2026-10-09")]["top_category"], "aaa")
+        self.assertEqual(u[("u", "2026-10-10")]["top_category"], "unknown")
+        self.assertIsNone(u[("u", "2026-11-28")]["top_category"])
+
 
 class ByteDistinctIds(unittest.TestCase):
     def test_lookalike_ids_and_lexical_click_tie(self):
