@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Contiguous alias lanes — 2026-11-20 (Houston)
+
+The final alias table is allocated once from deduplicated link counts. Parallel builders fill disjoint lane ranges; union reads the node indexes stored there and replaces them in place with canonical person tokens. Uniform lanes prefetch with just the region base and the upper hash bits. When padding would exceed 50% over per-lane sizing, the same contiguous layout uses ragged ranges and omits empty lanes. Collision probes stay within their lane and compare the full key. Person tokens and byte-minimum naming are unchanged.
+
+Both dev checkers matched exactly; 36/36 official fixtures passed, and 10/10 kit-generated 20k cases plus 6/6 official 10k and 100k cases (including leap day) matched the Python oracle. Native ARM64 disassembly confirms the uniform prefetch is a shift and scaled add followed by `prfm`, with no lane pointer or mask load. The 20M timing gate was deliberately not run. Remaining risks to measure are uniform padding and the cold probe cost on the target CPU, especially if home-slot collisions or ragged layouts are common.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.
