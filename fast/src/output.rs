@@ -713,7 +713,7 @@ mod count_tests {
     fn narrow_counts_and_encoded_pages_round_trip_boundaries() {
         let path = std::env::var_os("COUNT_TEST_OUT")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(format!("target/count-test-{}.parquet", std::process::id())));
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("ss-count-test-{}.parquet", std::process::id())));
         let sch = schema(vec![long("counts")]);
         let desc = SchemaDescriptor::new(sch.clone());
         let mut writer = file(&path, sch);
