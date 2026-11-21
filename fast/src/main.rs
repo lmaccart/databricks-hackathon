@@ -22,6 +22,7 @@ mod events;
 mod links;
 mod output;
 mod person;
+mod timesweep;
 use links::{People, person_names};
 use person::Codec;
 
@@ -276,8 +277,58 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
     best.map(|b| b as u32)
 }
 
-fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec) -> ShardOut {
-    evs.sort_unstable_by_key(|e| (e.person, e.ts));
+fn process_shard(
+    evs: Vec<Vec<PEv>>,
+    cls: Vec<PCl>,
+    sm: &Small,
+    codec: &Codec,
+    bins: Option<timesweep::Bins>,
+) -> ShardOut {
+    match timesweep::prepare(evs, bins) {
+        Ok(sweep) => {
+            let purchases = &sweep.purchases;
+            let sessions = sweep.sessions.iter().map(|s| {
+                let mut head = s.head;
+                let prices = std::iter::from_fn(move || {
+                    if head == 0 {
+                        return None;
+                    }
+                    let p = &purchases[head as usize - 1];
+                    head = p.next;
+                    Some((p.cat, p.price))
+                });
+                (s.person, s.start, s.count as i64, prices)
+            });
+            attribute(sessions, cls, sm, codec)
+        }
+        Err(mut evs) => {
+            evs.sort_unstable_by_key(|e| (e.person, e.ts));
+            let mut rest = evs.as_slice();
+            let sessions = std::iter::from_fn(|| {
+                let first = rest.first()?;
+                let mut end = 1;
+                while end < rest.len()
+                    && rest[end].person == first.person
+                    && rest[end].ts.saturating_sub(rest[end - 1].ts) <= GAP
+                {
+                    end += 1;
+                }
+                let (session, next) = rest.split_at(end);
+                rest = next;
+                let prices = session.iter().filter(|e| e.price != 0).map(|e| (e.cat, e.price));
+                Some((first.person, first.ts, end as i64, prices))
+            });
+            attribute(sessions, cls, sm, codec)
+        }
+    }
+}
+
+fn attribute<P: Iterator<Item = (u32, u32)>>(
+    sessions: impl Iterator<Item = (u64, i64, i64, P)>,
+    mut cls: Vec<PCl>,
+    sm: &Small,
+    codec: &Codec,
+) -> ShardOut {
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
     let ncamp = sm.camp_names.len();
     let mut users = Vec::new();
@@ -288,13 +339,8 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
     let mut catsum = vec![0i64; sm.cat_names.len()];
 
     let mut ci = 0usize;
-    let mut i = 0usize;
-    while i < evs.len() {
-        let person = evs[i].person;
-        let mut j = i;
-        while j < evs.len() && evs[j].person == person {
-            j += 1;
-        }
+    let mut sessions = sessions.peekable();
+    while let Some(&(person, _, _, _)) = sessions.peek() {
         while ci < cls.len() && cls[ci].person < person {
             ci += 1;
         }
@@ -309,14 +355,8 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
         let mut cur_day: i32 = i32::MIN;
         let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
 
-        let mut k = i;
-        while k < j {
-            // one session is evs[k..m]
-            let start = evs[k].ts;
-            let mut m = k + 1;
-            while m < j && evs[m].ts - evs[m - 1].ts <= GAP {
-                m += 1;
-            }
+        while sessions.peek().is_some_and(|s| s.0 == person) {
+            let (_, start, event_count, prices) = sessions.next().unwrap();
             let day = start.div_euclid(DAY) as i32;
             if day != cur_day {
                 if cur_day != i32::MIN {
@@ -335,16 +375,12 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
                 (d_sess, d_ev, d_rev) = (0, 0, 0);
             }
             let mut rev = 0i64;
-            let mut purch = false;
-            for e in &evs[k..m] {
-                if e.price != 0 {
-                    purch = true;
-                    rev += e.price as i64;
-                    catsum[e.cat as usize] += e.price as i64;
-                }
+            for (cat, price) in prices {
+                rev += price as i64;
+                catsum[cat as usize] += price as i64;
             }
             d_sess += 1;
-            d_ev += (m - k) as i64;
+            d_ev += event_count;
             d_rev += rev;
 
             // slide the click window to [start - 7d, start]
@@ -378,12 +414,11 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
             let credit = if lo < hi { clicks[latest].camp } else { ORGANIC };
             let e = camps.entry(ckey(credit, day)).or_insert([0; 4]);
             e[0] += 1;
-            e[1] += purch as i64;
+            e[1] += (rev != 0) as i64;
             e[2] += rev;
             for &a in &active {
                 camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
             }
-            k = m;
         }
         let top = top_category(&catsum, &sm.cat_rank);
         users.push(UserRow {
@@ -399,7 +434,6 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
             cnt[a as usize] = 0;
         }
         active.clear();
-        i = j;
     }
     ShardOut { users, camps }
 }
@@ -475,9 +509,10 @@ fn main() {
     jobs.sort_unstable_by_key(|(e, c)| {
         std::cmp::Reverse(e.iter().map(Vec::len).sum::<usize>() + c.iter().map(Vec::len).sum::<usize>())
     });
+    let bins = timesweep::Bins::new(ws, we);
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(gather(e), gather(c), &sm, &names.codec))
+        .map(|(e, c)| process_shard(e, gather(c), &sm, &names.codec, bins))
         .collect();
     log("sessions done");
 
