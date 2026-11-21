@@ -3,6 +3,9 @@ name = "shopping_sessions"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+shape-stats = []
+
 [dependencies]
 ahash = "0.8.12"
 bytes = "1"

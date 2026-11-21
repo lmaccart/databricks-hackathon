@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Exact suffix motifs against `dfbd330` — 2026-11-21
+
+Experimental only; **do not promote on these measurements**. The typed parser's product/price suffix caches a bounded 16-byte structural-mask motif, discarding bits beyond the first newline. A hit checks the exact structural mask and every quote, comma and newline boundary; a miss uses the original rank scanner, and the rest of the typed grammar and one-line strict fallback are unchanged. This is a suffix-only experiment, not a full-row or four-field date/type shape decoder. No code was copied from the public implementation. The earlier, different two-field cache lost 5–7% on Mac dev (`PERF_178.md`).
+
+Opt-in `cargo build --release --features shape-stats` and `SHAPE_STATS=1` reported 1,031,523 hits / 1,063,993 attempts (96.95%) over 32 dev chunks; attempts include suffixes reached by the typed grammar, not all input lines. An initial non-normalized-key variant hit 28.8%. Nine alternating warm Mac ARM64 dev pairs, eight workers: 0.100 → 0.097 s total medians, but only 4/9 candidate wins, median paired change -0.4% and event-parse phase 0.025 → 0.026 s. One worker: 0.191 → 0.188 s total, 5/9 wins, event parse 0.071 → 0.075 s. Shared-host noise and the tiny dev size make both timing results inconclusive; no 20M, target amd64, CI, Docker or organizer measurements were run.
+
+The normal build passed 39 reference and binary tests, 22 Rust tests including primed-cache strict byte mutations and motif collisions, 10 dirty 20k-event seeds, 36/36 official fixtures, and both dev-answer comparers. The feature-enabled output also matched the dev answer. This does not establish final-scale correctness or a speedup.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).

@@ -106,43 +106,51 @@ const STEP: usize = 1;
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn structural(b: &[u8; 16]) -> u64 {
+fn structural(b: &[u8; 16]) -> (u64, u64) {
     use std::arch::aarch64::*;
     // SAFETY: 16 readable bytes and NEON is baseline.
     unsafe {
         let v = vld1q_u8(b.as_ptr());
+        let nl = vceqq_u8(v, vdupq_n_u8(b'\n'));
         let x = vorrq_u8(
             vorrq_u8(vceqq_u8(v, vdupq_n_u8(b',')), vceqq_u8(v, vdupq_n_u8(b'"'))),
-            vceqq_u8(v, vdupq_n_u8(b'\n')),
+            nl,
         );
-        vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(x))))
+        (
+            vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(x)))),
+            vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(nl)))),
+        )
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn structural(b: &[u8; 16]) -> u64 {
+fn structural(b: &[u8; 16]) -> (u64, u64) {
     use std::arch::x86_64::*;
     // SAFETY: 16 readable bytes and SSE2 is baseline.
     unsafe {
         let v = _mm_loadu_si128(b.as_ptr().cast());
+        let nl = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\n' as i8));
         let x = _mm_or_si128(
             _mm_or_si128(
                 _mm_cmpeq_epi8(v, _mm_set1_epi8(b',' as i8)),
                 _mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8)),
             ),
-            _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\n' as i8)),
+            nl,
         );
-        _mm_movemask_epi8(x) as u64
+        (_mm_movemask_epi8(x) as u64, _mm_movemask_epi8(nl) as u64)
     }
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
-fn structural(b: &[u8; 16]) -> u64 {
-    b.iter()
-        .enumerate()
-        .fold(0, |m, (i, c)| m | (u64::from(matches!(c, b',' | b'"' | b'\n')) << i))
+fn structural(b: &[u8; 16]) -> (u64, u64) {
+    b.iter().enumerate().fold((0, 0), |(m, n), (i, c)| {
+        (
+            m | (u64::from(matches!(c, b',' | b'"' | b'\n')) << i),
+            n | (u64::from(*c == b'\n') << i),
+        )
+    })
 }
 
 #[inline(always)]
@@ -155,12 +163,133 @@ fn next(m: u64, start: usize) -> usize {
 
 type PriceCategory = (u32, u32);
 
+#[derive(Clone, Copy, Default)]
+struct Motif {
+    mask: u64,
+    p: u8,
+    end: u8,
+    comma: u8,
+    start2: u8,
+    end2: u8,
+    nl: u8,
+    valid: bool,
+}
+
+struct ShapeCache {
+    slots: [Motif; 256],
+    #[cfg(any(test, feature = "shape-stats"))]
+    hits: u64,
+    #[cfg(feature = "shape-stats")]
+    attempts: u64,
+    #[cfg(feature = "shape-stats")]
+    report: bool,
+}
+
+impl Default for ShapeCache {
+    fn default() -> Self {
+        Self {
+            slots: [Motif::default(); 256],
+            #[cfg(any(test, feature = "shape-stats"))]
+            hits: 0,
+            #[cfg(feature = "shape-stats")]
+            attempts: 0,
+            #[cfg(feature = "shape-stats")]
+            report: std::env::var_os("SHAPE_STATS").is_some(),
+        }
+    }
+}
+
+#[cfg(feature = "shape-stats")]
+impl Drop for ShapeCache {
+    fn drop(&mut self) {
+        if self.report && self.attempts != 0 {
+            eprintln!("shape suffix hits={} attempts={}", self.hits, self.attempts);
+        }
+    }
+}
+
+#[inline(always)]
+fn suffix_cached<'a>(
+    s: &'a [u8],
+    purchase: bool,
+    sm: &Small,
+    cache: &mut ShapeCache,
+) -> Option<(Option<PriceCategory>, &'a [u8])> {
+    let b = s.first_chunk::<16>()?;
+    let (mask, newlines) = structural(b);
+    let bits = (newlines.trailing_zeros() as usize / STEP + 1) * STEP;
+    let key = if bits < 64 { mask & ((1u64 << bits) - 1) } else { mask };
+    #[cfg(feature = "shape-stats")]
+    {
+        cache.attempts += 1;
+    }
+    let index = (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize;
+    let old = cache.slots[index];
+    let p = old.p as usize;
+    let end = old.end as usize;
+    let comma = old.comma as usize;
+    let start2 = old.start2 as usize;
+    let end2 = old.end2 as usize;
+    let nl = old.nl as usize;
+    // The mask proves there are no unexamined structural bytes in either
+    // field. Exact byte checks distinguish commas, quotes and newlines.
+    if old.valid
+        && old.mask == key
+        && (p == 0 || b[0] == b'"')
+        && (p != 0 || b[0] != b'"')
+        && (p == 0 || b[end] == b'"')
+        && b[comma] == b','
+        && (start2 == comma + 1 || b[comma + 1] == b'"')
+        && (start2 != comma + 1 || b[comma + 1] != b'"')
+        && (nl == end2 || b[end2] == b'"')
+        && b[nl] == b'\n'
+    {
+        #[cfg(any(test, feature = "shape-stats"))]
+        {
+            cache.hits += 1;
+        }
+        return Some((suffix_payload(b, p, end, start2, end2, purchase, sm), &s[nl + 1..]));
+    }
+    let mut motif = suffix_motif(b, mask)?;
+    motif.mask = key;
+    cache.slots[index] = motif;
+    Some((
+        suffix_payload(
+            b,
+            motif.p as usize,
+            motif.end as usize,
+            motif.start2 as usize,
+            motif.end2 as usize,
+            purchase,
+            sm,
+        ),
+        &s[motif.nl as usize + 1..],
+    ))
+}
+
+#[inline(always)]
+fn suffix_payload(
+    b: &[u8; 16],
+    p: usize,
+    end: usize,
+    start2: usize,
+    end2: usize,
+    purchase: bool,
+    sm: &Small,
+) -> Option<PriceCategory> {
+    if end == p {
+        None
+    } else if purchase {
+        parse_price(&b[start2..end2]).map(|price| (price, sm.product_cat.get(&b[p..end]).unwrap_or(sm.unknown_cat)))
+    } else {
+        Some((0, 0))
+    }
+}
+
 /// One classification for both product and price, even when the price is
 /// ignored. The first structural byte in each body must be its exact end.
 #[inline(always)]
-fn suffix<'a>(s: &'a [u8], purchase: bool, sm: &Small) -> Option<(Option<PriceCategory>, &'a [u8])> {
-    let b = s.first_chunk::<16>()?;
-    let mask = structural(b);
+fn suffix_motif(b: &[u8; 16], mask: u64) -> Option<Motif> {
     let p = usize::from(b[0] == b'"');
     let end = next(mask, p);
     let comma = if p == 1 {
@@ -189,23 +318,48 @@ fn suffix<'a>(s: &'a [u8], purchase: bool, sm: &Small) -> Option<(Option<PriceCa
     if *b.get(nl)? != b'\n' {
         return None;
     }
-    let payload = if end == p {
-        None
-    } else if purchase {
-        parse_price(&b[start2..end2]).map(|price| (price, sm.product_cat.get(&b[p..end]).unwrap_or(sm.unknown_cat)))
-    } else {
-        Some((0, 0))
-    };
-    Some((payload, &s[nl + 1..]))
+    Some(Motif {
+        mask,
+        p: p as u8,
+        end: end as u8,
+        comma: comma as u8,
+        start2: start2 as u8,
+        end2: end2 as u8,
+        nl: nl as u8,
+        valid: true,
+    })
+}
+
+#[cfg(test)]
+fn suffix<'a>(s: &'a [u8], purchase: bool, sm: &Small) -> Option<(Option<PriceCategory>, &'a [u8])> {
+    let b = s.first_chunk::<16>()?;
+    let m = suffix_motif(b, structural(b).0)?;
+    Some((
+        suffix_payload(
+            b,
+            m.p as usize,
+            m.end as usize,
+            m.start2 as usize,
+            m.end2 as usize,
+            purchase,
+            sm,
+        ),
+        &s[m.nl as usize + 1..],
+    ))
 }
 
 #[inline(always)]
-fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestClock)) -> Option<(Pending, &'a [u8])> {
+fn decode<'a>(
+    s: &'a [u8],
+    sm: &Small,
+    (ws, we, clock): (i64, i64, &ManifestClock),
+    cache: &mut ShapeCache,
+) -> Option<(Pending, &'a [u8])> {
     let (eid, s) = id(s)?;
     let (uid, s) = id(s)?;
     let (ts, seconds, s) = timestamps(s, clock)?;
     let (purchase, s) = event_type(s)?;
-    let (payload, rest) = suffix(s, purchase, sm)?;
+    let (payload, rest) = suffix_cached(s, purchase, sm, cache)?;
     let mut e = Pending {
         claim_key: links::mix(eid),
         ts,
@@ -259,8 +413,9 @@ pub(super) fn for_events<'a>(
         });
     }
     let mut rest = c.data;
+    let mut cache = ShapeCache::default();
     while !rest.is_empty() {
-        if let Some((e, tail)) = decode(rest, sm, window) {
+        if let Some((e, tail)) = decode(rest, sm, window, &mut cache) {
             emit(e);
             rest = tail;
         } else {
@@ -276,6 +431,48 @@ pub(super) fn for_events<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suffix_motifs_match_uncached_scanner_with_aliases_and_mutations() {
+        let path = Path::new("fixture.csv");
+        let sm = read_small(
+            b"product_id,category\nitem-7,shoes\n",
+            b"campaign_id,channel\n",
+            path,
+            path,
+        );
+        let rows: &[&[u8]] = &[
+            b"item-7,123\nnext99999,",
+            b"\"item-7\",\"123\"\nnext99999,",
+            b"item-7,\n\"next99999\",",
+            b"\"item-7\",bad\nnext99999,",
+        ];
+        let mut cache = ShapeCache::default();
+        for _ in 0..2 {
+            for row in rows {
+                for purchase in [false, true] {
+                    assert_eq!(
+                        suffix_cached(row, purchase, &sm, &mut cache),
+                        suffix(row, purchase, &sm)
+                    );
+                }
+                for i in 0..row.len() {
+                    for byte in [b',', b'"', b'\n', b'X', 0] {
+                        let mut changed = row.to_vec();
+                        changed[i] = byte;
+                        for purchase in [false, true] {
+                            assert_eq!(
+                                suffix_cached(&changed, purchase, &sm, &mut cache),
+                                suffix(&changed, purchase, &sm),
+                                "{changed:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cache.hits > 0);
+    }
 
     #[test]
     fn inline_ids_match_codec_for_every_accepted_byte_and_boundary() {
@@ -328,7 +525,9 @@ mod tests {
         let header = cols.join(",") + "\n";
         let following = b"next99999,user99999,2026-10-03T10:00:00Z,2026-10-03T10:00:00Z,view,item-7,\n";
         let check = |row: &[u8], after: &[u8]| {
-            let file = [header.as_bytes(), row, after].concat();
+            // Prime the motif cache before the mutated row, including when
+            // malformed input must not claim an event ID or consume a row.
+            let file = [header.as_bytes(), following, following, row, after].concat();
             let codec = Codec::new();
             for c in chunks_of(&file, &cols, path) {
                 let (mut want, mut got) = (vec![], vec![]);
@@ -348,7 +547,7 @@ mod tests {
             b"opaque009,\"USER_07\",\"2026-10-03T10:30:00+00:30\",\"2026-10-03T10:00:00Z\",\"purchase\",\"item-7\",\"0123\"",
         ] {
             let file = [row, &followed].concat();
-            let (event, rest) = decode(&file, &sm, window).unwrap_or_else(|| panic!("must exercise the word path: {row:?}"));
+            let (event, rest) = decode(&file, &sm, window, &mut ShapeCache::default()).unwrap_or_else(|| panic!("must exercise the word path: {row:?}"));
             assert_ne!(event.uid, 0);
             assert_eq!(rest, following);
             check(row, b"");
