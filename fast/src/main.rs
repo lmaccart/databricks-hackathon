@@ -98,6 +98,37 @@ fn mmap_files(dir: &Path) -> Vec<(PathBuf, Mmap)> {
     out
 }
 
+/// Ask Linux to start reading a bounded event prefix while link identities are
+/// being built. This is only a page-cache hint, never a correctness dependency.
+#[cfg(target_os = "linux")]
+fn advise_event_prefix(files: &[(PathBuf, Mmap)]) -> usize {
+    use memmap2::Advice;
+
+    const WINDOW: usize = 8 << 20;
+    const BUDGET: usize = 64 << 20;
+
+    let mut maps: Vec<_> = files.iter().map(|(_, map)| map).collect();
+    maps.sort_unstable_by_key(|map| std::cmp::Reverse(map.len()));
+    let mut remaining = BUDGET;
+    let mut advised = 0;
+    for map in maps {
+        let mut offset = 0;
+        while offset < map.len() && remaining > 0 {
+            let len = (map.len() - offset).min(WINDOW).min(remaining);
+            // A failed hint must never change the pipeline's result.
+            if map.advise_range(Advice::WillNeed, offset, len).is_ok() {
+                advised += len;
+            }
+            offset += len;
+            remaining -= len;
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    advised
+}
+
 fn chunks_for<'a>(files: &'a [(PathBuf, Mmap)], cols: &[&str]) -> Vec<Chunk<'a>> {
     let mut v: Vec<Chunk> = files.iter().flat_map(|(p, m)| chunks_of(&m[..], cols, p)).collect();
     v.sort_by_key(|c| std::cmp::Reverse(c.data.len())); // big tasks first
@@ -456,6 +487,9 @@ fn main() {
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
     let hs = rs();
 
+    #[cfg(target_os = "linux")]
+    let names = rayon::join(|| person_names(&link_chunks), || advise_event_prefix(&event_files)).0;
+    #[cfg(not(target_os = "linux"))]
     let names = person_names(&link_chunks);
     log(&format!("links: {} linked ids", names.count));
 
@@ -529,4 +563,31 @@ fn main() {
     log("written");
     // Everything is on disk; skip tearing down the shard tables and mmaps.
     std::process::exit(0);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod io_advice_tests {
+    use super::*;
+
+    #[test]
+    fn linux_willneed_hint_accepts_read_only_mmap() {
+        const BUDGET: usize = 64 << 20;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("shopping-sessions-madvise-{}-{unique}", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create test mapping");
+        file.set_len((BUDGET + (16 << 20)) as u64).expect("size test mapping");
+        drop(file);
+        let file = File::open(&path).expect("reopen test input read-only");
+        let map = unsafe { Mmap::map(&file).expect("map test input") };
+        assert_eq!(advise_event_prefix(&[(path.clone(), map)]), BUDGET);
+        std::fs::remove_file(path).expect("remove test mapping");
+    }
 }

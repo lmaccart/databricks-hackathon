@@ -1,5 +1,25 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 2 I/O scheduling challenger — 2026-11-20
+
+- Added a Linux-only `MADV_WILLNEED` hint over at most 64 MiB of event mappings, in 8 MiB windows, concurrently with link-name construction. It is a best-effort page-cache hint, not PTE population; errors are ignored and non-Linux builds retain the existing path. This avoids a serialized full-input pass and bounds prefetched input under the 14 GiB CI cap.
+- macOS validation: 13 Rust release tests, 31 reference tests, 31 binary tests, 10/10 small differential seeds, and exact dev-answer parity (117,038 user rows; 27,400 campaign rows). The Linux-only syscall test is cfg-gated and was not exercised locally.
+- macOS cannot exercise Linux `madvise` behavior. The required native check is the `linux_willneed_hint_accepts_read_only_mmap` release test on `ubuntu-24.04`, followed by the native Linux dev parity and five-pair 20M benchmark:
+  ```
+  CARGO_BUILD_JOBS=2 cargo +1.100.0 test --locked --release --manifest-path fast/Cargo.toml linux_willneed_hint_accepts_read_only_mmap
+  CARGO_BUILD_JOBS=2 cargo +1.100.0 build --locked --release --manifest-path fast/Cargo.toml
+  git worktree add --detach "$RUNNER_TEMP/io-control-src" HEAD^
+  CARGO_TARGET_DIR="$RUNNER_TEMP/io-control-target" CARGO_BUILD_JOBS=2 cargo +1.100.0 build --locked --release --manifest-path "$RUNNER_TEMP/io-control-src/fast/Cargo.toml"
+  cp "$RUNNER_TEMP/io-control-target/release/shopping_sessions" "$RUNNER_TEMP/io-control"
+  DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$RUNNER_TEMP/io-dev" NCPU=8 RAYON_NUM_THREADS=8 fast/target/release/shopping_sessions
+  "$RUNNER_TEMP/venv/bin/python" tools/compare_outputs.py "$RUNNER_TEMP/dev-answer" "$RUNNER_TEMP/io-dev"
+  # First runtime invocation after generating fresh practice data (record separately).
+  DATA_DIR="$RUNNER_TEMP/practice" OUTPUT_DIR="$RUNNER_TEMP/io-first" NCPU=8 RAYON_NUM_THREADS=8 fast/target/release/shopping_sessions
+  python3 tools/bench_pair.py "$RUNNER_TEMP/io-control" fast/target/release/shopping_sessions "$RUNNER_TEMP/practice" --runs 5 --threads 8 --tmpdir "$RUNNER_TEMP"
+  ```
+  The same control/candidate build and runtime sequence should be executed on a fresh native runner for first-touch comparisons. The paired benchmark includes its documented warmups. Do not flush host-wide caches or treat a warmed benchmark as first-touch evidence. No native Linux speedup is claimed from this Mac session.
+- A separate click-parse/event-dedup `rayon::join` trial was discarded: five warm Mac pairs measured 0.762 s control vs 0.899 s candidate with high variance, so it did not meet the >3% acceptance bar. No click-overlap code remains.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.
