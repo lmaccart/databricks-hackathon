@@ -7,7 +7,7 @@ WORKDIR /src
 ARG HIGHWAY_SORT
 RUN if [ "$HIGHWAY_SORT" = "1" ]; then \
     apt-get update && apt-get install -y --no-install-recommends \
-    libhwy-dev=1.0.3-3+deb12u1 && rm -rf /var/lib/apt/lists/*; \
+    pkg-config g++ libhwy-dev=1.0.3-3+deb12u1 && rm -rf /var/lib/apt/lists/*; \
     fi
 COPY fast/Cargo.toml fast/Cargo.lock ./
 COPY fast/src ./src
