@@ -4,6 +4,8 @@
 use super::*;
 use std::hash::{BuildHasherDefault, Hasher};
 
+#[cfg(test)]
+mod budget;
 mod word;
 
 #[derive(Clone, Copy)]
