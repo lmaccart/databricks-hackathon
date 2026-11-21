@@ -50,7 +50,7 @@ mod csv;
 mod ts;
 
 use csv::{Chunk, chunks_of, for_rows};
-use ts::{parse_ingest, parse_ts};
+use ts::{ManifestClock, parse_ts};
 
 // ------------------------------------------------------------------ prices
 
@@ -221,7 +221,15 @@ struct Clicks {
     wide: Vec<PCl>,
 }
 
-fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<'a>, packed: bool) -> Vec<Clicks> {
+fn parse_clicks<'a>(
+    c: &Chunk<'a>,
+    sm: &Small,
+    lo: i64,
+    we: i64,
+    names: &People<'a>,
+    packed: bool,
+    clock: &ManifestClock,
+) -> Vec<Clicks> {
     let hint = reserve_per_shard(c.data);
     let mut b: Vec<_> = (0..NS)
         .map(|_| Clicks {
@@ -259,7 +267,7 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<
             return;
         }
         let Some(ci) = sm.camp_idx.get(camp) else { return };
-        let ts = parse_ts(r[3]);
+        let ts = clock.parse_ts(r[3]);
         if ts == BAD || ts < lo || ts >= we {
             return;
         }
@@ -522,6 +530,7 @@ fn main() {
     let ws = parse_ts(manifest["window_start"].as_str().unwrap().as_bytes());
     let we = parse_ts(manifest["window_end"].as_str().unwrap().as_bytes());
     assert!(ws != BAD && we != BAD);
+    let clock = ManifestClock::new(ws, we);
 
     let pf = File::open(data.join("products.csv")).expect("products.csv");
     let cf = File::open(data.join("campaigns.csv")).expect("campaigns.csv");
@@ -552,12 +561,12 @@ fn main() {
     let packing = Packing::new(ws, we, names.count);
     log(&format!("links: {} linked ids", names.count));
 
-    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, ws, we, packing, &hs, &log);
+    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, &hs, &log);
     log("events deduped");
 
     let cl_by_person = cl_chunks
         .par_iter()
-        .map(|c| parse_clicks(c, &sm, ws.saturating_sub(WEEK), we, &names, packing.is_some()))
+        .map(|c| parse_clicks(c, &sm, ws.saturating_sub(WEEK), we, &names, packing.is_some(), &clock))
         .collect();
     log("clicks routed");
 

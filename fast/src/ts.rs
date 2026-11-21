@@ -171,11 +171,145 @@ pub fn parse_ts(s: &[u8]) -> i64 {
 
 /// `ingest_ts`, which rules.md guarantees is valid F1. A bad one sorts last
 /// (i64::MAX), so such a copy can only lose the dedup or be late.
+#[cfg(test)]
 #[inline]
 pub fn parse_ingest(s: &[u8]) -> i64 {
     match parse_ts(s) {
         BAD => i64::MAX,
         t => t,
+    }
+}
+
+const CLOCK_TEMPLATE: u64 = word(b"T00:00:0");
+const CLOCK_ADD: u64 = word(&[L, D, D, L, D, D, L, D]);
+
+const fn minute_table() -> [i32; 65536] {
+    let mut table = [-1; 65536];
+    let mut hour = 0;
+    while hour < 24 {
+        let mut minute = 0;
+        while minute < 60 {
+            let key = (hour / 10) << 12 | (hour % 10) << 8 | (minute / 10) << 4 | (minute % 10);
+            table[key] = (hour * 3600 + minute * 60) as i32 * 1000;
+            minute += 1;
+        }
+        hour += 1;
+    }
+    table
+}
+
+static MINUTES: [i32; 65536] = minute_table();
+
+#[derive(Clone, Copy)]
+struct CivilDay {
+    first: u64,
+    last: u16,
+    midnight: i64,
+}
+
+/// Immutable exact date lookup for the hot manifest interval. A miss always
+/// falls back to the complete Gregorian parser, including invalid-copy ingests.
+pub struct ManifestClock {
+    days: [Vec<CivilDay>; 32],
+}
+
+impl ManifestClock {
+    pub fn new(ws: i64, we: i64) -> Self {
+        const DAY: i64 = 86_400_000;
+        const LIMIT: i64 = 256;
+        let first_valid = days_from_civil(0, 1, 1);
+        let last_valid = days_from_civil(9999, 12, 31);
+        let lo = ws
+            .saturating_sub(8 * DAY)
+            .div_euclid(DAY)
+            .clamp(first_valid, last_valid);
+        let hi = we
+            .saturating_add(2 * DAY)
+            .div_euclid(DAY)
+            .clamp(first_valid, last_valid);
+        let mut clock = Self {
+            days: std::array::from_fn(|_| Vec::new()),
+        };
+        if lo > hi {
+            return clock;
+        }
+        // Very wide windows get both ends, with all other dates using fallback.
+        for day in lo..=hi.min(lo + LIMIT - 1) {
+            if hi - lo >= LIMIT && day >= lo + LIMIT / 2 {
+                break;
+            }
+            clock.add_day(day);
+        }
+        if hi - lo >= LIMIT {
+            for day in hi - LIMIT / 2 + 1..=hi {
+                clock.add_day(day);
+            }
+        }
+        clock
+    }
+
+    fn add_day(&mut self, day: i64) {
+        // Inverse proleptic Gregorian conversion, valid for years 0000..9999.
+        let z = day + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = mp + if mp < 10 { 3 } else { -9 };
+        let y = y + i64::from(m <= 2);
+        let date = format!("{y:04}-{m:02}-{d:02}");
+        let bytes = date.as_bytes();
+        self.days[d as usize].push(CivilDay {
+            first: load8(bytes, 0),
+            last: u16::from_le_bytes([bytes[8], bytes[9]]),
+            midnight: day * 86_400_000,
+        });
+    }
+
+    #[inline]
+    pub fn parse_ts(&self, s: &[u8]) -> i64 {
+        if s.len() == 20 {
+            let tens = s[8].wrapping_sub(b'0');
+            let ones = s[9].wrapping_sub(b'0');
+            if tens <= 3 && ones <= 9 {
+                let day = usize::from(tens) * 10 + usize::from(ones);
+                if day < 32 {
+                    let first = load8(s, 0);
+                    let last = u16::from_le_bytes([s[8], s[9]]);
+                    for entry in &self.days[day] {
+                        if entry.first == first && entry.last == last {
+                            let t = load8(s, 10) ^ CLOCK_TEMPLATE;
+                            let last_second = s[18].wrapping_sub(b'0');
+                            if !fits(t, CLOCK_ADD) || last_second > 9 || s[19] != b'Z' {
+                                return BAD;
+                            }
+                            let index = ((b(t, 1) as usize) << 12)
+                                | ((b(t, 2) as usize) << 8)
+                                | ((b(t, 4) as usize) << 4)
+                                | b(t, 5) as usize;
+                            let minute = MINUTES[index];
+                            let seconds = b(t, 7) * 10 + i64::from(last_second);
+                            if minute < 0 || seconds > 59 {
+                                return BAD;
+                            }
+                            return entry.midnight + i64::from(minute) + seconds * 1000;
+                        }
+                    }
+                }
+            }
+        }
+        parse_ts(s)
+    }
+
+    #[inline]
+    pub fn parse_ingest(&self, s: &[u8]) -> i64 {
+        match self.parse_ts(s) {
+            BAD => i64::MAX,
+            t => t,
+        }
     }
 }
 
@@ -291,6 +425,105 @@ mod tests {
         "0001791071890000",
         "9223372036854775807",
     ];
+
+    #[test]
+    fn manifest_clock_matches_full_parser() {
+        let ws = parse_ts(b"2028-02-20T12:00:00Z");
+        let we = parse_ts(b"2028-03-05T12:00:00Z");
+        let clock = ManifestClock::new(ws, we);
+        assert_eq!(clock.days.iter().map(Vec::len).sum::<usize>(), 25);
+        for entries in &clock.days {
+            for entry in entries {
+                let mut timestamp = entry.first.to_le_bytes().to_vec();
+                timestamp.extend_from_slice(&entry.last.to_le_bytes());
+                timestamp.extend_from_slice(b"T00:00:00Z");
+                assert_eq!(entry.midnight, parse_ts(&timestamp), "{timestamp:?}");
+            }
+        }
+        let mut inputs = Vec::new();
+        for year in [0, 100, 400, 1900, 2000, 2027, 2028, 2100, 2400, 9999] {
+            for month in 1..=12 {
+                for day in 0..=32 {
+                    for time in ["00:00:00Z", "23:59:59Z", "24:00:00Z", "12:60:00Z", "12:00:60Z"] {
+                        inputs.push(format!("{year:04}-{month:02}-{day:02}T{time}").into_bytes());
+                    }
+                }
+            }
+        }
+        for base in ["2028-02-29T12:34:56Z", "2028-03-01T00:00:00Z"] {
+            for pos in 0..base.len() {
+                for byte in 0..=255 {
+                    let mut input = base.as_bytes().to_vec();
+                    input[pos] = byte;
+                    inputs.push(input);
+                }
+            }
+        }
+        for s in BASES {
+            inputs.push(s.as_bytes().to_vec());
+        }
+        for input in inputs {
+            assert_eq!(clock.parse_ts(&input), parse_ts(&input), "{input:?}");
+            assert_eq!(clock.parse_ingest(&input), parse_ingest(&input), "{input:?}");
+        }
+        for second in 0..86_400 {
+            let s = format!(
+                "2028-02-29T{:02}:{:02}:{:02}Z",
+                second / 3600,
+                second / 60 % 60,
+                second % 60
+            );
+            assert_eq!(clock.parse_ts(s.as_bytes()), parse_ts(s.as_bytes()), "{s}");
+        }
+    }
+
+    #[test]
+    fn manifest_clock_long_and_extreme_windows() {
+        for (ws, we) in [
+            (i64::MIN + 1, i64::MAX),
+            (parse_ts(b"0000-01-01T00:00:00Z"), parse_ts(b"9999-12-31T23:59:59Z")),
+            (parse_ts(b"2100-02-27T00:00:00Z"), parse_ts(b"2100-03-03T00:00:00Z")),
+        ] {
+            let clock = ManifestClock::new(ws, we);
+            assert!(clock.days.iter().map(Vec::len).sum::<usize>() <= 256);
+            for entries in &clock.days {
+                for entry in entries {
+                    let mut timestamp = entry.first.to_le_bytes().to_vec();
+                    timestamp.extend_from_slice(&entry.last.to_le_bytes());
+                    timestamp.extend_from_slice(b"T00:00:00Z");
+                    assert_eq!(entry.midnight, parse_ts(&timestamp), "{timestamp:?}");
+                }
+            }
+            for s in [
+                "0000-01-01T00:00:00Z",
+                "0000-02-29T23:59:59Z",
+                "9999-12-31T23:59:59Z",
+                "2100-02-29T00:00:00Z",
+                "2100-03-01T00:00:00Z",
+                "000000000001791071890000",
+                "2028-03-01T00:00:00+23:59",
+                "2028-03-01T00:00:00-23:59",
+            ] {
+                assert_eq!(clock.parse_ts(s.as_bytes()), parse_ts(s.as_bytes()), "{s}");
+                assert_eq!(clock.parse_ingest(s.as_bytes()), parse_ingest(s.as_bytes()), "{s}");
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_clock_same_day_number_in_multiple_months() {
+        let clock = ManifestClock::new(parse_ts(b"2028-01-20T00:00:00Z"), parse_ts(b"2028-04-10T00:00:00Z"));
+        assert!(clock.days[1].len() >= 3);
+        for s in [
+            "2028-01-01T05:06:07Z",
+            "2028-02-01T05:06:07Z",
+            "2028-03-01T05:06:07Z",
+            "2028-04-01T05:06:07Z",
+            "2028-05-01T05:06:07Z",
+        ] {
+            assert_eq!(clock.parse_ts(s.as_bytes()), parse_ts(s.as_bytes()), "{s}");
+        }
+    }
 
     #[test]
     fn rules_examples() {

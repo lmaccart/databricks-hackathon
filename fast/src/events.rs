@@ -36,11 +36,11 @@ fn parse<'a>(
     c: &Chunk<'a>,
     sm: &Small,
     people: &People<'a>,
-    ws: i64,
-    we: i64,
+    window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
     hs: &RandomState,
 ) -> (Vec<Payload>, Vec<Vec<Claim>>) {
+    let (ws, we, clock) = window;
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Payload> = (0..NS)
         .map(|_| {
@@ -78,8 +78,8 @@ fn parse<'a>(
             return;
         }
         let id = people.codec.key(r[0]);
-        let ingest = parse_ingest(r[3]);
-        let ts = parse_ts(r[2]);
+        let ingest = clock.parse_ingest(r[3]);
+        let ts = clock.parse_ts(r[2]);
         let mut next = Pending {
             id,
             ts,
@@ -186,15 +186,14 @@ pub(super) fn by_person<'a>(
     chunks: &[Chunk<'a>],
     sm: &Small,
     people: &People<'a>,
-    ws: i64,
-    we: i64,
+    window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
     hs: &RandomState,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Payload>> {
     let parsed: Vec<_> = chunks
         .par_iter()
-        .map(|c| parse(c, sm, people, ws, we, packing, hs))
+        .map(|c| parse(c, sm, people, window, packing, hs))
         .collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());

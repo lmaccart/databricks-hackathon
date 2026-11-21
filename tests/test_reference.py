@@ -189,6 +189,35 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_manifest_days_collisions_far_ingests_and_boundaries(self):
+        start, end = "2028-02-28T00:00:00Z", "2028-03-02T00:00:00Z"
+        last = "2028-03-01T23:59:59Z"
+        u, c = run_case(
+            window=(start, end),
+            events=[
+                ev("start", "u1", start, ingest=start),
+                ev("offset", "u2", "2028-02-27T00:01:00-23:59", ingest=start),
+                ev("leap", "u3", "2028-02-29T00:00:00Z", ingest="2028-02-29T00:00:00Z"),
+                ev("last", "u4", last, ingest="2028-03-02T23:59:59Z"),
+                ev("late", "u5", last, ingest="2028-03-03T00:00:00Z"),
+                ev("end", "u6", end, ingest=end),
+                ev("dupe", "loser", start, ingest=start),
+                ev("dupe", "invalid", "2028-02-30T00:00:00Z", ingest="1900-02-28T00:00:00Z"),
+                ev("far", "far", start, ingest="0001-03-01T00:00:00Z"),
+            ],
+            clicks=[
+                "a,u1,c_1,2028-02-21T00:00:00Z",
+                "b,u2,c_2,2028-02-20T00:01:00-23:59",
+                "c,u3,c_3,2028-02-29T00:00:00Z",
+            ],
+        )
+        self.assertEqual(set(u), {("u1", "2028-02-28"), ("u2", "2028-02-28"),
+                                  ("u3", "2028-02-29"), ("u4", "2028-03-01"),
+                                  ("far", "2028-02-28")})
+        self.assertEqual(c[("c_1", "2028-02-28")]["sessions"], 1)
+        self.assertEqual(c[("c_2", "2028-02-28")]["sessions"], 1)
+        self.assertEqual(c[("c_3", "2028-02-29")]["sessions"], 1)
+
     def test_purchase_stream_preserves_multiplicity_dedup_and_session_start_day(self):
         before = "2026-10-01T23:55:00Z"
         after = "2026-10-02T00:05:00Z"

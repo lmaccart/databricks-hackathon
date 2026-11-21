@@ -1,5 +1,35 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Experimental manifest clock — 2026-11-20
+
+**Not a proven end-to-end improvement; do not promote on these results.**
+Compared with `012174f`, this experiment constructs a read-only exact ISO-day
+lookup from the manifest, including the click lookback, zone padding and a day
+for ingest lateness. It retains at most 256 civil days (both ends of wider
+windows) and uses the complete original parser on every miss. Date slots
+compare all ten bytes, including when months share a day number. F1 time
+spellings are checked before indexing a 256 KiB valid-minute table. F2, F3,
+outliers and malformed dates retain the original path; invalid earliest copies
+still use exact far-out ingest timestamps for dedup.
+
+On this Mac, 12 alternating pairs of the parser-only `tools/bench_clock.rs`
+mixed-format workload (60% F1, 10% F2, 30% F3) had median times approximately
+48.8 ms baseline versus 38.2 ms candidate (22% less). This is not an
+end-to-end result. Nine alternating whole-process pairs on a 1M-event,
+250k-click **kit-generated** seed-7 input measured 0.102 s versus 0.101 s
+(0.7% less); 11 pairs on kit seed-15 / 200k measured 0.028 s versus 0.029 s
+(4% slower). These short process times are noisy and neither reaches the 3%
+acceptance criterion. No official dev, fixture, 20M, Docker or scorer run was
+available or attempted in this isolated experiment.
+
+Checks: 19 Rust tests, 35 Python edge cases against each implementation, ten
+3k-event kit-generator oracle comparisons, and a 200k-event kit oracle
+comparison all passed. The 1M-event kit output matched the baseline on all
+49,012 user and 28,007 campaign rows. Tests cover day-number collisions,
+leap centuries, extreme and wide windows, invalid time spellings, all 86,400
+F1 times on a cached day, far-out earliest ingests and both window endpoints.
+`cargo fmt --check` and `cargo clippy -- -D warnings` passed.
+
 ## Round 2 integration: compact streams, exact catalog index and click prefetch — 2026-11-20
 
 The link graph already assigns each exact ID a node. Reuse its canonical root
