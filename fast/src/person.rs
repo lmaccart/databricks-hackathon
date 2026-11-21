@@ -26,6 +26,12 @@ pub fn inline(bytes: &[u8]) -> Option<u64> {
         tmp[..bytes.len()].copy_from_slice(bytes);
         (u64::from_be_bytes(tmp), 0)
     };
+    pack(word, tail)
+}
+
+/// `word` holds the first eight bytes in big-endian order, with zero padding.
+#[inline(always)]
+pub(crate) fn pack(word: u64, tail: u8) -> Option<u64> {
     if word & HIGH_BITS != 0 || tail > 127 {
         return None;
     }

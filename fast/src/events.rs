@@ -143,32 +143,48 @@ fn parse<'a>(
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
-    for_rows(c, |r| {
-        if r[0].is_empty() {
+    csv::lanes::events(c, clock, |raw, decoded| {
+        let (id, uid, ts, ingest, seconds, product, price) = if let Some(e) = decoded {
+            (e.id, e.user, e.ts, e.ingest * 1000, e.ingest, e.product, e.price)
+        } else {
+            let r = raw.unwrap();
+            if r[0].is_empty() {
+                return;
+            }
+            let (ingest, seconds) = clock.ingest_for_claim(r[3]);
+            let price = match r[4] {
+                b"purchase" => parse_price(r[6]),
+                b"view" | b"cart" => Some(0),
+                _ => None,
+            };
+            (
+                csv::lanes::Id::borrowed(r[0]),
+                csv::lanes::Id::borrowed(r[1]),
+                clock.parse_ts(r[2]),
+                ingest,
+                seconds,
+                r[5],
+                price,
+            )
+        };
+        if id.empty() {
             return;
         }
-        let claim_key = links::mix(people.codec.key(r[0]));
-        let (ingest, seconds) = clock.ingest_for_claim(r[3]);
-        let ts = clock.parse_ts(r[2]);
+        let claim_key = links::mix(id.key(&people.codec));
         let mut next = Pending {
             claim_key,
             ts,
             claim_order: Claim::order(ingest, seconds, &mut spill),
             ..Default::default()
         };
-        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
-            let purchase = match r[4] {
-                b"purchase" => parse_price(r[6]),
-                b"view" | b"cart" => Some(0),
-                _ => None,
-            };
-            if let Some(price) = purchase {
+        if !uid.empty() && !product.is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
+            if let Some(price) = price {
                 let cat = if price == 0 {
                     0
                 } else {
-                    sm.product_cat.get(r[5]).unwrap_or(sm.unknown_cat)
+                    sm.product_cat.get(product).unwrap_or(sm.unknown_cat)
                 };
-                next.uid = people.codec.key(r[1]);
+                next.uid = uid.key(&people.codec);
                 next.hash = links::mix(next.uid);
                 people.prefetch(next.hash);
                 next.price = price;

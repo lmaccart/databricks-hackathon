@@ -12,6 +12,8 @@ use memchr::memchr;
 use std::marker::PhantomData;
 use std::path::Path;
 
+pub(crate) mod lanes;
+
 /// Output slot for fields no caller reads (the ninth entry of the row buffer).
 const SKIP: u8 = 8;
 
@@ -370,6 +372,194 @@ mod tests {
     use super::*;
 
     type Rows = Vec<Vec<Vec<u8>>>;
+
+    #[test]
+    fn four_lanes_restart_at_physical_lf_and_preserve_invalid_claims() {
+        use crate::{BAD, ManifestClock, parse_ts};
+        let mut file = b"event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n".to_vec();
+        let ws = parse_ts(b"2028-02-28T00:00:00Z");
+        let clock = ManifestClock::new(ws, ws + 4 * crate::DAY);
+        let codec = crate::Codec::new();
+        let rows: &[&[u8]] = &[
+            b"\"e1\",u1,2028-02-29T15:01:02Z,2028-02-29T15:01:04Z,view,p1,ignored\r\n",
+            b"e1,\"u1\",2028-02-29T10:01:02-05:00,\"2028-02-29T15:01:03Z\",purchase,\"p1\",\"00123\"\n",
+            b"e1,u1,bad,2028-02-29T15:01:02Z,view,p1,\n",
+            b"e1,u1,2028-02-29T15:01:02Z,2028-02-29T15:01:01Z,view,p1,\"not closed\n",
+            b"e1,u1,2028-02-29T15:01:02Z,2028-02-29T15:01:01Z,view,p1,xx\"xx\"\n",
+            b"e1,u1,2028-02-29T15:01:02Z,2028-02-29T15:01:01Z,view,p1,,\n",
+            b"e123456789012345,u\0,1835449262000,2028-02-29T15:01:02Z,\"cart\",p1,\"\"\n",
+            b"\n",
+        ];
+        for row in rows.iter().cycle().take(161) {
+            file.extend_from_slice(row);
+        }
+        // Mutate every byte, including each delimiter and quote, while moving
+        // fields across the 64- and 96-byte vector boundaries.
+        for pad in 0..80 {
+            let base = format!(
+                "\"{}\",u1,2028-02-29T15:01:02Z,2028-02-29T15:01:04Z,purchase,p1,\"42\"",
+                "x".repeat(pad)
+            )
+            .into_bytes();
+            for pos in 0..base.len() {
+                for byte in [b',', b'"', b'\n', b'\r', 0, b'x'] {
+                    let mut row = base.clone();
+                    row[pos] = byte;
+                    file.extend_from_slice(&row);
+                    file.push(b'\n');
+                }
+            }
+        }
+        file.extend_from_slice(rows[0].strip_suffix(b"\n").unwrap());
+        let cols = [
+            "event_id",
+            "user_id",
+            "ts",
+            "ingest_ts",
+            "event_type",
+            "product_id",
+            "price_cents",
+        ];
+        let c = chunks_sized(&file, &cols, Path::new("events"), file.len())[0];
+        let mut expected = Vec::new();
+        for_rows(&c, |r| {
+            let price = match r[4] {
+                b"view" | b"cart" => Some(0),
+                b"purchase" => crate::parse_price(r[6]),
+                _ => None,
+            };
+            expected.push((
+                codec.key(r[0]),
+                codec.key(r[1]),
+                clock.parse_ts(r[2]),
+                clock.ingest_for_claim(r[3]),
+                price,
+                r[5].to_vec(),
+            ));
+        });
+        let mut actual = Vec::new();
+        let mut fast = 0;
+        super::lanes::events(&c, &clock, |row, decoded| {
+            if let Some(e) = decoded {
+                fast += 1;
+                actual.push((
+                    e.id.key(&codec),
+                    e.user.key(&codec),
+                    e.ts,
+                    (e.ingest * 1000, e.ingest),
+                    e.price,
+                    e.product.to_vec(),
+                ));
+            } else {
+                let r = row.unwrap();
+                actual.push((
+                    codec.key(r[0]),
+                    codec.key(r[1]),
+                    clock.parse_ts(r[2]),
+                    clock.ingest_for_claim(r[3]),
+                    match r[4] {
+                        b"view" | b"cart" => Some(0),
+                        b"purchase" => crate::parse_price(r[6]),
+                        _ => None,
+                    },
+                    r[5].to_vec(),
+                ));
+            }
+        });
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+        assert!(actual.iter().any(|x| x.2 == BAD));
+        let kernel = cfg!(target_arch = "aarch64");
+        #[cfg(target_arch = "x86_64")]
+        let kernel =
+            kernel || (std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("popcnt"));
+        if kernel {
+            assert!(fast > 25);
+        }
+    }
+
+    #[test]
+    fn four_lane_clicks_match_scalar_on_adversarial_physical_rows() {
+        let mut rng = Rng(0x7123_4628_9abc_def0);
+        let mut file = b"click_id,user_id,campaign_id,ts\n".to_vec();
+        let fields: &[&[u8]] = &[
+            b"",
+            b"\"\"",
+            b"x",
+            b"\"x\"",
+            b"\"",
+            b"\"x",
+            b"x\"",
+            b"x\"y",
+            b"\"x\"y\"",
+            b"\"\"\"",
+            b"\0",
+            b"a\0",
+            b"\xc3\xa9",
+            b"2028-02-29T12:34:56Z",
+            b"2028-02-29T07:34:56-05:00",
+            b"1835440496000",
+            b"bad\r",
+        ];
+        for i in 0..6000 {
+            let count = match i % 17 {
+                0 => 3,
+                1 => 5,
+                _ => 4,
+            };
+            for j in 0..count {
+                if j != 0 {
+                    file.push(b',');
+                }
+                if rng.below(8) == 0 {
+                    let len = rng.below(140);
+                    let alphabet = b"abcd0123\"";
+                    for _ in 0..len {
+                        file.push(alphabet[rng.below(alphabet.len())]);
+                    }
+                } else {
+                    file.extend_from_slice(fields[rng.below(fields.len())]);
+                }
+            }
+            if i != 5999 {
+                file.push(b'\n');
+            }
+        }
+        let cols = ["click_id", "user_id", "campaign_id", "ts"];
+        let ws = crate::parse_ts(b"2028-02-28T00:00:00Z");
+        let clock = crate::ManifestClock::new(ws, ws + 4 * crate::DAY);
+        let codec = crate::Codec::new();
+        for size in [usize::MAX, 4096, 8192, 65_536] {
+            let mut expected = Vec::new();
+            let mut actual = Vec::new();
+            let mut fast = 0;
+            for c in chunks_sized(&file, &cols, Path::new("clicks"), size) {
+                for_rows(&c, |r| {
+                    expected.push((codec.key(r[0]), codec.key(r[1]), r[2].to_vec(), clock.parse_ts(r[3])));
+                });
+                super::lanes::clicks(&c, &clock, |raw, decoded| {
+                    if let Some(row) = decoded {
+                        fast += 1;
+                        actual.push((row.id.key(&codec), row.user.key(&codec), row.campaign.to_vec(), row.ts));
+                    } else {
+                        let r = raw.unwrap();
+                        actual.push((codec.key(r[0]), codec.key(r[1]), r[2].to_vec(), clock.parse_ts(r[3])));
+                    }
+                });
+            }
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "chunk size {size}");
+            let kernel = cfg!(target_arch = "aarch64");
+            #[cfg(target_arch = "x86_64")]
+            let kernel = kernel
+                || (std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("popcnt"));
+            if kernel {
+                assert!(fast > 100, "chunk size {size}");
+            }
+        }
+    }
 
     // ---- literal transcription of reference/pipeline.py (read_csv_rows, parse_line, _unquote)
 

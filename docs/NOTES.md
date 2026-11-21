@@ -1,5 +1,26 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Four-lane CSV experiment — 2026-11-21
+
+Four LF-aligned cursors decode positional event and click rows in independent
+stages. Unusual headers, unsupported CPUs, long or malformed rows and tails
+fall back to the existing strict scanner. The lane clock is a fixed-size cache;
+ID interning remains collision-checked. No dataset-sized staging buffer is added.
+
+On the local aarch64 machine, 21 Rust tests, 39 reference and binary tests,
+36/36 fixtures per implementation, both dev comparers, 10 dirty-data seeds,
+and official-generator seeds 1–9 and 15 at 100k events matched. Seed 15
+covers leap day. Adversarial tests mutate delimiters, quotes and physical LF
+positions and exercise long rows, NULs, bad timestamps and duplicate claims.
+The x86_64 path has runtime AVX2/POPCNT dispatch but was not tested here.
+
+Five alternating pairs on the 1M dev set against the saved control binary had
+medians **0.310 → 0.323 s** (4.1% slower), with substantial noise; this is not
+evidence of a practice-scale speedup. No 20M or Docker timing was run as
+instructed. The reported 1.57 s practice control is an organizer score, not
+comparable to this local timing. This experiment needs independent x86_64
+correctness and representative performance testing before selection.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

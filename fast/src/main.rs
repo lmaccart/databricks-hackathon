@@ -259,18 +259,27 @@ fn parse_clicks<'a>(
     };
     let mut ring = [PendingClick::default(); 16];
     let mut n = 0usize;
-    for_rows(c, |r| {
+    csv::lanes::clicks(c, clock, |raw, decoded| {
         // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
-        let (cid, uid, camp) = (r[0], r[1], r[2]);
-        if cid.is_empty() || uid.is_empty() {
+        let (cid, uid, camp, ts) = if let Some(click) = decoded {
+            (click.id, click.user, click.campaign, click.ts)
+        } else {
+            let r = raw.unwrap();
+            (
+                csv::lanes::Id::borrowed(r[0]),
+                csv::lanes::Id::borrowed(r[1]),
+                r[2],
+                clock.parse_ts(r[3]),
+            )
+        };
+        if cid.empty() || uid.empty() {
             return;
         }
         let Some(ci) = sm.camp_idx.get(camp) else { return };
-        let ts = clock.parse_ts(r[3]);
         if ts == BAD || ts < lo || ts >= we {
             return;
         }
-        let key = names.codec.key(uid);
+        let key = uid.key(&names.codec);
         let hash = links::mix(key);
         names.prefetch(hash);
         let i = n % ring.len();
@@ -281,7 +290,7 @@ fn parse_clicks<'a>(
             uid: key,
             hash,
             ts,
-            cid: names.codec.key(cid),
+            cid: cid.key(&names.codec),
             camp: ci,
         };
         n += 1;

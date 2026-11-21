@@ -90,6 +90,34 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_physical_rows_and_invalid_earliest_with_four_busy_lanes(self):
+        ts = "2026-10-02T00:00:00Z"
+        early = "2026-10-01T23:59:59Z"
+        events, clicks = [], []
+        for i in range(80):
+            user = f"u{i}"
+            events += [
+                ev(f"e{i}", user, ts),
+                ev(f'"drop{i}"', user, ts),
+                ev(f"drop{i}", user, "not-a-ts", ingest=early),
+                # Neither the unclosed quote nor the extra comma is a claim.
+                ev(f"e{i}", "", ts, price='"unterminated', ingest=early),
+                ev(f"e{i}", "", ts, price=",", ingest=early),
+                # Mix wide rows and CR-data with common narrow F1, F2 and F3.
+                ev(f"long{i}", user, "2026-10-01T21:00:00-03:00", price="x" * (40 + i) + "\r"),
+                ev(f"x{i}", user, str(ms(ts)), "purchase", "p1", '"0012"'),
+            ]
+            clicks += [
+                f'"k{i}",{user},"c_1","{ts}"',
+                f'"K{i},{user},c_2,{ts}',
+                f"k2_{i},{user},c_2,{ts}\r",
+            ]
+        users, campaigns = run_case(events, clicks)
+        self.assertEqual(len(users), 80)
+        self.assertTrue(all((r["events"], r["revenue_cents"]) == (3, 12) for r in users.values()))
+        self.assertEqual(set(campaigns), {("c_1", "2026-10-02")})
+        self.assertEqual(campaigns[("c_1", "2026-10-02")]["sessions"], 80)
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"

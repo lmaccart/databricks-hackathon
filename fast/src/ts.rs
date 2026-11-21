@@ -182,6 +182,49 @@ pub fn parse_ingest(s: &[u8]) -> i64 {
 const CLOCK_TEMPLATE: u64 = word(b"T00:00:0");
 const CLOCK_ADD: u64 = word(&[L, D, D, L, D, D, L, D]);
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FastDay {
+    first: u64,
+    // A signed 48-bit midnight leaves two low bytes for DD. All four-digit
+    // years require fewer than 39 bits of seconds.
+    seconds_and_last: i64,
+}
+
+impl FastDay {
+    /// Only the ten date bytes are checked here; the clock and zone are
+    /// independently validated, and F2's offset is subtracted afterwards.
+    #[inline(always)]
+    fn matches(self, s: &[u8]) -> bool {
+        (self.first == load8(s, 0)) & (self.seconds_and_last as u16 == u16::from_le_bytes([s[8], s[9]]))
+    }
+
+    #[inline(always)]
+    fn midnight(self) -> i64 {
+        self.seconds_and_last >> 16
+    }
+
+    #[inline(always)]
+    fn slot(first: u64, last: u16) -> usize {
+        // Month units and day-of-month scatter nearby dates across the
+        // direct cache. An alias always misses on the full ten-byte check.
+        let day = usize::from(last);
+        ((((first >> 48) as usize & 15) << 5) + (day & 15) * 10 + ((day >> 8) & 15)) & 511
+    }
+
+    #[inline(always)]
+    fn local(s: &[u8]) -> i64 {
+        let t = load8(s, 10) ^ CLOCK_TEMPLATE;
+        let st = b(t, 7);
+        let so = s[18].wrapping_sub(b'0');
+        let (h, m) = (b(t, 1) * 10 + b(t, 2), b(t, 4) * 10 + b(t, 5));
+        if fits(t, CLOCK_ADD) & (h < 24) & (m < 60) & (st < 6) & (so < 10) {
+            h * 3600 + m * 60 + st * 10 + i64::from(so)
+        } else {
+            BAD
+        }
+    }
+}
+
 const fn minute_table() -> [i32; 65536] {
     let mut table = [-1; 65536];
     let mut hour = 0;
@@ -209,9 +252,83 @@ struct CivilDay {
 /// falls back to the complete Gregorian parser, including for ingest claims.
 pub struct ManifestClock {
     days: [Vec<CivilDay>; 32],
+    lane_days: [FastDay; 512],
 }
 
 impl ManifestClock {
+    #[inline(always)]
+    fn fast_date(&self, s: &[u8]) -> Option<FastDay> {
+        let last = u16::from_le_bytes([s[8], s[9]]);
+        let first = load8(s, 0);
+        let cached = self.lane_days[FastDay::slot(first, last)];
+        if (cached.first == first) & (cached.seconds_and_last as u16 == last) & (last != 0) {
+            Some(cached)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn lane_ingest(&self, s: &[u8]) -> Option<(i64, FastDay)> {
+        if s.len() == 20 && s[19] == b'Z' {
+            let day = self.fast_date(s)?;
+            let local = FastDay::local(s);
+            if local != BAD {
+                return Some((day.midnight() + local, day));
+            }
+        }
+        None
+    }
+
+    #[inline(always)]
+    pub(crate) fn lane_ts(&self, s: &[u8], reuse: Option<FastDay>) -> i64 {
+        match s.len() {
+            20 | 25 if s[4] == b'-' => {
+                let day = match reuse {
+                    Some(d) if d.matches(s) => Some(d),
+                    _ => self.fast_date(s),
+                };
+                let Some(day) = day else { return parse_ts(s) };
+                let local = FastDay::local(s);
+                if local == BAD {
+                    return BAD;
+                }
+                let delta = if s.len() == 20 {
+                    if s[19] != b'Z' {
+                        return BAD;
+                    }
+                    0
+                } else {
+                    let s = &s[19..];
+                    let (a, b, c, d) = (
+                        s[1].wrapping_sub(b'0'),
+                        s[2].wrapping_sub(b'0'),
+                        s[4].wrapping_sub(b'0'),
+                        s[5].wrapping_sub(b'0'),
+                    );
+                    let (h, m) = (i64::from(a) * 10 + i64::from(b), i64::from(c) * 10 + i64::from(d));
+                    if !(a < 10 && b < 10 && c < 10 && d < 10 && s[3] == b':' && h < 24 && m < 60) {
+                        return BAD;
+                    }
+                    match s[0] {
+                        b'+' => -(h * 60 + m) * 60,
+                        b'-' => (h * 60 + m) * 60,
+                        _ => return BAD,
+                    }
+                };
+                (day.midnight() + local + delta) * 1000
+            }
+            13 => {
+                let a = (load8(s, 0) << 24) | 0x30_3030;
+                match (eight(a), eight(load8(s, 5))) {
+                    (Some(a), Some(b)) => (a * 100_000_000 + b) as i64,
+                    _ => BAD,
+                }
+            }
+            _ => parse_ts(s),
+        }
+    }
+
     pub fn new(ws: i64, we: i64) -> Self {
         const DAY: i64 = 86_400_000;
         const LIMIT: i64 = 256;
@@ -227,6 +344,7 @@ impl ManifestClock {
             .clamp(first_valid, last_valid);
         let mut clock = Self {
             days: std::array::from_fn(|_| Vec::new()),
+            lane_days: [FastDay::default(); 512],
         };
         // Very wide windows get both ends, with all other dates using fallback.
         if hi - lo >= LIMIT {
@@ -258,11 +376,18 @@ impl ManifestClock {
         let y = y + i64::from(m <= 2);
         let date = format!("{y:04}-{m:02}-{d:02}");
         let bytes = date.as_bytes();
+        let first = load8(bytes, 0);
+        let last = u16::from_le_bytes([bytes[8], bytes[9]]);
+        let midnight_seconds = day * 86_400;
         self.days[d as usize].push(CivilDay {
-            first: load8(bytes, 0),
-            last: u16::from_le_bytes([bytes[8], bytes[9]]),
-            midnight_seconds: day * 86_400,
+            first,
+            last,
+            midnight_seconds,
         });
+        self.lane_days[FastDay::slot(first, last)] = FastDay {
+            first,
+            seconds_and_last: (midnight_seconds << 16) | i64::from(last),
+        };
     }
 
     /// `s` has the F1 length and a date separator at byte 4.
@@ -444,6 +569,11 @@ mod tests {
             BAD
         };
         assert_eq!(clock.parse_ts(s), ms, "{s:?}");
+        assert_eq!(clock.lane_ts(s, None), ms, "{s:?}");
+        if let Some((ingest, date)) = clock.lane_ingest(s) {
+            assert_eq!(ingest, seconds, "{s:?}");
+            assert_eq!(clock.lane_ts(s, Some(date)), ms, "{s:?}");
+        }
         assert_eq!(
             clock.ingest_for_claim(s),
             (if ms == BAD { i64::MAX } else { ms }, seconds),
@@ -468,12 +598,20 @@ mod tests {
         ] {
             check_clock(&clock, s.as_bytes());
         }
-        for base in [*b"2028-02-29T12:34:56Z", *b"2028-03-01T00:00:00Z"] {
+        let reused = clock.lane_ingest(b"2028-02-29T12:34:56Z").unwrap().1;
+        for base in [
+            b"2028-02-29T12:34:56Z".as_slice(),
+            b"2028-03-01T00:00:00Z",
+            b"2028-02-29T12:34:56-05:30",
+            b"2028-03-01T00:00:00+12:23",
+            b"1835449262000",
+        ] {
             for pos in 0..base.len() {
                 for byte in 0..=255 {
-                    let mut input = base;
+                    let mut input = base.to_vec();
                     input[pos] = byte;
                     check_clock(&clock, &input);
+                    assert_eq!(clock.lane_ts(&input, Some(reused)), want(&input), "{input:?}");
                 }
             }
         }
