@@ -172,6 +172,7 @@ gh workflow run native-bench.yml --ref perf/practice-154 \
 # Locally: exact output through both the ranked and wide-window paths.
 make build
 .venv/bin/python tools/graph_diff.py fast/target/release/shopping_sessions
+.venv/bin/python tools/campaign_diff.py fast/target/release/shopping_sessions
 .venv/bin/python tools/grammar_diff.py fast/target/release/shopping_sessions
 .venv/bin/python tools/opaque_diff.py vendor/dev fast/target/release/shopping_sessions
 ```
