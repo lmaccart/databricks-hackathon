@@ -1,0 +1,75 @@
+name: Docker A/B on amd64
+run-name: Docker A/B — ${{ github.sha }}
+# Push to bench/docker-ab with bench/ab.env naming two commits. Each image is that
+# commit's root Dockerfile, built unchanged. Same runner, alternating pairs, fresh
+# outputs, verified page-cache residency, every output compared with the baseline's.
+on:
+  push:
+    branches: [bench/docker-ab]
+permissions:
+  contents: read
+jobs:
+  ab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Machine
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket|Flags' | cut -c1-200
+          lscpu -e=CPU,CORE,SOCKET
+          nproc; free -g; cat /sys/fs/cgroup/cpu.max 2>/dev/null || true
+          cat /sys/kernel/mm/transparent_hugepage/enabled; df -h / /mnt
+          { echo '### Machine'; echo '```'; lscpu | grep -E 'Model name|^CPU\(s\)|Thread'; nproc; free -g | head -2; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Public generator (checksum-verified)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -eu
+          curl --fail --silent --show-error --location --retry 2 \
+            https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip -o generator.zip
+          echo '13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  generator.zip' | sha256sum -c
+          unzip -q generator.zip
+          cargo build --release --locked --manifest-path generator/Cargo.toml
+      - name: Inputs (seeds 7 and 15 at 20M/5M, seed 13 at 60M/15M)
+        run: |
+          set -eu
+          sudo mkdir -p /mnt/ab/data /mnt/ab/out && sudo chown -R "$USER" /mnt/ab
+          g="$RUNNER_TEMP/generator/target/release/generate"
+          "$g" --seed 7 --events 20000000 --clicks 5000000 --output /mnt/ab/data/s7 >/dev/null
+          "$g" --seed 15 --events 20000000 --clicks 5000000 --output /mnt/ab/data/s15 >/dev/null
+          "$g" --seed 13 --events 60000000 --clicks 15000000 --output /mnt/ab/data/s13 >/dev/null
+          du -sh /mnt/ab/data/*
+      - name: Images
+        run: |
+          set -eu
+          . bench/ab.env
+          for side in BASELINE CANDIDATE; do
+            eval repo=\$${side}_REPO sha=\$${side}_SHA
+            dir="$RUNNER_TEMP/src-$side"
+            git init -q "$dir" && git -C "$dir" fetch -q --depth 1 "$repo" "$sha" && git -C "$dir" checkout -q FETCH_HEAD
+            test "$(git -C "$dir" rev-parse HEAD)" = "$sha"
+            docker build -q -t "ab:$(echo $side | tr A-Z a-z)" "$dir"
+          done
+          docker images ab
+          { echo '### Images'; cat bench/ab.env | grep -v '^#'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Alternating pairs (warm, then cold)
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv" && "$RUNNER_TEMP/venv/bin/pip" -q install pyarrow
+          n=$(nproc); cpus="0-$((n - 1))"
+          ab() { sudo -E AB_DATA=/mnt/ab/data AB_OUT=/mnt/ab/out "$RUNNER_TEMP/venv/bin/python" -u tools/docker_ab.py \
+                   ab:baseline ab:candidate --ncpu "$n" --cpuset "$cpus" --mem 14 "$@"; }
+          for mode in warm cold; do
+            for s in s7 s15; do ab --data $s --expected exp-$s --pairs 5 --mode $mode --json /mnt/ab/$s-$mode.json | tee -a /mnt/ab/log.txt; done
+            ab --data s13 --expected exp-s13 --pairs 3 --mode $mode --json /mnt/ab/s13-$mode.json | tee -a /mnt/ab/log.txt
+          done
+          { echo '### Results'; echo '```'; grep -E 'SUMMARY' /mnt/ab/log.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: docker-ab
+          path: |
+            /mnt/ab/*.json
+            /mnt/ab/log.txt
