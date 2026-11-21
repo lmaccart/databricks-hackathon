@@ -223,6 +223,45 @@ class EventsOrder(unittest.TestCase):
         ])
         self.assertEqual(set(u), {("u1", "2026-10-02"), ("u3", "2026-10-02")})
 
+    def test_ingest_uses_utc_day_and_exact_late_boundary(self):
+        leap = "2028-02-29T12:00:00Z"
+        march = "2028-03-01T12:00:00Z"
+        boundary = ms(leap)
+        u, _ = run_case(window=("2028-02-28T00:00:00Z", "2028-03-03T00:00:00Z"), events=[
+            ev("warm", "warm", leap),
+            ev("near", "near", str(boundary + 1), ingest=march),
+            ev("exact", "exact", str(boundary), ingest=march),
+            ev("late", "late", str(boundary - 1), ingest=march),
+            ev("back", "back", "2028-03-01T00:01:00+01:00", ingest="2028-02-29T23:59:00Z"),
+            ev("forward", "forward", "2028-02-29T23:00:00-02:00", ingest=march),
+            ev("rolled", "rolled", "2028-03-01T00:01:00+02:00", ingest="2028-03-01T23:00:00Z"),
+            ev("bad1", "bad1", leap, ingest="2028-02-29T24:00:00Z"),
+            ev("bad2", "bad2", leap, ingest="2028-02-29T23:59:60Z"),
+            ev("bad3", "bad3", leap, ingest="2028-02-29T12:00:00z"),
+            ev("non-f1", "non-f1", leap, ingest="2028-02-29T02:00:00-10:00"),
+        ])
+        self.assertEqual(set(u), {(name, "2028-02-29") for name in ("warm", "near", "exact", "back", "non-f1")}
+                         | {("forward", "2028-03-01")})
+
+    def test_ingest_claims_cross_chunks_before_validation(self):
+        t = "2026-10-02T10:00:00Z"
+        early = "2026-10-02T10:00:01Z"
+        late = "2026-10-02T10:00:05Z"
+        tie = ev("tie", "tie", t, ingest=early)
+        u, _ = run_case(events=[
+            ev("warm", "warm", t),
+            ev("dup", "loser", t, ingest=late),
+            ev("invalid", "rescue", t, ingest=late),
+            ev("cached", "cached", t, ingest=f'"{early}"'),
+            tie,
+        ], extra={
+            "events/part-1.csv": [ev("dup", "earliest", t, ingest=early), tie],
+            "events/part-2.csv": [ev("invalid", "bad", "bad-ts", ingest=early)],
+            "events/part-3.csv": [ev("cached", "rawlater", t, ingest=late)],
+        })
+        self.assertEqual(set(u), {(name, "2026-10-02") for name in ("warm", "earliest", "cached", "tie")})
+        self.assertTrue(all(row["events"] == 1 for row in u.values()))
+
     def test_window(self):
         u, _ = run_case(events=[
             ev("e1", "u1", WS, ingest=WS),

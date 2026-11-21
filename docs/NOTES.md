@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 2 candidate: defer same-day ingest decoding — 2026-11-20
+
+Each chunk learns exact F1 date bytes from validated ingests. If the date matches the event's decoded UTC day, checking only the time suffix proves the row is not late. The 24-byte claim then stores a chunk-relative byte offset; the Bloom suspect pass decodes the precise ingest only when needed for dedup. Cache misses and exceptional ingests keep the existing exact parse.
+
+33 edge cases against both the oracle and binary, 15 Rust tests, 10 dirty-seed diffs, all 36 official fixtures, and the official and kit dev checkers passed. The 20M timing is pending the parent session's paired benchmark.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.

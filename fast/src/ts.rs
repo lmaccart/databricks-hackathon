@@ -42,6 +42,15 @@ fn b(v: u64, i: u32) -> i64 {
     ((v >> (8 * i)) & 0xFF) as i64
 }
 
+/// Check just the F1 suffix after the exact date bytes have already been validated.
+#[inline(always)]
+pub(super) fn valid_f1_time(s: &[u8; 20]) -> bool {
+    const TIME: u64 = word(b"00:00:00");
+    const LIMITS: u64 = word(&[0x7F - 2, D, L, 0x7F - 5, D, L, 0x7F - 5, D]);
+    let v = load8(s, 11) ^ TIME;
+    fits(v, LIMITS) & ((v as u16).swap_bytes() <= 0x0203) & (s[10] == b'T') & (s[19] == b'Z')
+}
+
 /// Days since 1970-01-01, proleptic Gregorian (Hinnant), for years 0..=9999.
 #[inline(always)]
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
