@@ -24,6 +24,8 @@ Baseline: original Rust data path on an Apple M2 Pro (32 GiB RAM), release build
 
 The 60M run overlapped compilation on the host. Its 14.97 s comprised 0.71 s setup/links, **3.43 s event parse, 4.40 s event dedup, 3.82 s sessions**, 1.65 s clicks, 0.40 s writing and ~0.56 s from the last log to process exit. No stdout or scratch usage. `tools/check_scale.py` verified schema, uniqueness and cross-table invariants on the full output; no hand-written expected answer exists for that seed. The 24 GB no-swap scorer limit was not enforced on this native run.
 
+Interpret the phase labels carefully: “sessions” includes copying from the dedup buckets before sorting. “Written” includes the serial campaign-counter merge and Arrow batch construction as well as Parquet I/O. Split those timers before choosing a sort or writer replacement.
+
 ## Latency experiments to run in order
 
 These are code-review findings, not measured speedups. The current entry retains the validated sessionization, duplicate selection, byte ordering and attribution algorithms. Run `tools/bench.py` on the same official 20M input for both builds; compare five-run medians, dev answer, and peak memory at 60M. Measure start-to-exit, since moving work between phases can look like an improvement in one log line.
