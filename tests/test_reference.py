@@ -31,12 +31,14 @@ def ms(iso: str) -> int:
     return P.parse_ts(iso.encode())
 
 
-def write(path, header, lines):
+def write(path, header, lines, final_newline=True):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as fh:
         fh.write(header.encode() + b"\n")
-        for ln in lines:
-            fh.write((ln if isinstance(ln, bytes) else ln.encode()) + b"\n")
+        for i, ln in enumerate(lines):
+            fh.write(ln if isinstance(ln, bytes) else ln.encode())
+            if final_newline or i + 1 < len(lines):
+                fh.write(b"\n")
 
 
 def run_case(events=(), clicks=(), links=(), products=("p1,shoes", "p2,hats", "p3,bags"),
@@ -63,7 +65,11 @@ def _run_case_at(tmp, events, clicks, links, products, campaigns, extra=None, wi
     write(os.path.join(data, "clicks", "part-0.csv"), "click_id,user_id,campaign_id,ts", clicks)
     write(os.path.join(data, "links", "part-0.csv"), "user_id_a,user_id_b", links)
     for rel, lines in (extra or {}).items():  # more part files; may replace the header-only events/part-1
-        write(os.path.join(data, rel), HEADERS[rel.split("/")[0]], lines)
+        if isinstance(lines, tuple):
+            header, lines, final_newline = lines
+        else:
+            header, final_newline = HEADERS[rel.split("/")[0]], True
+        write(os.path.join(data, rel), header, lines, final_newline)
     if os.environ.get("SS_BIN"):  # run an implementation binary instead of the reference
         import subprocess
         subprocess.run([os.environ["SS_BIN"]], check=True, stderr=subprocess.DEVNULL,
@@ -290,6 +296,38 @@ class LinkedIds(unittest.TestCase):
 
 
 class Clicks(unittest.TestCase):
+    def test_cross_chunk_long_quoted_nul_tie(self):
+        s = ms("2026-10-09T12:00:00Z")
+        prefix = b"x" * (8 * 1024 * 1024 + 1)
+        t = str(s - HOUR).encode()
+        _, c = run_case(
+            events=[ev("e", "u", str(s), "purchase", price="7")],
+            clicks=[b'"' + prefix + b'z",u,c_1,' + t,
+                    b'"' + prefix + b'\x00\xc3\xa9",u,c_2,' + t,
+                    b'"' + prefix + b'\x00\xc3\xa9",u,c_2,' + t],
+        )
+        day = "2026-10-09"
+        self.assertEqual((c[("c_1", day)]["sessions"], c[("c_1", day)]["assisted_sessions"]), (0, 1))
+        self.assertEqual((c[("c_2", day)]["sessions"], c[("c_2", day)]["revenue_cents"],
+                          c[("c_2", day)]["assisted_sessions"]), (1, 7, 1))
+
+    def test_permuted_header_eof_last_field_tie(self):
+        s = ms("2026-10-09T12:00:00Z")
+        t = s - HOUR
+        _, c = run_case(
+            events=[ev("e", "u", str(s)), ev("e2", "v", str(s))],
+            clicks=[f"é,u,c_1,{t}", f"a\0z,u,c_3,{t}", f"z,v,c_1,{t}"],
+            extra={"clicks/part-1.csv": ("ts,campaign_id,user_id,click_id",
+                                          [f'{t},c_2,u,"a"'], False),
+                   "clicks/part-2.csv": ("ts,campaign_id,user_id,click_id",
+                                          [f'{t},c_3,v,b'], False)},
+        )
+        day = "2026-10-09"
+        self.assertEqual(c[("c_2", day)]["sessions"], 1)
+        self.assertEqual(c[("c_3", day)]["sessions"], 1)
+        for campaign in ("c_1", "c_2", "c_3"):
+            self.assertEqual(c[(campaign, day)]["assisted_sessions"], 2 if campaign != "c_2" else 1)
+
     def test_credit_boundaries(self):
         s = ms("2026-10-09T12:00:00Z")
         events = [ev(f"e{i}", f"u{i}", str(s)) for i in range(1, 7)]

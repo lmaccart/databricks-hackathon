@@ -176,8 +176,61 @@ struct PEv {
 struct PCl {
     person: u64,
     ts: i64,
-    cid: u64,
+    offset: u64,
+    source: u32,
     camp: u32,
+}
+
+impl PCl {
+    // Offsets start at the unquoted value. Valid CSV values cannot contain
+    // structural bytes, and an EOF field has no terminating byte at all.
+    #[inline]
+    fn click_id<'a>(&self, chunks: &[Chunk<'a>]) -> &'a [u8] {
+        let (data, offset) = if self.source == u32::MAX {
+            // More than u32::MAX chunks: retain the address instead of
+            // truncating the source index. No dereference of that address.
+            let addr = self.offset as usize;
+            let data = chunks
+                .iter()
+                .map(|c| c.data)
+                .find(|data| addr.wrapping_sub(data.as_ptr() as usize) < data.len())
+                .expect("click source");
+            (data, addr - data.as_ptr() as usize)
+        } else {
+            (chunks[self.source as usize].data, self.offset as usize)
+        };
+        let tail = &data[offset..];
+        let end = memchr::memchr3(b'"', b',', b'\n', tail).unwrap_or(tail.len());
+        &tail[..end]
+    }
+}
+
+#[cfg(test)]
+mod click_span_tests {
+    use super::*;
+
+    #[test]
+    fn overflow_source_and_eof_field() {
+        assert_eq!(std::mem::size_of::<PCl>(), 32);
+        let file = b"ts,campaign_id,user_id,click_id\n1,c,u,\"a\0\xc3\xa9\"\n1,c,u,z";
+        let chunks = chunks_of(file, &["click_id", "user_id", "campaign_id", "ts"], Path::new("test"));
+        let data = chunks[0].data;
+        let pos = memchr::memchr(b'"', data).unwrap() + 1;
+        let row = PCl {
+            person: 0,
+            ts: 0,
+            offset: data[pos..].as_ptr() as usize as u64,
+            source: u32::MAX,
+            camp: 0,
+        };
+        assert_eq!(row.click_id(&chunks), b"a\0\xc3\xa9");
+        let eof = PCl {
+            offset: (data.len() - 1) as u64,
+            source: 0,
+            ..row
+        };
+        assert_eq!(eof.click_id(&chunks), b"z");
+    }
 }
 
 #[inline]
@@ -220,14 +273,18 @@ fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
     rows
 }
 
-fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<'a>) -> Vec<Vec<PCl>> {
+fn parse_clicks<'a>(c: &Chunk<'a>, source: usize, sm: &Small, lo: i64, we: i64, names: &People<'a>) -> Vec<Vec<PCl>> {
     let hint = reserve_per_shard(c.data);
+    let source = u32::try_from(source)
+        .ok()
+        .filter(|&s| s != u32::MAX)
+        .unwrap_or(u32::MAX);
     let mut b: Vec<Vec<PCl>> = (0..NS).map(|_| Vec::with_capacity(hint)).collect();
     #[derive(Clone, Copy, Default)]
     struct PendingClick {
         uid: u64,
         hash: u64,
-        cid: u64,
+        offset: u64,
         ts: i64,
         camp: u32,
     }
@@ -236,7 +293,8 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<
         b[shard(person)].push(PCl {
             person,
             ts: row.ts,
-            cid: row.cid,
+            offset: row.offset,
+            source,
             camp: row.camp,
         });
     };
@@ -264,7 +322,11 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<
             uid: key,
             hash,
             ts,
-            cid: names.codec.key(cid),
+            offset: if source == u32::MAX {
+                cid.as_ptr() as usize as u64
+            } else {
+                (cid.as_ptr() as usize - c.data.as_ptr() as usize) as u64
+            },
             camp: ci,
         };
         n += 1;
@@ -311,7 +373,7 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
     best.map(|b| b as u32)
 }
 
-fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec) -> ShardOut {
+fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, chunks: &[Chunk<'_>]) -> ShardOut {
     evs.sort_unstable_by_key(|e| (e.person, e.ts));
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
     let ncamp = sm.camp_names.len();
@@ -384,7 +446,10 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
 
             // slide the click window to [start - 7d, start]
             while hi < clicks.len() && clicks[hi].ts <= start {
-                if hi == 0 || clicks[hi].ts != clicks[latest].ts || codec.less(clicks[hi].cid, clicks[latest].cid) {
+                if hi == 0
+                    || clicks[hi].ts != clicks[latest].ts
+                    || clicks[hi].click_id(chunks) < clicks[latest].click_id(chunks)
+                {
                     latest = hi;
                 }
                 let c = clicks[hi].camp as usize;
@@ -499,7 +564,8 @@ fn main() {
 
     let cl_by_person = cl_chunks
         .par_iter()
-        .map(|c| parse_clicks(c, &sm, ws - WEEK, we, &names))
+        .enumerate()
+        .map(|(source, c)| parse_clicks(c, source, &sm, ws - WEEK, we, &names))
         .collect();
     log("clicks routed");
 
@@ -512,7 +578,7 @@ fn main() {
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(gather(e), gather(c), &sm, &names.codec))
+        .map(|(e, c)| process_shard(gather(e), gather(c), &sm, &cl_chunks))
         .collect();
     log("sessions done");
 

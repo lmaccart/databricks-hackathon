@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Deferred click-ID comparisons — 2026-11-21 UTC
+
+Candidate retains click source offsets in 32-byte rows and reads IDs only on timestamp ties; it no longer interns every click ID. The overflow-source fallback retains the address without dereferencing it and finds the owning chunk on demand. Long quoted IDs across chunks, NUL/UTF-8, permuted EOF fields, and the overflow fallback are covered. Reference and binary tests, Rust tests, 36/36 official fixtures, ten small dirty-data seeds, and both dev-answer comparisons passed. Two-seed paired performance measurements are pending in the parent session; no speedup is claimed yet.
+
 ## Official practice: rebuild at 1.78 s — 2026-11-21 UTC
 
 Leif reports **1.78 s** on the rebuild submitted before the final-scale CI job finished, down from **5.03 s** on `cc9f33e` (**2.83× faster**). The exact submitted SHA was not specified. Use [`4f75f52`](https://github.com/lmaccart/databricks-hackathon/commit/4f75f526cef27623e406d2ec1008b40eb1935f23) as the fixed control for the next round; the subsequent `bcdc149` commit only recorded the CI result. These official and CI clocks are tracked separately.
