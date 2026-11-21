@@ -90,6 +90,71 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_sparse_seconds_gap_boundaries_and_tied_midnight_purchases(self):
+        base = ms("2026-10-01T23:29:59Z")
+        events = []
+        clicks = []
+        for label, end, next_offset, expected in [
+            ("minus", 999, 1_800_998, 1),
+            ("equal", 999, 1_800_999, 1),
+            ("plus", 999, 1_801_000, 2),
+            ("mixed", 999, 1_800_000, 1),
+        ]:
+            uid = label
+            events += [
+                ev(label+"a", uid, str(base), "purchase", "p1", "10"),
+                ev(label+"b", uid, str(base + end), "purchase", "p2", "20"),
+                ev(label+"c", uid, str(base + next_offset), "purchase", "p1", "30"),
+                ev(label+"d", uid, str(base + next_offset), "purchase", "p2", "40"),
+            ]
+            events += [ev(f"{label}padding{i}", uid, str(base)) for i in range(12)]
+            clicks += [f"{label}x,{uid},c_1,{base + next_offset}",
+                       f"{label}y,{uid},c_2,{base + next_offset + 1}"]
+        users, camps = run_case(events, clicks, links=[f"{x},{x}z" for x in ("minus", "equal", "plus", "mixed")])
+        for name, sessions in [("minus", 1), ("equal", 1), ("plus", 2), ("mixed", 1)]:
+            self.assertEqual(users[(name, "2026-10-01")]["sessions"], 1)
+            rows = [r for (u, _), r in users.items() if u == name]
+            self.assertEqual(sum(r["sessions"] for r in rows), sessions)
+            self.assertEqual(sum(r["events"] for r in rows), 16)
+            self.assertEqual(sum(r["revenue_cents"] for r in rows), 100)
+        self.assertEqual(camps[("c_1", "2026-10-02")]["sessions"], 1)
+
+    def test_sparse_fractional_start_credit_and_mixed_next_minimum(self):
+        start = ms("2026-10-01T23:59:59Z") + 900
+        whole = ms("2026-10-02T00:00:01Z")
+        next_start = whole + 1_800_001
+        events = [ev("first", "u", str(start), "purchase", "p1", "10")]
+        events += [ev(f"pad{i}", "u", str(whole)) for i in range(12)]
+        events += [ev("next", "u", str(next_start), "purchase", "p2", "20"),
+                   ev("tied", "u", str(next_start + 998), "purchase", "p1", "30")]
+        clicks = [f"early,u,c_1,{start - 1}", f"exact,u,c_2,{start}",
+                  f"too-late,u,c_3,{start + 1}", f"second,u,c_1,{next_start}"]
+        users, camps = run_case(events, clicks, links=["u,v"])
+        self.assertEqual(users[("u", "2026-10-01")]["events"], 13)
+        self.assertEqual(users[("u", "2026-10-01")]["revenue_cents"], 10)
+        self.assertEqual(users[("u", "2026-10-02")]["sessions"], 1)
+        self.assertEqual(users[("u", "2026-10-02")]["revenue_cents"], 50)
+        self.assertEqual(camps[("c_2", "2026-10-01")]["sessions"], 1)
+        self.assertEqual(camps[("c_1", "2026-10-02")]["sessions"], 1)
+
+    def test_sparse_rank_tiles_share_a_shard(self):
+        names = [f"tile{i:05d}" for i in range(10_000)]
+        t = ms("2026-10-01T00:00:00Z")
+        events = []
+        for i, name in enumerate(names[::17]):
+            events.extend([
+                ev(f"t{i}a", name, str(t)),
+                ev(f"t{i}b", name, str(t)),
+                ev(f"t{i}c", name, str(t)),
+                ev(f"t{i}d", name, str(t + 1), "purchase", "p1", "7"),
+            ])
+        users, campaigns = run_case(events, links=[f"{name},{name}" for name in names],
+                                    window=("2025-01-01T00:00:00Z", "2028-12-31T00:00:00Z"))
+        self.assertEqual(len(users), len(names[::17]))
+        self.assertTrue(all(r["sessions"] == 1 and r["events"] == 4 and
+                            r["revenue_cents"] == 7 for r in users.values()))
+        self.assertEqual(campaigns[("organic", "2026-10-01")]["sessions"], len(users))
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"

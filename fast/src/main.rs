@@ -26,7 +26,7 @@ mod person;
 mod stream;
 use links::{Identity, People, person_names};
 use person::Codec;
-use stream::{Packing, Payload, Stream, Temporal};
+use stream::{Packing, Payload, Seconds, Stream, Temporal};
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
@@ -334,6 +334,7 @@ fn process_stream<T: Temporal>(
     sm: &Small,
     people: &People,
     layout: T::Layout,
+    mut detail: Vec<u64>,
     ShardOut { users, camps }: &mut ShardOut,
 ) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
@@ -350,6 +351,7 @@ fn process_stream<T: Temporal>(
     }
     evs.sort_unstable();
     purchases.sort_unstable_by_key(|p| p.key);
+    detail.sort_unstable();
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
     let ncamp = sm.camp_names.len();
     let mut cnt = vec![0usize; ncamp]; // copies enter and leave the window together
@@ -360,6 +362,7 @@ fn process_stream<T: Temporal>(
     let mut ci = 0usize;
     let mut i = 0usize;
     let mut pi = 0usize;
+    let mut di = 0usize;
     while i < evs.len() {
         let rank = evs[i].person(layout);
         let person = T::name(rank, people);
@@ -384,10 +387,26 @@ fn process_stream<T: Temporal>(
         let mut k = i;
         while k < j {
             // one session is evs[k..m]
-            let start = evs[k].ts(layout);
             let mut m = k + 1;
-            while m < j && evs[m].gap(evs[m - 1]) <= GAP as u64 {
+            while m < j && evs[m] == evs[k] {
                 m += 1;
+            }
+            let (start, mut last) = evs[k].bounds(layout, m - k, &detail, &mut di);
+            while m < j {
+                let next = m;
+                while m < j && evs[m] == evs[next] {
+                    m += 1;
+                }
+                // Peek without consuming detail: a new session must see this
+                // same group's exact first millisecond on its next iteration.
+                let mut peek = di;
+                let (first, end) = evs[next].bounds(layout, m - next, &detail, &mut peek);
+                if first.abs_diff(last) > GAP as u64 {
+                    m = next;
+                    break;
+                }
+                di = peek;
+                last = end;
             }
             let day = start.div_euclid(DAY) as i32;
             if day != cur_day {
@@ -483,6 +502,78 @@ fn process_stream<T: Temporal>(
     debug_assert_eq!(pi, np);
 }
 
+fn process_seconds(
+    pieces: &[Stream<u64>],
+    clicks: &[PCl],
+    sm: &Small,
+    people: &People,
+    pack: Packing,
+    out: &mut ShardOut,
+) -> bool {
+    let Some(first) = pieces
+        .iter()
+        .find_map(|s| s.times.first().copied().or_else(|| s.purchases.first().map(|p| p.key)))
+    else {
+        return true;
+    };
+    let rank = first.person(pack) as u32;
+    let Some(layout) = Seconds::new(pack, rank) else {
+        return false;
+    };
+    // Avoid a sparse side stream when it would be denser than the normal one,
+    // and bound tile overhead for exceptionally large rank spaces.
+    if people.count > 0 && layout.tile((people.count - 1) as u32) > 4096 {
+        return false;
+    }
+    let mut count = 0usize;
+    let mut fractional = 0usize;
+    for s in pieces {
+        for key in s.times.iter().copied().chain(s.purchases.iter().map(|p| p.key)) {
+            count += 1;
+            fractional += usize::from(key.ts(pack).rem_euclid(1000) != 0);
+        }
+    }
+    if fractional > count / 4 {
+        return false;
+    }
+    let mut tiles: std::collections::BTreeMap<u32, (Stream<u32>, Vec<u64>)> = Default::default();
+    for s in pieces {
+        for &key in &s.times {
+            let rank = key.person(pack) as u32;
+            let tile = layout.tile(rank);
+            let (key, rem) = layout.encode(rank, key.ts(pack));
+            let (stream, detail) = tiles.entry(tile).or_default();
+            stream.times.push(key);
+            if rem != 0 {
+                detail.push((u64::from(key) << 10) | u64::from(rem));
+            }
+        }
+        for purchase in &s.purchases {
+            let rank = purchase.key.person(pack) as u32;
+            let tile = layout.tile(rank);
+            let (key, rem) = layout.encode(rank, purchase.key.ts(pack));
+            let (stream, detail) = tiles.entry(tile).or_default();
+            stream.purchases.push(stream::Purchase {
+                key,
+                price: purchase.price,
+                cat: purchase.cat,
+            });
+            if rem != 0 {
+                detail.push((u64::from(key) << 10) | u64::from(rem));
+            }
+        }
+    }
+    for (tile, (stream, detail)) in tiles {
+        let cls = clicks
+            .iter()
+            .copied()
+            .filter(|c| layout.tile(c.person as u32) == tile)
+            .collect();
+        process_stream(vec![stream], cls, sm, people, layout.with_tile(tile), detail, out);
+    }
+    true
+}
+
 fn process_shard(
     evs: Vec<Payload>,
     cls: Vec<Clicks>,
@@ -497,9 +588,12 @@ fn process_shard(
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        let clicks = gather(pc);
+        if !process_seconds(&packed, &clicks, sm, people, pack, &mut out) {
+            process_stream(packed, clicks, sm, people, pack, Vec::new(), &mut out);
+        }
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
+    process_stream(wide, gather(wc), sm, people, (), Vec::new(), &mut out);
     out
 }
 

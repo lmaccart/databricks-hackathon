@@ -11,6 +11,7 @@ pub(super) struct Wide {
 #[derive(Clone, Copy)]
 pub(super) struct Packing {
     origin: i64,
+    end: i64,
     bits: u32,
     mask: u64,
 }
@@ -26,6 +27,7 @@ impl Packing {
         }
         Some(Self {
             origin: ws,
+            end: we,
             bits,
             mask: (1 << bits) - 1,
         })
@@ -37,13 +39,94 @@ impl Packing {
     }
 }
 
+/// Seconds use only the rank bits not already supplied by the shard and tile.
+#[derive(Clone, Copy)]
+pub(super) struct Seconds {
+    origin: i64,
+    bits: u32,
+    mask: u32,
+    low: u32,
+    tile: u32,
+}
+
+impl Seconds {
+    pub fn new(pack: Packing, rank: u32) -> Option<Self> {
+        let origin = pack.origin.div_euclid(1000).checked_mul(1000)?;
+        let last = (i128::from(pack.end) - 1 - i128::from(origin)) / 1000;
+        let span = u32::try_from(last).ok()?;
+        let bits = u32::BITS - span.leading_zeros();
+        let rank_bits = 32 - bits;
+        let shift = super::NS.trailing_zeros();
+        let tile = (u64::from(rank) >> (shift + rank_bits)) as u32;
+        Some(Self {
+            origin,
+            bits,
+            mask: u32::MAX.checked_shr(32 - bits).unwrap_or(0),
+            low: rank & (super::NS as u32 - 1),
+            tile,
+        })
+    }
+
+    pub fn tile(self, rank: u32) -> u32 {
+        (u64::from(rank) >> (super::NS.trailing_zeros() + 32 - self.bits)) as u32
+    }
+
+    pub fn with_tile(self, tile: u32) -> Self {
+        Self { tile, ..self }
+    }
+
+    pub fn encode(self, rank: u32, ts: i64) -> (u32, u16) {
+        let offset = (i128::from(ts) - i128::from(self.origin)) as u64;
+        let rank_bits = 32 - self.bits;
+        let rank_mask = u32::MAX.checked_shr(32 - rank_bits).unwrap_or(0);
+        let person = (rank >> super::NS.trailing_zeros()) & rank_mask;
+        let key = ((u64::from(person) << self.bits) | (offset / 1000)) as u32;
+        (key, (offset % 1000) as u16)
+    }
+}
+
 pub(super) trait Temporal: Copy + Ord {
     type Layout: Copy;
     fn person(self, layout: Self::Layout) -> u64;
     fn ts(self, layout: Self::Layout) -> i64;
-    // Only compared within one person's ordered keys.
-    fn gap(self, prev: Self) -> u64;
     fn name(person: u64, people: &People) -> u64;
+    fn bounds(self, layout: Self::Layout, count: usize, detail: &[u64], cursor: &mut usize) -> (i64, i64) {
+        let _ = (count, detail, cursor);
+        let t = self.ts(layout);
+        (t, t)
+    }
+}
+
+impl Temporal for u32 {
+    type Layout = Seconds;
+
+    fn person(self, p: Seconds) -> u64 {
+        let shift = super::NS.trailing_zeros();
+        let local = u64::from(self) >> p.bits;
+        (((u64::from(p.tile) << (32 - p.bits)) | local) << shift) | u64::from(p.low)
+    }
+
+    fn ts(self, p: Seconds) -> i64 {
+        (i128::from(p.origin) + i128::from(self & p.mask) * 1000) as i64
+    }
+
+    fn name(rank: u64, people: &People) -> u64 {
+        people.original(rank as u32)
+    }
+
+    fn bounds(self, p: Seconds, count: usize, detail: &[u64], cursor: &mut usize) -> (i64, i64) {
+        let t = self.ts(p);
+        let lo = *cursor;
+        while *cursor < detail.len() && detail[*cursor] >> 10 == u64::from(self) {
+            *cursor += 1;
+        }
+        let hi = *cursor;
+        if lo == hi {
+            return (t, t);
+        }
+        let min = if hi - lo < count { 0 } else { detail[lo] & 1023 };
+        (t + min as i64, t + (detail[hi - 1] & 1023) as i64)
+    }
 }
 
 impl Temporal for Wide {
@@ -57,11 +140,6 @@ impl Temporal for Wide {
     #[inline]
     fn ts(self, (): ()) -> i64 {
         self.ts
-    }
-
-    #[inline]
-    fn gap(self, prev: Self) -> u64 {
-        self.ts.abs_diff(prev.ts)
     }
 
     #[inline]
@@ -81,11 +159,6 @@ impl Temporal for u64 {
     #[inline]
     fn ts(self, pack: Packing) -> i64 {
         (self & pack.mask).wrapping_add(pack.origin as u64) as i64
-    }
-
-    #[inline]
-    fn gap(self, prev: Self) -> u64 {
-        self - prev
     }
 
     #[inline]
@@ -181,5 +254,22 @@ mod tests {
             p.encode(u32::MAX - 1, (1i64 << 31) - 1).person(p),
             (u32::MAX - 1) as u64
         );
+    }
+
+    #[test]
+    fn seconds_tiles_and_sparse_bounds_are_exact() {
+        let pack = Packing::new(-1234, 20_000_000_000, 1 << 28).unwrap();
+        let rank = 0x0234_56ab;
+        let layout = Seconds::new(pack, rank).unwrap();
+        let (key, rem) = layout.encode(rank, -1233);
+        assert_eq!(rem, 767);
+        assert_eq!(key.person(layout), u64::from(rank));
+        let detail = vec![(u64::from(key) << 10) | 2, (u64::from(key) << 10) | 767];
+        assert_eq!(key.bounds(layout, 2, &detail, &mut 0), (-1998, -1233));
+        assert_eq!(key.bounds(layout, 3, &detail, &mut 0), (-2000, -1233));
+        let other = rank.wrapping_add(1 << 18);
+        let (k, _) = layout.encode(other, -1233);
+        assert_eq!(k.person(layout.with_tile(layout.tile(other))), u64::from(other));
+        assert_ne!(layout.tile(rank), layout.tile(other));
     }
 }

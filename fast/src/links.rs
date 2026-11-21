@@ -233,7 +233,8 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         for slot in &mut lane.slots {
             if slot.key != 0 {
                 let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
-                let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
+                // The shard bits are implicit in each compact temporal key.
+                let routing = (u64::from(rank) & (NS as u64 - 1)) << SHARD_SHIFT;
                 slot.value = LINKED | routing | u64::from(rank);
             }
         }

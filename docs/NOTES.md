@@ -1,5 +1,26 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Adaptive seconds experiment — 2026-11-21
+
+Isolated experiment: linked root ranks route by their low eight bits; after exact
+dedup, manifest-derived second widths and rank tiles produce `u32` temporal
+keys. A sorted sparse remainder stream recovers the exact minimum and maximum
+within each person/second, including mixed whole and fractional milliseconds.
+Purchases retain their multiplicity. The original millisecond stream is used
+for wide windows, excessive tiles, or over 25% fractional events per shard;
+standalone people remain wide. No dataset distribution is assumed for correctness.
+
+Public 1M dev on native Mac, alternating 5 pairs, 8 workers, warm cache:
+control 0.074 → seconds 0.076 s (+1.6%); directpeople 0.083 → 0.085 s
+(+2.7%); ranks 0.080 → 0.083 s (+3.7%). Short runs are noisy and do not show
+a win. No 20M or Docker timings were run, per experiment constraints. This
+does not establish a practice-scale performance improvement.
+
+Both dev comparers matched; both implementations passed 36 official fixtures;
+10 kit dirty seeds, the Rust tests, and the kit edge tests passed. New cases
+cover fractional session starts and click credit, ±1 ms gap boundaries,
+mixed seconds, tied purchases, midnight, and multiple rank tiles.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.
