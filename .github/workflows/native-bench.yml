@@ -1,7 +1,16 @@
 name: Native amd64 performance check
-run-name: Cold-cache diagnostic — 7fd1b76 vs 14ccc10
+run-name: Page-cache diagnostic — ${{ inputs.candidate }}
 on:
   workflow_dispatch:
+    inputs:
+      baseline:
+        description: Full control commit SHA to build and time
+        type: string
+        required: true
+      candidate:
+        description: Full candidate commit SHA to build and time
+        type: string
+        required: true
 permissions:
   contents: read
 jobs:
@@ -15,6 +24,9 @@ jobs:
           persist-credentials: false
       - name: Record environment and build exact packaged images
         shell: bash
+        env:
+          CONTROL: ${{ inputs.baseline }}
+          CANDIDATE: ${{ inputs.candidate }}
         run: |
           set -euo pipefail
           echo "workflow commit $(git rev-parse HEAD)"
@@ -25,8 +37,9 @@ jobs:
           df -hT "$RUNNER_TEMP"
           findmnt -T "$RUNNER_TEMP"
           lsblk -o NAME,TYPE,SIZE,ROTA,MODEL,FSTYPE,MOUNTPOINTS
-          git worktree add --detach "$RUNNER_TEMP/control" 7fd1b7602280cfce05ac97b6afb703fa42c0b6ba
-          git worktree add --detach "$RUNNER_TEMP/finalist" 14ccc10f1dfc0845760640eeee2fa3db62b3e87a
+          [[ "$CONTROL" =~ ^[a-f0-9]{40}$ && "$CANDIDATE" =~ ^[a-f0-9]{40}$ ]]
+          git worktree add --detach "$RUNNER_TEMP/control" "$CONTROL"
+          git worktree add --detach "$RUNNER_TEMP/finalist" "$CANDIDATE"
           git -C "$RUNNER_TEMP/control" rev-parse HEAD HEAD^{tree}
           git -C "$RUNNER_TEMP/finalist" rev-parse HEAD HEAD^{tree}
           docker build --platform linux/amd64 -t coldcheck:control "$RUNNER_TEMP/control"
