@@ -17,7 +17,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 mod dims;
 mod events;
 mod links;
@@ -328,6 +328,189 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
     best.map(|b| b as u32)
 }
 
+// Experimental only: nested work can steal workers from other shards.
+fn sort_streams<T: Temporal>(
+    evs: &mut [T],
+    purchases: &mut [stream::Purchase<T>],
+    cls: &mut [PCl],
+    threshold: Option<usize>,
+) {
+    if threshold.is_some_and(|n| evs.len() >= n) {
+        evs.par_sort_unstable();
+    } else {
+        evs.sort_unstable();
+    }
+    if threshold.is_some_and(|n| purchases.len() >= n) {
+        purchases.par_sort_unstable_by_key(|p| p.key);
+    } else {
+        purchases.sort_unstable_by_key(|p| p.key);
+    }
+    if threshold.is_some_and(|n| cls.len() >= n) {
+        cls.par_sort_unstable_by_key(|c| (c.person, c.ts));
+    } else {
+        cls.sort_unstable_by_key(|c| (c.person, c.ts));
+    }
+}
+
+#[derive(Default)]
+struct ShardTiming {
+    events: usize,
+    clicks: usize,
+    parallel_sorts: usize,
+    gather: Duration,
+    sort: Duration,
+    walk: Duration,
+    start: Duration,
+    end: Duration,
+}
+
+struct SessionOptions {
+    parallel_threshold: Option<usize>,
+    timing: Option<ShardTiming>,
+}
+
+// Process CPU time counts all Rayon workers, unlike summed shard elapsed time.
+#[cfg(unix)]
+fn process_cpu() -> Option<Duration> {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let ok = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) } == 0;
+    ok.then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+#[cfg(not(unix))]
+fn process_cpu() -> Option<Duration> {
+    None
+}
+
+fn report_shards(shards: &mut [ShardTiming], wall: Duration, cpu: Option<Duration>) {
+    let total = |s: &ShardTiming| s.end.saturating_sub(s.start);
+    let gather: Duration = shards.iter().map(|s| s.gather).sum();
+    let sort: Duration = shards.iter().map(|s| s.sort).sum();
+    let walk: Duration = shards.iter().map(|s| s.walk).sum();
+    let shard_work: Duration = shards.iter().map(total).sum();
+    let mut ends: Vec<_> = shards.iter().map(|s| s.end).collect();
+    ends.sort_unstable();
+    let solo = if ends.len() > 1 {
+        ends[ends.len() - 1] - ends[ends.len() - 2]
+    } else {
+        wall
+    };
+    let workers = rayon::current_num_threads().min(ends.len());
+    let final_wave = if workers > 0 {
+        ends[ends.len() - 1] - ends[ends.len() - workers]
+    } else {
+        Duration::ZERO
+    };
+    let parallel_sorts: usize = shards.iter().map(|s| s.parallel_sorts).sum();
+    shards.sort_unstable_by_key(total);
+    let median = shards.get(shards.len() / 2).map(total).unwrap_or_default();
+    eprintln!(
+        "session timing: wall={:.6}s process_cpu={}s cpu/wall={} shard_elapsed_sum={:.6}s gather_sum={:.6}s sort_sum={:.6}s walk_sum={:.6}s p50={:.6}s max={:.6}s last_finish_gap={:.6}s final_wave={:.6}s parallel_sorts={}",
+        wall.as_secs_f64(),
+        cpu.map(|x| format!("{:.6}", x.as_secs_f64()))
+            .unwrap_or_else(|| "unavailable".into()),
+        cpu.map(|x| format!("{:.2}", x.as_secs_f64() / wall.as_secs_f64()))
+            .unwrap_or_else(|| "unavailable".into()),
+        shard_work.as_secs_f64(),
+        gather.as_secs_f64(),
+        sort.as_secs_f64(),
+        walk.as_secs_f64(),
+        median.as_secs_f64(),
+        shards.last().map(total).unwrap_or_default().as_secs_f64(),
+        solo.as_secs_f64(),
+        final_wave.as_secs_f64(),
+        parallel_sorts,
+    );
+    for s in shards.iter().rev().take(5) {
+        eprintln!(
+            "session shard: events={} clicks={} start={:.6}s end={:.6}s gather={:.6}s sort={:.6}s walk={:.6}s",
+            s.events,
+            s.clicks,
+            s.start.as_secs_f64(),
+            s.end.as_secs_f64(),
+            s.gather.as_secs_f64(),
+            s.sort.as_secs_f64(),
+            s.walk.as_secs_f64()
+        );
+    }
+    for (label, s) in [
+        ("largest_events", shards.iter().max_by_key(|s| s.events)),
+        ("last_finish", shards.iter().max_by_key(|s| s.end)),
+    ] {
+        if let Some(s) = s {
+            eprintln!(
+                "session {label}: events={} clicks={} start={:.6}s end={:.6}s gather={:.6}s sort={:.6}s walk={:.6}s",
+                s.events,
+                s.clicks,
+                s.start.as_secs_f64(),
+                s.end.as_secs_f64(),
+                s.gather.as_secs_f64(),
+                s.sort.as_secs_f64(),
+                s.walk.as_secs_f64()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_sort_tests {
+    use super::*;
+    use stream::{Purchase, Wide};
+
+    #[test]
+    fn experimental_sorts_match_sequential_with_ties_and_wide_keys() {
+        let keys: Vec<Wide> = (0..4096)
+            .rev()
+            .map(|i| Wide {
+                person: (i % 9) as u64,
+                ts: (i % 23) as i64 - 11,
+            })
+            .collect();
+        let purchases: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, &key)| Purchase {
+                key,
+                price: i as u32 + 1,
+                cat: (i % 7) as u32,
+            })
+            .collect();
+        let clicks: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| PCl {
+                person: key.person,
+                ts: key.ts,
+                cid: i as u64,
+                camp: (i % 5) as u32,
+            })
+            .collect();
+        let (mut seq_e, mut seq_p, mut seq_c) = (keys.clone(), purchases.clone(), clicks.clone());
+        let (mut par_e, mut par_p, mut par_c) = (keys, purchases, clicks);
+        sort_streams(&mut seq_e, &mut seq_p, &mut seq_c, None);
+        sort_streams(&mut par_e, &mut par_p, &mut par_c, Some(1));
+        assert!(seq_e == par_e);
+        assert!(seq_p.iter().map(|p| p.key).eq(par_p.iter().map(|p| p.key)));
+        assert!(
+            seq_c
+                .iter()
+                .map(|c| (c.person, c.ts))
+                .eq(par_c.iter().map(|c| (c.person, c.ts)))
+        );
+        // Equal-key values may be permuted; no payload may be lost.
+        let mut seq_values: Vec<_> = seq_p.iter().map(|p| (p.price, p.cat)).collect();
+        let mut par_values: Vec<_> = par_p.iter().map(|p| (p.price, p.cat)).collect();
+        seq_values.sort_unstable();
+        par_values.sort_unstable();
+        assert_eq!(seq_values, par_values);
+        let mut seq_ids: Vec<_> = seq_c.iter().map(|c| c.cid).collect();
+        let mut par_ids: Vec<_> = par_c.iter().map(|c| c.cid).collect();
+        seq_ids.sort_unstable();
+        par_ids.sort_unstable();
+        assert_eq!(seq_ids, par_ids);
+    }
+}
+
 fn process_stream<T: Temporal>(
     pieces: Vec<Stream<T>>,
     mut cls: Vec<PCl>,
@@ -335,11 +518,20 @@ fn process_stream<T: Temporal>(
     people: &People,
     layout: T::Layout,
     ShardOut { users, camps }: &mut ShardOut,
+    options: &mut SessionOptions,
 ) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
     let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
     if ne == 0 {
         return;
+    }
+    let started = options.timing.as_ref().map(|_| Instant::now());
+    if let Some(t) = options.timing.as_mut() {
+        t.events += ne;
+        t.clicks += cls.len();
+        if let Some(n) = options.parallel_threshold {
+            t.parallel_sorts += usize::from(ne >= n) + usize::from(np >= n) + usize::from(cls.len() >= n);
+        }
     }
     let mut evs = Vec::with_capacity(ne);
     let mut purchases = Vec::with_capacity(np);
@@ -348,9 +540,15 @@ fn process_stream<T: Temporal>(
         evs.extend(s.purchases.iter().map(|p| p.key));
         purchases.extend_from_slice(&s.purchases);
     }
-    evs.sort_unstable();
-    purchases.sort_unstable_by_key(|p| p.key);
-    cls.sort_unstable_by_key(|c| (c.person, c.ts));
+    if let (Some(t), Some(start)) = (options.timing.as_mut(), started) {
+        t.gather += start.elapsed();
+    }
+    let sort_start = options.timing.as_ref().map(|_| Instant::now());
+    sort_streams(&mut evs, &mut purchases, &mut cls, options.parallel_threshold);
+    if let (Some(t), Some(start)) = (options.timing.as_mut(), sort_start) {
+        t.sort += start.elapsed();
+    }
+    let walk_start = options.timing.as_ref().map(|_| Instant::now());
     let ncamp = sm.camp_names.len();
     let mut cnt = vec![0usize; ncamp]; // copies enter and leave the window together
     let mut active: Vec<u32> = Vec::new(); // campaigns with cnt > 0
@@ -481,6 +679,9 @@ fn process_stream<T: Temporal>(
         i = j;
     }
     debug_assert_eq!(pi, np);
+    if let (Some(t), Some(start)) = (options.timing.as_mut(), walk_start) {
+        t.walk += start.elapsed();
+    }
 }
 
 fn process_shard(
@@ -489,7 +690,16 @@ fn process_shard(
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
-) -> ShardOut {
+    threshold: Option<usize>,
+    epoch: Option<Instant>,
+) -> (ShardOut, Option<ShardTiming>) {
+    let mut options = SessionOptions {
+        parallel_threshold: threshold,
+        timing: epoch.map(|start| ShardTiming {
+            start: start.elapsed(),
+            ..Default::default()
+        }),
+    };
     let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
     let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
     let mut out = ShardOut {
@@ -497,10 +707,13 @@ fn process_shard(
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        process_stream(packed, gather(pc), sm, people, pack, &mut out, &mut options);
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
-    out
+    process_stream(wide, gather(wc), sm, people, (), &mut out, &mut options);
+    if let (Some(t), Some(start)) = (options.timing.as_mut(), epoch) {
+        t.end = start.elapsed();
+    }
+    (out, options.timing)
 }
 
 // ------------------------------------------------------------------ output
@@ -580,10 +793,22 @@ fn main() {
             e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
         )
     });
-    let outs: Vec<_> = jobs
+    let timing = std::env::var_os("SS_SESSION_TIMING").is_some_and(|x| x == "1");
+    let threshold = std::env::var("SS_PAR_SORT_THRESHOLD")
+        .ok()
+        .and_then(|x| x.parse::<usize>().ok())
+        .filter(|&x| x > 0);
+    let epoch = timing.then(Instant::now);
+    let cpu_start = timing.then(process_cpu).flatten();
+    let (outs, timings): (Vec<_>, Vec<_>) = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
-        .collect();
+        .map(|(e, c)| process_shard(e, c, &sm, &names, packing, threshold, epoch))
+        .unzip();
+    if let Some(start) = epoch {
+        let wall = start.elapsed();
+        let cpu = cpu_start.and_then(|s| process_cpu().and_then(|e| e.checked_sub(s)));
+        report_shards(&mut timings.into_iter().flatten().collect::<Vec<_>>(), wall, cpu);
+    }
     log("sessions done");
 
     let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());

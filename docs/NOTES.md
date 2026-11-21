@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Session sorting/tail diagnostic — 2026-11-21
+
+The interrupted `tails` experiment adds opt-in session timing (`SS_SESSION_TIMING=1`) and an opt-in per-stream size threshold for Rayon sorting (`SS_PAR_SORT_THRESHOLD=N`). With neither variable set, the binary emits no timing report and all three sorts remain serial. A local four-worker diagnostic on `../../../vendor/practice` compared the same release binary once serially and once at threshold 65,536. Exact output matched: **2,242,393 user-day rows and 28,014 campaign-day rows**, with zero missing, extra or differing rows.
+
+This was a diagnostic, not a qualified speed comparison: serial ran first, then parallel, with no repeated pairs. Session-work wall time was **1.343067 → 1.252537 s** (-6.7%); process CPU for that work was **2.154926 → 2.165077 s** (+0.5%). The reporter saw 9 streams cross the parallel-sort threshold. Whole-process wall times were 7.011 → 4.599 s, but the second run parsed much faster (2.125 vs 4.762 s before session work), consistent with order/cache effects; those times do **not** establish an end-to-end gain. The single sample suggests reduced session tail latency but does not justify enabling nested parallel sorts by default or claiming a speedup. Raw timings and both output directories are retained in ignored `scratch/session-diagnostic.json` and its sibling directories. The diagnostic preceded a Clippy-driven `SessionOptions` grouping refactor; sort decisions and timing logic were unchanged.
+
+Correctness after the change: 20 Rust tests, 39 binary-backed Python tests, all 36 official fixtures against both reference and binary, 10 kit-generated 20k-event diffs, four official-generator cases (10k and 100k; seeds 1 and 15, including leap day), and both dev-answer comparers passed. Dev output had 117,038 user rows and 27,400 campaign rows; the rules self-check passed. `cargo fmt --check` and release Clippy with warnings denied passed.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

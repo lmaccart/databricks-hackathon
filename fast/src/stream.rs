@@ -37,7 +37,7 @@ impl Packing {
     }
 }
 
-pub(super) trait Temporal: Copy + Ord {
+pub(super) trait Temporal: Copy + Ord + Send {
     type Layout: Copy;
     fn person(self, layout: Self::Layout) -> u64;
     fn ts(self, layout: Self::Layout) -> i64;
