@@ -60,6 +60,8 @@ On a [four-worker Intel Xeon 6975P-C](https://github.com/lmaccart/databricks-hac
 
 The release won all three alternating pairs in each cell; every output matched the control. The [harness](https://github.com/lmaccart/databricks-hackathon/blob/161fd41/tools/coldcheck_terra.py) flushed and evicted just the generated input files, verified residency with `mincore` before each run, then started the timer. It measured 0 of 469,253 input pages resident at 20M and 0 of 1,393,407 at 60M; the warm runs had all of them resident. Device and storage-service caches were not controlled. A first job that failed the residency check produced no cold timing.
 
+The [positioned-read challenger](https://github.com/lmaccart/databricks-hackathon/commit/bd1fc948d19b26936ab472fa16e439da156878a2) keeps one bounded `pread` buffer per worker and falls back to the mapped input for oversized lines. Against `14ccc10` on a heavily loaded eight-worker Mac, native medians were 6.545 → 6.757 s and 7.230 → 7.269 s on the two 20M seeds, with just 2/10 pair wins. All 36 official fixtures, dev and ten dirty-seed comparisons passed. The Mac test did not control page-cache residency; the Linux comparison below can be reproduced with explicit input-cache control.
+
 ### Container launch and parsing
 
 On a [four-worker Intel Xeon 6975P-C](https://github.com/lmaccart/databricks-hackathon/actions/runs/44933674959), two builds with identical production sources differed by 0.3% or less on both practice seeds. The host CLI includes Docker creation and removal; the Engine interval is `StartedAt` to `FinishedAt`; `written` is the pipeline's internal timer through closing its Parquet files. Five-run medians:
@@ -186,6 +188,10 @@ candidate=14ccc10f1dfc0845760640eeee2fa3db62b3e87a
 gh workflow run native-bench.yml --ref perf/practice-154 \
   -f revision="$candidate" -f baseline="$control" -f challenge=true \
   -f oracle=true -f containers=true -f scale=true -f scale_pairs=true
+
+# Same-runner full Docker medians at 20M and 60M, under both cache conditions.
+gh workflow run native-bench.yml --ref trial/154-cache-pairs \
+  -f baseline="$candidate" -f candidate=bd1fc948d19b26936ab472fa16e439da156878a2
 
 # Locally: exact output through both the ranked and wide-window paths.
 make build
