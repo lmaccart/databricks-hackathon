@@ -64,6 +64,9 @@ def main():
               flush=True)
     base, test = [statistics.median(pair[j]["seconds"] for pair in pairs) for j in (0, 1)]
     print(f"medians: {base:.3f} → {test:.3f} s, {(1-test/base)*100:+.1f}% less time, {base/test:.2f}×")
+    paired = [100 * (1 - b["seconds"] / a["seconds"]) for a, b in pairs]
+    print(f"paired savings: candidate faster in {sum(v > 0 for v in paired)}/{len(paired)}; "
+          f"median {statistics.median(paired):+.1f}%, range {min(paired):+.1f}% to {max(paired):+.1f}%")
     if args.phases:
         for j, label in enumerate(("baseline", "candidate")):
             phases = {}
