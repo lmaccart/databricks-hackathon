@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Session counter experiment — 2026-11-21 UTC
+
+Candidate for native timing: bounded manifest-day/campaign counters reused per Rayon worker, with a sparse fallback for large cross products. Touched counters alone are merged; category totals reset only purchased categories. Organic-only people are credited once per day, and single-campaign click timelines skip the active campaign set. Correctness checks include wide windows, 10,000 campaigns, a 260-session whale, inclusive seven-day boundaries, category ties, crossing midnight, and late purchases. Timing is pending; no speedup or acceptance is claimed.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

@@ -90,6 +90,67 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_whale_many_campaigns_and_sparse_counter_fallback(self):
+        # 10k campaigns over 14 days exceeds the bounded dense counter budget.
+        start = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        events = []
+        for n in range(260):
+            ts = (start + dt.timedelta(hours=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            events.append(ev(f"e{n}", "whale", ts, "purchase",
+                             "p1" if n % 2 else "p2", "10"))
+        # A second purchase joins the first session; the late event is dropped.
+        events += [
+            ev("spill", "whale", "2026-10-02T00:05:00Z", "purchase", "p1", "2"),
+            ev("late", "whale", "2026-10-02T00:10:00Z", "purchase", "p1", "999",
+               ingest="2026-10-03T00:10:01Z"),
+        ]
+        clicks = [f"k{n:04},whale,c{n:04},{WS}" for n in range(200)]
+        campaigns = [f"c{n:04},channel" for n in range(10000)]
+        u, c = run_case(events=events, clicks=clicks, campaigns=campaigns)
+        self.assertEqual((u[("whale", "2026-10-02")]["sessions"],
+                          u[("whale", "2026-10-02")]["events"],
+                          u[("whale", "2026-10-02")]["revenue_cents"]), (24, 25, 242))
+        self.assertEqual(c[("c0000", "2026-10-01")]["sessions"], 24)
+        self.assertEqual(c[("c0199", "2026-10-01")]["assisted_sessions"], 24)
+        self.assertEqual(c[("c0000", "2026-10-08")]["sessions"], 1)
+        self.assertEqual(c[("organic", "2026-10-08")]["sessions"], 23)
+
+    def test_daily_attribution_reuses_counters_across_people_and_days(self):
+        for window in ((WS, WE), ("0001-01-01T00:00:00Z", "9999-12-31T23:59:59Z")):
+            with self.subTest(window=window):
+                u, c = run_case(
+                    events=[
+                        ev("e1", "u1", "2026-10-01T23:55:00Z", "purchase", "p1", "10"),
+                        ev("e2", "u1", "2026-10-02T00:05:00Z", "purchase", "p2", "10"),
+                        ev("e3", "u1", "2026-10-02T01:00:00Z"),
+                        ev("e4", "u2", "2026-10-02T01:00:00Z", "purchase", "p1", "9"),
+                        ev("e5", "u3", "2026-10-09T01:00:00Z"),
+                        ev("e6", "u4", "2026-10-09T01:00:00Z"),
+                        ev("e7", "u5", "2026-10-04T00:00:00Z", "purchase", "p1", "7"),
+                        ev("e8", "u5", "2026-10-04T01:00:00Z"),
+                        ev("e9", "u5", "2026-10-05T00:00:00Z", "purchase", "p2", "11"),
+                    ],
+                    clicks=[
+                        "a,u1,c_1,2026-09-24T23:55:00Z",
+                        "b,u1,c_2,2026-10-01T23:55:00Z",
+                        "a2,u2,c_1,2026-10-02T01:00:00Z",
+                        "a3,u3,c_1,2026-10-02T01:00:00Z",
+                        "a4,u4,c_1,2026-10-02T00:59:59Z",
+                    ],
+                    window=window,
+                )
+                self.assertEqual((u[("u1", "2026-10-01")]["events"],
+                                  u[("u1", "2026-10-01")]["top_category"]), (2, "hats"))
+                self.assertIsNone(u[("u1", "2026-10-02")]["top_category"])
+                self.assertEqual(c[("c_1", "2026-10-01")]["assisted_sessions"], 1)
+                self.assertEqual(c[("c_2", "2026-10-01")]["revenue_cents"], 20)
+                self.assertEqual(c[("c_1", "2026-10-09")]["assisted_sessions"], 1)
+                self.assertEqual(c[("organic", "2026-10-09")]["sessions"], 1)
+                self.assertEqual((c[("organic", "2026-10-04")]["sessions"],
+                                  c[("organic", "2026-10-04")]["purchasing_sessions"],
+                                  c[("organic", "2026-10-04")]["revenue_cents"]), (2, 1, 7))
+                self.assertEqual(c[("organic", "2026-10-05")]["revenue_cents"], 11)
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"

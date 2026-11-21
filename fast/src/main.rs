@@ -305,7 +305,7 @@ struct UserRow {
 
 struct ShardOut {
     users: Vec<UserRow>,
-    camps: Map<u64, [i64; 4]>, // (camp << 32 | day) -> sessions, purchasing, revenue, assisted
+    camps: Vec<(u64, [i64; 4])>, // (camp << 32 | day) -> sessions, purchasing, revenue, assisted
 }
 
 #[inline]
@@ -313,19 +313,66 @@ fn ckey(camp: u32, day: i32) -> u64 {
     ((camp as u64) << 32) | (day as u32 as u64)
 }
 
-fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
-    let mut best: Option<usize> = None;
-    for c in 0..catsum.len() {
-        if catsum[c] == 0 {
-            continue;
+// Reused across shards; a large manifest or campaign dimension uses exact
+// sparse keys instead of allocating their potentially enormous cross product.
+struct CampCounters {
+    first_day: i64,
+    width: usize,
+    dense: Vec<[i64; 4]>,
+    touched: Vec<usize>,
+    sparse: Map<u64, [i64; 4]>,
+}
+
+impl CampCounters {
+    fn new(ws: i64, we: i64, ncamp: usize) -> Self {
+        let first_day = ws.div_euclid(DAY);
+        let width = ncamp.checked_add(1).unwrap_or(0);
+        let cells = we
+            .checked_sub(1)
+            .and_then(|last| last.div_euclid(DAY).checked_sub(first_day))
+            .and_then(|days| days.checked_add(1))
+            .and_then(|days| usize::try_from(days).ok())
+            .and_then(|days| days.checked_mul(width))
+            .filter(|&n| width > 0 && n <= 131_072)
+            .unwrap_or(0);
+        Self {
+            first_day,
+            width,
+            dense: vec![[0; 4]; cells],
+            touched: Vec::new(),
+            sparse: Map::with_hasher(rs()),
         }
-        best = match best {
-            None => Some(c),
-            Some(b) if catsum[c] > catsum[b] || (catsum[c] == catsum[b] && rank[c] < rank[b]) => Some(c),
-            keep => keep,
-        };
     }
-    best.map(|b| b as u32)
+
+    #[inline]
+    fn get(&mut self, camp: u32, day: i32) -> &mut [i64; 4] {
+        if self.dense.is_empty() {
+            return self.sparse.entry(ckey(camp, day)).or_insert([0; 4]);
+        }
+        let c = if camp == ORGANIC { self.width - 1 } else { camp as usize };
+        let index = (i64::from(day) - self.first_day) as usize * self.width + c;
+        let row = &mut self.dense[index];
+        if *row == [0; 4] {
+            self.touched.push(index);
+        }
+        row
+    }
+
+    fn finish(&mut self) -> Vec<(u64, [i64; 4])> {
+        let mut result = Vec::with_capacity(self.sparse.len() + self.touched.len());
+        result.extend(self.sparse.drain());
+        for index in self.touched.drain(..) {
+            let c = index % self.width;
+            let camp = if c == self.width - 1 { ORGANIC } else { c as u32 };
+            let day = (self.first_day + (index / self.width) as i64) as i32;
+            result.push((ckey(camp, day), std::mem::take(&mut self.dense[index])));
+        }
+        result
+    }
+}
+
+thread_local! {
+    static CAMPAIGN_COUNTERS: std::cell::RefCell<Option<CampCounters>> = const { std::cell::RefCell::new(None) };
 }
 
 fn process_stream<T: Temporal>(
@@ -334,7 +381,8 @@ fn process_stream<T: Temporal>(
     sm: &Small,
     people: &People,
     layout: T::Layout,
-    ShardOut { users, camps }: &mut ShardOut,
+    users: &mut Vec<UserRow>,
+    camps: &mut CampCounters,
 ) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
     let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
@@ -356,6 +404,7 @@ fn process_stream<T: Temporal>(
     let mut active: Vec<u32> = Vec::new(); // campaigns with cnt > 0
     let mut pos = vec![0u32; ncamp]; // index of a campaign inside `active`
     let mut catsum = vec![0i64; sm.cat_names.len()];
+    let mut cat_touched = Vec::new();
 
     let mut ci = 0usize;
     let mut i = 0usize;
@@ -375,11 +424,17 @@ fn process_stream<T: Temporal>(
             ci += 1;
         }
         let clicks = &cls[c0..ci];
+        let single_camp = clicks
+            .first()
+            .map(|c| c.camp)
+            .filter(|&c| clicks.iter().all(|x| x.camp == c));
         let (mut lo, mut hi) = (0usize, 0usize);
         let mut latest = 0;
 
         let mut cur_day: i32 = i32::MIN;
         let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
+        let mut d_buy = 0i64;
+        let mut top: Option<usize> = None;
 
         let mut k = i;
         while k < j {
@@ -392,19 +447,28 @@ fn process_stream<T: Temporal>(
             let day = start.div_euclid(DAY) as i32;
             if day != cur_day {
                 if cur_day != i32::MIN {
-                    let top = top_category(&catsum, &sm.cat_rank);
                     users.push(UserRow {
                         person,
                         day: cur_day,
                         sessions: d_sess,
                         events: d_ev,
                         revenue: d_rev,
-                        top,
+                        top: top.map(|c| c as u32),
                     });
-                    catsum.iter_mut().for_each(|x| *x = 0);
+                    if clicks.is_empty() {
+                        let e = camps.get(ORGANIC, cur_day);
+                        e[0] += d_sess;
+                        e[1] += d_buy;
+                        e[2] += d_rev;
+                    }
+                    for c in cat_touched.drain(..) {
+                        catsum[c] = 0;
+                    }
+                    top = None;
                 }
                 cur_day = day;
                 (d_sess, d_ev, d_rev) = (0, 0, 0);
+                d_buy = 0;
             }
             let mut rev = 0i64;
             // Each retained purchase contributed one immutable temporal key
@@ -416,64 +480,99 @@ fn process_stream<T: Temporal>(
             while pi < np && purchases[pi].key <= end {
                 let e = &purchases[pi];
                 rev += e.price as i64;
-                catsum[e.cat as usize] += e.price as i64;
+                let c = e.cat as usize;
+                if catsum[c] == 0 {
+                    cat_touched.push(c);
+                }
+                catsum[c] += e.price as i64;
+                if top.is_none_or(|b| {
+                    catsum[c] > catsum[b] || (catsum[c] == catsum[b] && sm.cat_rank[c] < sm.cat_rank[b])
+                }) {
+                    top = Some(c);
+                }
                 pi += 1;
             }
             d_sess += 1;
             d_ev += (m - k) as i64;
             d_rev += rev;
+            d_buy += (pi != p0) as i64;
 
-            // slide the click window to [start - 7d, start]
-            while hi < clicks.len() && clicks[hi].ts <= start {
-                if hi == 0
-                    || clicks[hi].ts != clicks[latest].ts
-                    || people.codec.less(clicks[hi].cid, clicks[latest].cid)
-                {
-                    latest = hi;
+            // A single campaign needs no active set or click-ID tie breaking.
+            if clicks.is_empty() {
+                // All sessions are organic; flush their day as one update.
+            } else if let Some(camp) = single_camp {
+                while hi < clicks.len() && clicks[hi].ts <= start {
+                    hi += 1;
                 }
-                let c = clicks[hi].camp as usize;
-                if cnt[c] == 0 {
-                    pos[c] = active.len() as u32;
-                    active.push(c as u32);
+                while lo < hi && clicks[lo].ts < start.saturating_sub(WEEK) {
+                    lo += 1;
                 }
-                cnt[c] += 1;
-                hi += 1;
-            }
-            while lo < hi && clicks[lo].ts < start.saturating_sub(WEEK) {
-                let c = clicks[lo].camp as usize;
-                cnt[c] -= 1;
-                if cnt[c] == 0 {
-                    let p = pos[c] as usize;
-                    let last = active.pop().unwrap();
-                    if last as usize != c {
-                        active[p] = last;
-                        pos[last as usize] = p as u32;
+                let qualified = lo < hi;
+                let e = camps.get(if qualified { camp } else { ORGANIC }, day);
+                e[0] += 1;
+                e[1] += (pi != p0) as i64;
+                e[2] += rev;
+                e[3] += qualified as i64;
+            } else {
+                // slide the click window to [start - 7d, start]
+                while hi < clicks.len() && clicks[hi].ts <= start {
+                    if hi == 0
+                        || clicks[hi].ts != clicks[latest].ts
+                        || people.codec.less(clicks[hi].cid, clicks[latest].cid)
+                    {
+                        latest = hi;
                     }
+                    let c = clicks[hi].camp as usize;
+                    if cnt[c] == 0 {
+                        pos[c] = active.len() as u32;
+                        active.push(c as u32);
+                    }
+                    cnt[c] += 1;
+                    hi += 1;
                 }
-                lo += 1;
-            }
-            // The entire latest timestamp run expires together. Identical
-            // copies change neither the tie winner nor campaign membership.
-            let credit = if lo < hi { clicks[latest].camp } else { ORGANIC };
-            let e = camps.entry(ckey(credit, day)).or_insert([0; 4]);
-            e[0] += 1;
-            e[1] += (pi != p0) as i64;
-            e[2] += rev;
-            for &a in &active {
-                camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
+                while lo < hi && clicks[lo].ts < start.saturating_sub(WEEK) {
+                    let c = clicks[lo].camp as usize;
+                    cnt[c] -= 1;
+                    if cnt[c] == 0 {
+                        let p = pos[c] as usize;
+                        let last = active.pop().unwrap();
+                        if last as usize != c {
+                            active[p] = last;
+                            pos[last as usize] = p as u32;
+                        }
+                    }
+                    lo += 1;
+                }
+                // The entire latest timestamp run expires together. Identical
+                // copies change neither the tie winner nor campaign membership.
+                let credit = if lo < hi { clicks[latest].camp } else { ORGANIC };
+                let e = camps.get(credit, day);
+                e[0] += 1;
+                e[1] += (pi != p0) as i64;
+                e[2] += rev;
+                for &a in &active {
+                    camps.get(a, day)[3] += 1;
+                }
             }
             k = m;
         }
-        let top = top_category(&catsum, &sm.cat_rank);
         users.push(UserRow {
             person,
             day: cur_day,
             sessions: d_sess,
             events: d_ev,
             revenue: d_rev,
-            top,
+            top: top.map(|c| c as u32),
         });
-        catsum.iter_mut().for_each(|x| *x = 0);
+        if clicks.is_empty() {
+            let e = camps.get(ORGANIC, cur_day);
+            e[0] += d_sess;
+            e[1] += d_buy;
+            e[2] += d_rev;
+        }
+        for c in cat_touched.drain(..) {
+            catsum[c] = 0;
+        }
         for &a in &active {
             cnt[a as usize] = 0;
         }
@@ -489,18 +588,19 @@ fn process_shard(
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
+    counters: &mut CampCounters,
 ) -> ShardOut {
     let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
     let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
-    let mut out = ShardOut {
-        users: Vec::new(),
-        camps: Map::with_hasher(rs()),
-    };
+    let mut users = Vec::new();
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        process_stream(packed, gather(pc), sm, people, pack, &mut users, counters);
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
-    out
+    process_stream(wide, gather(wc), sm, people, (), &mut users, counters);
+    ShardOut {
+        users,
+        camps: counters.finish(),
+    }
 }
 
 // ------------------------------------------------------------------ output
@@ -582,7 +682,12 @@ fn main() {
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(e, c)| {
+            CAMPAIGN_COUNTERS.with_borrow_mut(|slot| {
+                let counters = slot.get_or_insert_with(|| CampCounters::new(ws, we, sm.camp_names.len()));
+                process_shard(e, c, &sm, &names, packing, counters)
+            })
+        })
         .collect();
     log("sessions done");
 
