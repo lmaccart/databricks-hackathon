@@ -35,10 +35,41 @@ const DICT_BYTES: usize = 1024 * 1024;
 const NULL_CAT: u32 = u32::MAX;
 
 #[derive(Default)]
+struct NarrowCounts {
+    small: Vec<u8>,
+    // 255 is the escape; entries are appended in row order.
+    exceptions: Vec<(usize, i64)>,
+}
+
+impl NarrowCounts {
+    #[inline]
+    fn push(&mut self, value: i64) {
+        if (0..255).contains(&value) {
+            self.small.push(value as u8);
+        } else {
+            self.exceptions.push((self.small.len(), value));
+            self.small.push(255);
+        }
+    }
+
+    fn iter_range(&self, range: Range<usize>) -> impl Iterator<Item = i64> + Clone + '_ {
+        let offset = self.exceptions.partition_point(|&(row, _)| row < range.start);
+        let mut exceptions = self.exceptions[offset..].iter();
+        self.small[range].iter().map(move |&value| {
+            if value == 255 {
+                exceptions.next().expect("count exception").1
+            } else {
+                i64::from(value)
+            }
+        })
+    }
+}
+
+#[derive(Default)]
 pub struct UserColumns {
     day: Vec<i32>,
-    sessions: Vec<i64>,
-    events: Vec<i64>,
+    sessions: NarrowCounts,
+    events: NarrowCounts,
     revenue: Vec<i64>,
     category: Vec<u32>,
     people: Vec<(u64, usize)>, // exact person token, exclusive end row
@@ -230,6 +261,68 @@ impl Runs {
 
 fn index_bits(entries: usize) -> u8 {
     (usize::BITS - entries.saturating_sub(1).leading_zeros()) as u8
+}
+
+// A bounded per-group dictionary preserves INT64 for all parts, even when a
+// whale needs a full-width count. Beyond 256 distinct values, write PLAIN.
+fn write_counts(
+    rg: &mut SerializedRowGroupWriter<'_, File>,
+    desc: ColumnDescPtr,
+    rows: usize,
+    values: impl Iterator<Item = i64> + Clone,
+) {
+    let mut small = [u16::MAX; 255];
+    let mut other: Map<i64, u16> = Map::with_hasher(rs());
+    let mut dict = Vec::new();
+    let mut indices = Vec::with_capacity(rows);
+    for value in values.clone() {
+        let slot = if (0..255).contains(&value) {
+            &mut small[value as usize]
+        } else {
+            other.entry(value).or_insert(u16::MAX)
+        };
+        if *slot == u16::MAX {
+            if dict.len() == 256 * 8 {
+                let mut plain = Vec::with_capacity(rows * 8);
+                for v in values {
+                    plain.extend_from_slice(&v.to_le_bytes());
+                }
+                append_page(rg, desc, rows, None, plain);
+                return;
+            }
+            *slot = (dict.len() / 8) as u16;
+            dict.extend_from_slice(&value.to_le_bytes());
+        }
+        indices.push(*slot as u8);
+    }
+    let entries = dict.len() / 8;
+    let bits = index_bits(entries);
+    let mut buf = vec![bits];
+    if bits == 0 {
+        rle(&mut buf, rows, 0, 0);
+    } else {
+        // A single bit-packed hybrid run, padded to a multiple of eight.
+        let groups = rows.div_ceil(8);
+        let mut header = (groups << 1) | 1;
+        while header >= 128 {
+            buf.push((header as u8) | 128);
+            header >>= 7;
+        }
+        buf.push(header as u8);
+        let mut word = 0u32;
+        let mut pending = 0;
+        for index in indices.into_iter().chain(std::iter::repeat_n(0, groups * 8 - rows)) {
+            word |= (index as u32) << pending;
+            pending += bits;
+            while pending >= 8 {
+                buf.push(word as u8);
+                word >>= 8;
+                pending -= 8;
+            }
+        }
+        debug_assert_eq!(pending, 0);
+    }
+    append_page(rg, desc, rows, Some((dict, entries)), buf);
 }
 
 /// Write one already-encoded data page and its optional dictionary. Nullable
@@ -467,8 +560,18 @@ impl<'a> UserGroup<'a> {
             );
         }
         self.column::<Int32Type>(&mut rg, |s| &s.day);
-        self.column::<Int64Type>(&mut rg, |s| &s.sessions);
-        self.column::<Int64Type>(&mut rg, |s| &s.events);
+        write_counts(
+            &mut rg,
+            sch.column(2),
+            self.rows,
+            self.spans.iter().flat_map(|(s, r)| s.sessions.iter_range(r.clone())),
+        );
+        write_counts(
+            &mut rg,
+            sch.column(3),
+            self.rows,
+            self.spans.iter().flat_map(|(s, r)| s.events.iter_range(r.clone())),
+        );
         self.revenue(&mut rg, sch.column(4));
         self.categories(&mut rg, sch.column(5), cats);
         rg.close().expect("close row group");
@@ -598,4 +701,85 @@ pub fn campaign_daily(path: &Path, rows: &[CampRow<'_>]) {
         rg.close().expect("close row group");
     }
     w.close().expect("close file");
+}
+
+#[cfg(test)]
+mod count_tests {
+    use super::*;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::RowAccessor;
+
+    #[test]
+    fn narrow_counts_and_encoded_pages_round_trip_boundaries() {
+        let path = std::env::var_os("COUNT_TEST_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(format!("target/count-test-{}.parquet", std::process::id())));
+        let sch = schema(vec![long("counts")]);
+        let desc = SchemaDescriptor::new(sch.clone());
+        let mut writer = file(&path, sch);
+        let mut expected = Vec::new();
+        // Every dictionary bit width, a partial final group of eight, a plain
+        // fallback, and signed i64 outliers without generating billions of events.
+        let mut groups = Vec::new();
+        for cardinality in [1, 2, 3, 5, 9, 17, 33, 65, 129, 256, 257] {
+            groups.push(
+                (0..cardinality)
+                    .map(|v| v as i64)
+                    .cycle()
+                    .take(cardinality * 3 + 1)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        groups.push(vec![i64::MIN, -1, 0, 254, 255, 256, i32::MAX as i64, i64::MAX]);
+        groups.push((0..GROUP_ROWS).map(|v| (v % 3) as i64).collect());
+        for values in groups {
+            let mut counts = NarrowCounts::default();
+            for &v in &values {
+                counts.push(v);
+            }
+            assert_eq!(counts.iter_range(0..values.len()).collect::<Vec<_>>(), values);
+            assert_eq!(
+                counts.iter_range(1..values.len() - 1).collect::<Vec<_>>(),
+                values[1..values.len() - 1]
+            );
+            let mut rg = writer.next_row_group().unwrap();
+            write_counts(
+                &mut rg,
+                desc.column(0),
+                values.len(),
+                counts.iter_range(0..values.len()),
+            );
+            rg.close().unwrap();
+            expected.extend(values);
+        }
+        writer.close().unwrap();
+        let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+        assert!(
+            !reader
+                .metadata()
+                .row_group(10)
+                .column(0)
+                .encodings()
+                .any(|e| e == Encoding::RLE_DICTIONARY),
+            "257 distinct values must use the bounded fallback"
+        );
+        assert!(
+            reader
+                .metadata()
+                .row_group(11)
+                .column(0)
+                .encodings()
+                .any(|e| e == Encoding::RLE_DICTIONARY),
+            "full-width exceptions must also survive dictionary encoding"
+        );
+        let actual: Vec<_> = reader
+            .get_row_iter(None)
+            .unwrap()
+            .map(|row| row.unwrap().get_long(0).unwrap())
+            .collect();
+        assert_eq!(actual, expected);
+        if std::env::var_os("COUNT_TEST_OUT").is_none() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 }
