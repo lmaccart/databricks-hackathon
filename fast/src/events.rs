@@ -1,6 +1,7 @@
 //! Send payloads directly to the session partition. A separate, smaller
 //! stream of claims (ID, ingest time, payload location) decides which payloads
 //! must be removed. In particular, an invalid copy has a claim but no payload.
+use super::ts::{DayCache, parse_event_times};
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -73,20 +74,24 @@ fn parse<'a>(
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
+    let mut days = DayCache::new();
     for_rows(c, |r| {
         if r[0].is_empty() {
             return;
         }
         let id = people.codec.key(r[0]);
-        let ingest = parse_ingest(r[3]);
-        let ts = parse_ts(r[2]);
+        let (ts, ingest, same_day) = parse_event_times(r[2], r[3], &mut days);
         let mut next = Pending {
             id,
             ts,
             ingest,
             ..Default::default()
         };
-        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
+        if !r[1].is_empty()
+            && !r[5].is_empty()
+            && (ws..we).contains(&ts)
+            && (same_day || ingest.saturating_sub(ts) <= DAY)
+        {
             let purchase = match r[4] {
                 b"purchase" => parse_price(r[6]),
                 b"view" | b"cart" => Some(0),
