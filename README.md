@@ -41,4 +41,4 @@ The **Native amd64 performance check** workflow accepts `revision` and `baseline
 
 ## Credits
 
-Rust: Rayon, memchr, memmap2, aHash, serde_json, bytes, and the Apache Arrow project's Parquet crate. Python: PyArrow; Polars in the organizers’ test harness. The official generator, fixtures and dev answer are distributed by the organizers and are not checked in. Entry code: [MIT](LICENSE).
+Rust: Rayon, memchr, memmap2, aHash, serde_json, bytes, the Apache Arrow project's Parquet crate, and [mimalloc](https://github.com/microsoft/mimalloc) v3.3.2 via the Rust `mimalloc` 0.1.52 wrapper on Linux (system allocator fallback elsewhere). Python: PyArrow; Polars in the organizers’ test harness. The official generator, fixtures and dev answer are distributed by the organizers and are not checked in. Entry code: [MIT](LICENSE).
