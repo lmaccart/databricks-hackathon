@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Official practice: 1.57 s; new target 0.63 s — 2026-11-21
+
+Leif reports **1.57 s** on the most recent entry, down from **1.78 s** (11.8% less time), and a **0.63 s** record. The current main build and the recommended `9758471` have identical production sources. Use `9758471` as the fixed control. Matching 0.63 s requires **2.49×** the current throughput, or **0.94 s / 59.9%** less wall time.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

@@ -2,7 +2,7 @@
 
 A native Rust entry for the [Databricks Shopping Sessions buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). It reads the mounted CSVs, resolves linked identities, deduplicates events, sessionizes, attributes clicks and assists, and writes `user_daily/` and `campaign_daily/` as Parquet. [Official rules](docs/rules.md) · [architecture](ARCHITECTURE.md) · [review, measurements and open checks](docs/NOTES.md).
 
-**Recommended practice commit:** [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f). In [paired full-container CI](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871823659), it cut time from **2.201 to 1.903 s at 20M** and **6.755 to 5.882 s at 60M** against the 1.78 s rebuild control. All 6,615,971 rows at 60M matched under a 14 GiB no-swap cap. Both dev checkers, 36 official fixtures, and 60 Python-oracle comparisons also passed. The latest confirmed **official** time is still **1.78 s**, down from 5.03 s. [Two-seed trials and measurements](docs/PERF_178.md).
+**Official practice: 1.57 s** on the latest build, down from 1.78 s and originally 5.03 s. [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) is the reproducible control. In [paired full-container CI](https://github.com/lmaccart/databricks-hackathon/actions/runs/44871823659), it cut time from **2.201 to 1.903 s at 20M** and **6.755 to 5.882 s at 60M** against the 1.78 s rebuild. All 6,615,971 rows at 60M matched under a 14 GiB no-swap cap. [Two-seed trials and measurements](docs/PERF_178.md).
 
 ## Build and run
 
