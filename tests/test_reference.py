@@ -129,26 +129,33 @@ class EventClaims(unittest.TestCase):
         left = midnight - 1
         right = left + 30 * MIN
         split = right + 30 * MIN + 1
-        events = [ev(f"hot_{i}", "别名" if i % 2 else "alias", str(left + i % 2))
+        events = [ev(f"hot_{i}", "别名" if i % 2 else "alias", str(left))
                   for i in range(8192)]
         events += [
+            ev("first", "别名", str(left), "purchase", "p1", "300"),
             ev("bridge", "alias", str(right), "purchase", "p2", "300"),
             ev("new", "别名", str(split), "purchase", "p1", "500"),
-            ev("standalone", "different_é", str(right)),
+            ev("cold", "different_é", str(right)),
         ]
         clicks = [f"é,alias,c_1,{left}", f"z,别名,c_2,{left}", f"x,alias,c_3,{left + 1}"]
-        users, campaigns = run_case(events, clicks, ["alias,别名", "0root,alias"])
+        clicks += [f"cold,different_é,c_1,{right}", f"ignored,click_only,c_3,{left}"]
+        users, campaigns = run_case(
+            events[::2], clicks, ["alias,别名", "0root,alias", "different_é,different_é"],
+            extra={"events/part-1.csv": events[1::2][::-1]},
+        )
         self.assertEqual(
             {k: (r["sessions"], r["events"], r["revenue_cents"], r["top_category"])
              for k, r in users.items()},
-            {("0root", "2026-10-01"): (1, 8193, 300, "hats"),
+            {("0root", "2026-10-01"): (1, 8194, 600, "hats"),
              ("0root", "2026-10-02"): (1, 1, 500, "shoes"),
              ("different_é", "2026-10-02"): (1, 1, 0, None)},
         )
         self.assertEqual(campaigns["c_2", "2026-10-01"]["sessions"], 1)
+        self.assertEqual(campaigns["c_2", "2026-10-01"]["revenue_cents"], 600)
         self.assertEqual(campaigns["c_1", "2026-10-01"]["assisted_sessions"], 1)
         self.assertNotIn(("c_3", "2026-10-01"), campaigns)
         self.assertEqual(campaigns["c_3", "2026-10-02"]["revenue_cents"], 500)
+        self.assertEqual(campaigns["c_1", "2026-10-02"]["sessions"], 1)
 
     def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
         stamp = "2026-10-03T10:00:00Z"

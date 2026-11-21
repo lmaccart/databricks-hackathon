@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round four: accumulate hot timeline bins during scatter — 2026-11-21
+
+Against `0558eaa`, eligible direct ranks no longer allocate a four-byte timestamp for every event and then read that array twice. The owner histogram observes the post-dedup span; the scatter plan tags fixed bin ranges only for ranks with at least 4,096 events and at most half the flat timestamp storage cost. An owner uses at most 32,768 bins (512 KiB on 64-bit), 4,096 per rank at full `u32` width. Ineligible ranks retain the original path; short owners skip span tracking altogether. Sparse purchases and clicks still feed the same reducer with exact timestamps.
+
+Validation: 44 cases on both Python and Rust, 26 Rust unit tests, all 36 official fixtures on both implementations, 10 dirty diffs, and both official dev comparers passed (117,038 user rows / 27,400 campaign rows; empty stdout). A targeted 500k-row, 49-day skewed corpus with two hot people and many cold people matched the Python reference exactly. Clippy passed with warnings denied.
+
+Native macOS, eight workers, 21 alternating pairs each: official 1M dev wall median **50.43 → 50.00 ms** (0.9% less; 12/21 wins), session phase 9 → 9 ms at log resolution. Synthetic 500k hot/cold wall median **19.42 → 18.80 ms** (3.2% less; 16/21 wins), session phase 3 → 2 ms. No Docker or input over 1M events was run locally; larger-scale impact remains unmeasured.
+
 ## Round four: slot-indexed range reduction — 2026-11-21
 
 Port of `be4a89c` onto `4933dbe` for a direct final-scale comparison. The flat CAS graph is unchanged: the physical slot anchors identity and `slot & 255` still selects its owner. The range path indexes the owner-local histogram by `slot >> 8`, without a rank remap or another hash. Compact offsets and exact bins feed the same `finish_user_day` and `finish_person` calls as the full-width path. The columnar writer is unchanged from `4ad0e5d`. Singletons that cannot claim a slot and windows too wide for a 32-bit offset keep full-width time and exact identity. The prior standalone range branch reportedly won all ten 20M pairs by 3.5% / 2.5% against `a32d0b7`; those figures are not timings for this integration.
