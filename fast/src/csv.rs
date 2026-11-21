@@ -12,6 +12,9 @@ use memchr::memchr;
 use std::marker::PhantomData;
 use std::path::Path;
 
+#[cfg(any(target_arch = "x86_64", test))]
+mod fixed;
+
 /// Output slot for fields no caller reads (the ninth entry of the row buffer).
 const SKIP: u8 = 8;
 
@@ -100,6 +103,24 @@ pub fn for_rows<'a>(c: &Chunk<'a>, mut f: impl FnMut(&[&'a [u8]; 8])) {
         }
     }
     scan::<Native, _>(c.data, &slot, &mut f);
+}
+
+/// The fixed kernel applies only when every selected column is present in its
+/// natural order and the header contains no unselected columns.
+#[inline]
+pub fn for_fixed_rows<'a, const N: usize>(c: &Chunk<'a>, f: impl FnMut(&[&'a [u8]; 8])) {
+    const { assert!(matches!(N, 4 | 7)) };
+    #[cfg(target_arch = "x86_64")]
+    if fixed::identity::<N>(c)
+        && std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("bmi1")
+        && std::arch::is_x86_feature_detected!("popcnt")
+    {
+        let mut f = f;
+        // SAFETY: dispatch checked all the required features.
+        return unsafe { fixed::scan_avx2::<N, _>(c.data, &mut f) };
+    }
+    for_rows(c, f);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -425,7 +446,7 @@ mod tests {
     /// Kernels this CPU can run: dispatching entry, SWAR, native SIMD, AVX2.
     fn kernels() -> Vec<usize> {
         #[allow(unused_mut)]
-        let mut k = vec![0, 1, 2];
+        let mut k = vec![0, 1, 2, 4];
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx2") {
             k.push(3);
@@ -439,11 +460,18 @@ mod tests {
             let mut f = |r: &[&[u8]; 8]| out.push(r[..cols.len()].iter().map(|v| v.to_vec()).collect());
             let slot = slots(&c);
             match kernel {
-                0 => for_rows(&c, &mut f),
+                0 => match cols.len() {
+                    4 => for_fixed_rows::<4>(&c, &mut f),
+                    7 => for_fixed_rows::<7>(&c, &mut f),
+                    _ => for_rows(&c, &mut f),
+                },
                 1 => scan::<Swar, _>(c.data, &slot, &mut f),
                 2 => scan::<Native, _>(c.data, &slot, &mut f),
                 #[cfg(target_arch = "x86_64")]
                 3 => unsafe { scan_avx2(c.data, &slot, &mut f) },
+                4 if fixed::identity::<4>(&c) => fixed::scan::<4, fixed::Scalar, _>(c.data, &mut f),
+                4 if fixed::identity::<7>(&c) => fixed::scan::<7, fixed::Scalar, _>(c.data, &mut f),
+                4 => scan::<Swar, _>(c.data, &slot, &mut f),
                 _ => unreachable!(),
             }
         }
@@ -601,6 +629,11 @@ mod tests {
             b"price_cents,product_id,event_type,ingest_ts,ts,user_id,event_id\n7,p,view,i,t,u,e\n\"7\",p,view,i,t,u,\"e\"\n",
             &ev,
         );
+        check(
+            b"\"a\",b,\"c\",d\n\"\",first,2,3\n\"no\"no,1,2,3",
+            &["a", "b", "c", "d"],
+        );
+        check(b"a,b,x,c,d\n0,1,x,2,3\n0,1,\"x\"x,2,3", &["a", "b", "c", "d"]);
     }
 
     #[test]
@@ -629,6 +662,35 @@ mod tests {
                 file.push(b'\n');
                 file.extend_from_slice(lines[(i + 1) % lines.len()].as_bytes());
                 file.push(b'\n');
+                check(&file, &cols);
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_layout_quote_recovery() {
+        // Move paired and unpaired boundary quotes across both vector halves,
+        // block boundaries, and the synthetic separator at end of input.
+        for pad in (0..=130).chain([255, 256, 257, 4096]) {
+            for field in [
+                b"\"\"".as_slice(),
+                b"\"",
+                b"\"\"\"",
+                b"\"a\"\"b\"",
+                b"\"a,b\"",
+                b"a\"",
+                b"\"a\"\r",
+                b"\"a\"",
+                b"\xe6\xb0\xb4\x00\r",
+            ] {
+                let mut file = b"a,b,c,d,e,f,g\n".to_vec();
+                file.extend_from_slice(b"e,");
+                file.resize(file.len() + pad, b' ');
+                file.extend_from_slice(b",\"t\",i,view,p,");
+                file.extend_from_slice(field);
+                let cols = ["a", "b", "c", "d", "e", "f", "g"];
+                check(&file, &cols);
+                file.extend_from_slice(b"\n\"e\",\"\",t,i,view,p,\n,,\n,,,,,,\n");
                 check(&file, &cols);
             }
         }
