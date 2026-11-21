@@ -1,4 +1,4 @@
-//! Parquet output: one row group per file, PLAIN, uncompressed, no statistics.
+//! Parquet output: bounded row groups, PLAIN, uncompressed, no statistics.
 //!
 //! Rows are pushed straight into the parquet crate's typed column writers in
 //! small blocks, so there is no intermediate Arrow array (and no second copy of
@@ -16,7 +16,6 @@ use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Typ
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesPtr};
 use parquet::file::writer::{SerializedColumnWriter, SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::types::{Type, TypePtr};
-use rayon::prelude::*;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -25,6 +24,7 @@ use std::sync::Arc;
 /// Values handed to a column writer per call. Also the writer's own page-size
 /// check interval, so a page never overshoots its limit by more than a block.
 const BLOCK: usize = 4096;
+const USER_ROW_GROUP: usize = 8 * 1024;
 
 fn props() -> WriterPropertiesPtr {
     Arc::new(
@@ -134,6 +134,33 @@ fn strings<'a, R: 'a>(
     }
 }
 
+fn user_ids(cw: &mut SerializedColumnWriter<'_>, rows: &[UserRow], key: &(dyn Fn(u64, &mut Vec<u8>) + Sync)) {
+    let mut spans = Vec::with_capacity(BLOCK);
+    let mut values = Vec::with_capacity(BLOCK);
+    for block in rows.chunks(BLOCK) {
+        let mut arena = Vec::with_capacity(BLOCK * 12);
+        spans.clear();
+        let mut last = None;
+        let mut span = (0, 0);
+        for r in block {
+            if last != Some(r.person) {
+                let start = arena.len();
+                key(r.person, &mut arena);
+                assert!(std::str::from_utf8(&arena[start..]).is_ok(), "IDs must be UTF-8");
+                span = (start, arena.len());
+                last = Some(r.person);
+            }
+            spans.push(span);
+        }
+        let shared = Bytes::from(arena);
+        values.clear();
+        values.extend(spans.iter().map(|&(a, b)| ByteArray::from(shared.slice(a..b))));
+        cw.typed::<ByteArrayType>()
+            .write_batch(&values, None, None)
+            .expect("write column");
+    }
+}
+
 fn next<'a, W: Write + Send>(rg: &'a mut SerializedRowGroupWriter<'_, W>) -> SerializedColumnWriter<'a> {
     rg.next_column().expect("column").expect("schema has more columns")
 }
@@ -146,44 +173,59 @@ fn file(path: &Path, schema: TypePtr) -> SerializedFileWriter<File> {
     SerializedFileWriter::new(File::create(path).expect("create parquet"), schema, props()).expect("writer")
 }
 
-/// `user_daily`: shards are grouped into at most `parts` files, one thread each.
-/// `key` appends a person's name (byte-wise smallest of their IDs).
-pub fn user_daily(
-    dir: &Path,
-    shards: &[&[UserRow]],
-    parts: usize,
-    key: &(impl Fn(u64, &mut Vec<u8>) + Sync),
-    cats: &[Vec<u8>],
-) {
-    let per = shards.len().div_ceil(parts.max(1)).max(1);
-    let sch = schema(vec![
+fn user_schema() -> TypePtr {
+    schema(vec![
         string("user_id", false),
         date("day"),
         long("sessions"),
         long("events"),
         long("revenue_cents"),
         string("top_category", true),
-    ]);
-    // part-0 always exists so the table is never an empty folder.
-    let groups: Vec<&[&[UserRow]]> = if shards.is_empty() {
-        vec![&[][..]]
-    } else {
-        shards.chunks(per).collect()
-    };
-    groups.par_iter().enumerate().for_each(|(i, group)| {
-        let n: usize = group.iter().map(|s| s.len()).sum();
-        if n == 0 && i > 0 {
+    ])
+}
+
+/// One lane belongs to a Rayon worker. It retains at most one bounded batch
+/// of user rows across shards; all files use the same physical schema.
+pub struct UserWriter<'a> {
+    dir: &'a Path,
+    part: usize,
+    key: &'a (dyn Fn(u64, &mut Vec<u8>) + Sync),
+    cats: &'a [Vec<u8>],
+    rows: Vec<UserRow>,
+    writer: Option<SerializedFileWriter<File>>,
+}
+
+impl<'a> UserWriter<'a> {
+    pub fn new(dir: &'a Path, part: usize, key: &'a (dyn Fn(u64, &mut Vec<u8>) + Sync), cats: &'a [Vec<u8>]) -> Self {
+        Self {
+            dir,
+            part,
+            key,
+            cats,
+            rows: Vec::new(),
+            writer: None,
+        }
+    }
+
+    pub fn push(&mut self, row: UserRow) {
+        self.rows.push(row);
+        if self.rows.len() == USER_ROW_GROUP {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.rows.is_empty() {
             return;
         }
-        let rows = || group.iter().flat_map(|s| s.iter());
-        let mut w = file(&dir.join(format!("part-{i}.parquet")), sch.clone());
-        if n > 0 {
+        let w = self
+            .writer
+            .get_or_insert_with(|| file(&self.dir.join(format!("part-{}.parquet", self.part)), user_schema()));
+        let rows = || self.rows.iter();
+        {
             let mut rg = w.next_row_group().expect("row group");
             let mut c = next(&mut rg);
-            strings(&mut c, rows(), false, |r, out| {
-                key(r.person, out);
-                true
-            });
+            user_ids(&mut c, &self.rows, self.key);
             close(c);
             let mut c = next(&mut rg);
             fixed::<Int32Type, _>(&mut c, rows(), |r| r.day);
@@ -200,7 +242,7 @@ pub fn user_daily(
             let mut c = next(&mut rg);
             strings(&mut c, rows(), true, |r, out| match r.top {
                 Some(t) => {
-                    out.extend_from_slice(&cats[t as usize]);
+                    out.extend_from_slice(&self.cats[t as usize]);
                     true
                 }
                 None => false,
@@ -208,8 +250,19 @@ pub fn user_daily(
             close(c);
             rg.close().expect("close row group");
         }
-        w.close().expect("close file");
-    });
+        self.rows.clear();
+    }
+
+    pub fn finish(mut self) {
+        self.flush();
+        // Even an entirely empty input must produce a readable table.
+        if self.part == 0 && self.writer.is_none() {
+            self.writer = Some(file(&self.dir.join("part-0.parquet"), user_schema()));
+        }
+        if let Some(w) = self.writer {
+            w.close().expect("close file");
+        }
+    }
 }
 
 /// One `campaign_daily` row.

@@ -90,6 +90,45 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_user_and_campaign_output_preserve_wide_revenue_and_category_tie(self):
+        ts = "2026-10-02T00:00:00Z"
+        events = [ev(str(i), "wide", ts, "purchase", "p1" if i % 2 else "p2", "10000000")
+                  for i in range(440)]
+        events += [ev("small", "small", ts)]
+        u, c = run_case(events=events, products=("p1,z", "p2,é"))
+        row = u[("wide", "2026-10-02")]
+        self.assertEqual((row["events"], row["revenue_cents"], row["top_category"]),
+                         (440, 4400000000, "z"))
+        self.assertEqual(c[("organic", "2026-10-02")]["revenue_cents"], 4400000000)
+
+    def test_user_output_spans_row_groups_with_unicode_and_nulls(self):
+        # A single person can have more daily rows than the writer's bounded
+        # row group, including IDs and categories with embedded NULs.
+        start = dt.datetime(1900, 1, 1, tzinfo=dt.timezone.utc)
+        count = 8194
+        events = []
+        for i in range(count):
+            instant = start + dt.timedelta(days=i)
+            ts = instant.strftime("%Y-%m-%dT%H:%M:%SZ")
+            events.append(ev(str(i), "é\0user", ts,
+                             "purchase" if i in (0, 8191, 8192, count - 1) else "view",
+                             "p1", "2", ingest=ts))
+        with tempfile.TemporaryDirectory() as tmp:
+            u, c = _run_case_at(tmp, events, (), (), ("p1,cat\0é",), (),
+                                window=("1900-01-01T00:00:00Z", "2000-01-01T00:00:00Z"))
+            self.assertEqual(len(u), count)
+            self.assertEqual(len(c), count)
+            for i in (0, 8191, 8192, count - 1):
+                day = (start + dt.timedelta(days=i)).date().isoformat()
+                self.assertEqual(u[("é\0user", day)]["top_category"], "cat\0é")
+                self.assertEqual(u[("é\0user", day)]["revenue_cents"], 2)
+            self.assertIsNone(u[("é\0user", "1900-01-02")]["top_category"])
+            if os.environ.get("SS_BIN"):
+                import glob
+                import pyarrow.parquet as pq
+                files = glob.glob(os.path.join(tmp, "out", "user_daily", "*.parquet"))
+                self.assertTrue(any(pq.ParquetFile(f).metadata.num_row_groups > 1 for f in files))
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"
