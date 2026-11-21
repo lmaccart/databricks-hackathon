@@ -5,7 +5,7 @@
 //! template in one SWAR step: XOR with the template leaves 0..=9 in a digit byte
 //! and 0 in a literal byte, and one add flags any byte above its limit.
 
-use crate::BAD;
+use crate::{BAD, DAY};
 
 const LO7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
 const HI: u64 = 0x8080_8080_8080_8080;
@@ -55,7 +55,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 /// F1 (`F2 == false`, 20 bytes) or F2 (25 bytes), or BAD.
 #[inline(always)]
-fn iso<const F2: bool, const SECONDS: bool>(s: &[u8]) -> i64 {
+fn iso<const F2: bool>(s: &[u8]) -> i64 {
     let a = load8(s, 0) ^ T_DATE;
     let t = load8(s, 8) ^ T_TIME;
     let (z, ok, off_min) = if F2 {
@@ -85,7 +85,7 @@ fn iso<const F2: bool, const SECONDS: bool>(s: &[u8]) -> i64 {
         return BAD;
     }
     let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se - off_min * 60;
-    if SECONDS { secs } else { secs * 1000 }
+    secs * 1000
 }
 
 /// Eight ASCII digits (first byte most significant) as a number, or None.
@@ -117,21 +117,22 @@ fn short(s: &[u8]) -> Option<u64> {
     Some(v)
 }
 
-/// F3: digits only, any length. A value beyond i64 is outside every window: BAD.
+/// F3: digits only, any length. The oracle uses one sentinel for values
+/// with more than 19 significant digits, all outside the civil date range.
 #[inline(always)]
-fn epoch_ms(s: &[u8]) -> i64 {
+fn epoch_digits<const KEEP_WIDE: bool>(s: &[u8]) -> Option<u64> {
     if s.is_empty() {
-        return BAD;
+        return None;
     }
     let mut s = s;
     if s.len() > 19 {
         s = &s[s.iter().position(|&c| c != b'0').unwrap_or(s.len())..];
         if s.len() > 19 {
-            return BAD; // a non-digit or more than 19 significant digits: BAD either way
+            return (KEEP_WIDE && s.iter().all(u8::is_ascii_digit)).then_some(10_000_000_000_000_000_000);
         }
     }
     let n = s.len();
-    let v = match n {
+    match n {
         0..=8 => short(s),
         9..=16 => {
             // the first n-8 digits, left-padded with '0' to a full word
@@ -151,10 +152,6 @@ fn epoch_ms(s: &[u8]) -> i64 {
                 .zip(eight(load8(s, k + 8)))
                 .map(|((h, m), l)| (h * 100_000_000 + m) * 100_000_000 + l)
         }
-    };
-    match v {
-        Some(v) if v <= i64::MAX as u64 => v as i64,
-        _ => BAD,
     }
 }
 
@@ -163,57 +160,94 @@ fn epoch_ms(s: &[u8]) -> i64 {
 pub fn parse_ts(s: &[u8]) -> i64 {
     // s[4] == '-' rules out F3, so F1/F2 syntax decides alone
     match s.len() {
-        20 if s[4] == b'-' => iso::<false, false>(s),
-        25 if s[4] == b'-' => iso::<true, false>(s),
-        _ => epoch_ms(s),
+        20 if s[4] == b'-' => iso::<false>(s),
+        25 if s[4] == b'-' => iso::<true>(s),
+        _ => epoch_digits::<false>(s)
+            .and_then(|v| i64::try_from(v).ok())
+            .unwrap_or(BAD),
     }
 }
 
-/// `ingest_ts`, which rules.md guarantees is valid F1. A bad one sorts last
-/// (i64::MAX), so such a copy can only lose the dedup or be late.
-#[inline]
-pub fn parse_ingest(s: &[u8]) -> i64 {
-    match parse_ts(s) {
-        BAD => i64::MAX,
-        t => t,
-    }
+/// Cold path, including dates absent from the manifest cache. Match the
+/// oracle even on non-F1 ingest input: bad syntax sorts after a numeric value.
+#[cold]
+#[inline(never)]
+pub fn parse_ingest(s: &[u8]) -> i128 {
+    let ms = match s.len() {
+        20 if s[4] == b'-' => iso::<false>(s),
+        25 if s[4] == b'-' => iso::<true>(s),
+        _ => return epoch_digits::<true>(s).map_or(i128::MAX, i128::from),
+    };
+    if ms == BAD { i128::MAX } else { i128::from(ms) }
 }
 
-const CLOCK_TEMPLATE: u64 = word(b"T00:00:0");
-const CLOCK_ADD: u64 = word(&[L, D, D, L, D, D, L, D]);
+const HMS_TEMPLATE: u64 = u64::from_be_bytes(*b"00:00:00");
+const HMS_ADD: u64 = u64::from_be_bytes([D, D, L, 0x7F - 5, D, L, 0x7F - 5, D]);
 
-const fn minute_table() -> [i32; 65536] {
-    let mut table = [-1; 65536];
-    let mut hour = 0;
-    while hour < 24 {
-        let mut minute = 0;
-        while minute < 60 {
-            let key = (hour / 10) << 12 | (hour % 10) << 8 | (minute / 10) << 4 | (minute % 10);
-            table[key] = (hour * 3600 + minute * 60) as i32;
-            minute += 1;
-        }
-        hour += 1;
-    }
-    table
+#[inline(always)]
+fn hms_bcd(digits: u64) -> u32 {
+    let pairs = (digits | digits >> 4) & 0x00ff_0000_ff00_00ff;
+    // Gather bytes 6, 3, 0 into 6, 5, 4 (all nine product terms
+    // occupy disjoint bytes). Each pair is still two decimal nibbles.
+    ((pairs.wrapping_mul(0x1_0001_0001) >> 32) as u32) & 0x00ff_ffff
 }
 
-static MINUTES: [i32; 65536] = minute_table();
+#[inline(always)]
+fn clock_ms(digits: u64) -> i64 {
+    let pairs = ((digits >> 8) * 10 + digits) & 0x00ff_0000_ff00_00ff;
+    // Binary H, M and S occupy 24-bit lanes. Convolution with [60, 1]
+    // puts H*60 + M in the high lane; no lower lane can carry into it.
+    let minutes = pairs.wrapping_mul((1 << 24) | 60) >> 48;
+    (minutes * 60_000 + (pairs & 0xff) * 1000) as i64
+}
 
+#[derive(Clone, Copy)]
 struct CivilDay {
     first: u64,
-    last: u16,
-    midnight_seconds: i64,
+    tail_and_rank: u32,
+    midnight: i64,
+}
+
+#[derive(Clone, Copy)]
+pub struct F1Order {
+    pub word: u32,
+    midnight: i64,
+}
+
+impl F1Order {
+    #[inline(always)]
+    fn tod_ms(word: u32) -> i64 {
+        const MASK: u32 = 0x0f0f0f;
+        let pairs = ((word >> 4) & MASK) * 10 + (word & MASK);
+        i64::from((pairs >> 16) * 3_600_000 + ((pairs >> 8) & 0xff) * 60_000 + (pairs & 0xff) * 1000)
+    }
+
+    #[inline(always)]
+    pub fn on_time(self, ts: i64) -> bool {
+        // The UTC midnight partitions the clock comparison: on the same
+        // or an earlier day the ingest cannot be more than 24h after ts.
+        ts >= self.midnight || self.on_time_before_midnight(ts)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn on_time_before_midnight(self, ts: i64) -> bool {
+        let prior_midnight = self.midnight - DAY;
+        // On exactly the next day, compare the two clocks. Convert only
+        // this ingest clock; the event retains its exact millisecond fraction.
+        ts >= prior_midnight && ts - prior_midnight >= Self::tod_ms(self.word)
+    }
 }
 
 /// Immutable exact date lookup derived from the manifest. A miss always
 /// falls back to the complete Gregorian parser, including for ingest claims.
 pub struct ManifestClock {
-    days: [Vec<CivilDay>; 32],
+    days: [CivilDay; 64],
+    first_day: i64,
 }
 
 impl ManifestClock {
     pub fn new(ws: i64, we: i64) -> Self {
-        const DAY: i64 = 86_400_000;
         const LIMIT: i64 = 256;
         let first_valid = days_from_civil(0, 1, 1);
         let last_valid = days_from_civil(9999, 12, 31);
@@ -226,22 +260,25 @@ impl ManifestClock {
             .div_euclid(DAY)
             .clamp(first_valid, last_valid);
         let mut clock = Self {
-            days: std::array::from_fn(|_| Vec::new()),
+            days: [CivilDay {
+                first: 0,
+                tail_and_rank: 0,
+                midnight: 0,
+            }; 64],
+            first_day: lo,
         };
-        // Very wide windows get both ends, with all other dates using fallback.
-        if hi - lo >= LIMIT {
-            for day in lo..lo + LIMIT / 2 {
-                clock.add_day(day);
-            }
-            for day in hi - LIMIT / 2 + 1..=hi {
-                clock.add_day(day);
-            }
-        } else {
-            for day in lo..=hi {
-                clock.add_day(day);
-            }
+        // Cache only an exactly representable prefix for very wide windows.
+        for day in lo..=hi.min(lo + LIMIT - 1) {
+            clock.add_day(day);
         }
         clock
+    }
+
+    #[inline(always)]
+    fn date_slot(tail: u32) -> usize {
+        // Raw ASCII bits, not a decimal conversion. The full date is verified
+        // against the entry, including high bits discarded by this index.
+        (((tail & 3) << 4) | ((tail >> 8) & 15)) as usize
     }
 
     fn add_day(&mut self, day: i64) {
@@ -258,68 +295,53 @@ impl ManifestClock {
         let y = y + i64::from(m <= 2);
         let date = format!("{y:04}-{m:02}-{d:02}");
         let bytes = date.as_bytes();
-        self.days[d as usize].push(CivilDay {
+        let tail = u32::from_le_bytes([bytes[8], bytes[9], b'T', 0]);
+        let slot = &mut self.days[Self::date_slot(tail)];
+        // One candidate is enough: dates with the same day of month may
+        // miss the cache, never alias it. Prefer the later date so cached
+        // window days displace equally numbered days in the padding.
+        *slot = CivilDay {
             first: load8(bytes, 0),
-            last: u16::from_le_bytes([bytes[8], bytes[9]]),
-            midnight_seconds: day * 86_400,
-        });
+            tail_and_rank: tail | (((day - self.first_day) as u32) << 24),
+            midnight: day * DAY,
+        };
     }
 
-    /// `s` has the F1 length and a date separator at byte 4.
-    #[inline]
-    fn f1_seconds(&self, s: &[u8]) -> i64 {
-        let tens = s[8].wrapping_sub(b'0');
-        let ones = s[9].wrapping_sub(b'0');
-        if tens <= 3 && ones <= 9 {
-            let day = usize::from(tens) * 10 + usize::from(ones);
-            if let Some(entries) = self.days.get(day) {
-                let first = load8(s, 0);
-                let last = u16::from_le_bytes([s[8], s[9]]);
-                for entry in entries {
-                    if entry.first == first && entry.last == last {
-                        let t = load8(s, 10) ^ CLOCK_TEMPLATE;
-                        let last_second = s[18].wrapping_sub(b'0');
-                        if !fits(t, CLOCK_ADD) || last_second > 9 || s[19] != b'Z' {
-                            return BAD;
-                        }
-                        let index = ((b(t, 1) as usize) << 12)
-                            | ((b(t, 2) as usize) << 8)
-                            | ((b(t, 4) as usize) << 4)
-                            | b(t, 5) as usize;
-                        let minute_seconds = MINUTES[index];
-                        let seconds = b(t, 7) * 10 + i64::from(last_second);
-                        if minute_seconds < 0 || seconds > 59 {
-                            return BAD;
-                        }
-                        return entry.midnight_seconds + i64::from(minute_seconds) + seconds;
-                    }
-                }
-            }
+    #[inline(always)]
+    fn cached_f1(&self, s: &[u8]) -> Option<(&CivilDay, u64)> {
+        if s.len() != 20 {
+            return None;
         }
-        iso::<false, true>(s)
+        let tail = u32::from_le_bytes(s[8..12].try_into().unwrap());
+        let entry = &self.days[Self::date_slot(tail)];
+        let digits = load8(s, 11).swap_bytes() ^ HMS_TEMPLATE;
+        let mismatch = (load8(s, 0) ^ entry.first) | u64::from((tail ^ entry.tail_and_rank) & 0x00ff_ffff);
+        if (mismatch == 0) & (entry.first != 0) & fits(digits, HMS_ADD) & (digits >> 48 <= 0x0203) & (s[19] == b'Z') {
+            return Some((entry, digits));
+        }
+        None
+    }
+
+    #[inline(always)]
+    pub fn f1_order(&self, s: &[u8]) -> Option<F1Order> {
+        self.cached_f1(s).map(|(entry, digits)| F1Order {
+            word: (entry.tail_and_rank & 0xff00_0000) | hms_bcd(digits),
+            midnight: entry.midnight,
+        })
     }
 
     #[inline]
     pub fn parse_ts(&self, s: &[u8]) -> i64 {
-        if s.len() == 20 && s[4] == b'-' {
-            let seconds = self.f1_seconds(s);
-            return if seconds == BAD { BAD } else { seconds * 1000 };
+        if let Some((entry, digits)) = self.cached_f1(s) {
+            return entry.midnight + clock_ms(digits);
         }
         parse_ts(s)
     }
 
-    /// The F1 path supplies both exact milliseconds for the late check
-    /// and seconds for the compact claim. Non-F1 input still uses the sidecar.
-    #[inline]
-    pub fn ingest_for_claim(&self, s: &[u8]) -> (i64, i64) {
-        if s.len() == 20 && s[4] == b'-' {
-            let seconds = self.f1_seconds(s);
-            if seconds != BAD {
-                return (seconds * 1000, seconds);
-            }
-            return (i64::MAX, BAD);
-        }
-        (parse_ingest(s), BAD)
+    /// Decode on an actual duplicate with an uncached timestamp, not on
+    /// the overwhelmingly more common cached-cached comparison.
+    pub fn order_ms(&self, order: u32) -> i64 {
+        (self.first_day + i64::from(order >> 24)) * DAY + F1Order::tod_ms(order)
     }
 }
 
@@ -410,7 +432,7 @@ mod tests {
 
     fn check(s: &[u8]) {
         assert_eq!(parse_ts(s), want(s), "{:?}", String::from_utf8_lossy(s));
-        let ingest = if want(s) == BAD { i64::MAX } else { want(s) };
+        let ingest = py_parse_ts(s).unwrap_or(i128::MAX);
         assert_eq!(parse_ingest(s), ingest, "ingest {:?}", String::from_utf8_lossy(s));
     }
 
@@ -438,24 +460,21 @@ mod tests {
 
     fn check_clock(clock: &ManifestClock, s: &[u8]) {
         let ms = want(s);
-        let seconds = if ms != BAD && s.len() == 20 && s[4] == b'-' {
-            ms / 1000
-        } else {
-            BAD
-        };
         assert_eq!(clock.parse_ts(s), ms, "{s:?}");
-        assert_eq!(
-            clock.ingest_for_claim(s),
-            (if ms == BAD { i64::MAX } else { ms }, seconds),
-            "{s:?}"
-        );
+        if let Some(hit) = clock.f1_order(s) {
+            assert_eq!(clock.order_ms(hit.word), ms, "{s:?}");
+            for d in [-DAY - 1, -DAY, -DAY + 1, -1, 0, 1, DAY] {
+                assert_eq!(hit.on_time(ms + d), d >= -DAY, "{s:?}, {d}");
+            }
+        } else {
+            assert_eq!(parse_ingest(s), py_parse_ts(s).unwrap_or(i128::MAX), "{s:?}");
+        }
     }
 
     #[test]
     fn clock_validates_every_second_and_byte_of_cached_dates() {
-        let clock = ManifestClock::new(parse_ts(b"2028-01-20T00:00:00Z"), parse_ts(b"2028-04-10T00:00:00Z"));
         // Same day number but distinct YYYY-MM prefixes, including a miss.
-        assert!(clock.days[1].len() >= 3);
+        let wide = ManifestClock::new(parse_ts(b"2028-01-20T00:00:00Z"), parse_ts(b"2028-04-10T00:00:00Z"));
         for s in [
             "2028-01-01T05:06:07Z",
             "2028-02-01T05:06:07Z",
@@ -466,9 +485,14 @@ mod tests {
             "00000001791071890001",
             "2028-02-29T23:59:59-23:59",
         ] {
-            check_clock(&clock, s.as_bytes());
+            check_clock(&wide, s.as_bytes());
         }
+        let clock = ManifestClock::new(parse_ts(b"2028-02-27T00:00:00Z"), parse_ts(b"2028-03-04T00:00:00Z"));
+        let mut empty_cache_slot = [0; 20];
+        empty_cache_slot[11..].copy_from_slice(b"00:00:00Z");
+        check_clock(&clock, &empty_cache_slot);
         for base in [*b"2028-02-29T12:34:56Z", *b"2028-03-01T00:00:00Z"] {
+            assert!(clock.f1_order(&base).is_some());
             for pos in 0..base.len() {
                 for byte in 0..=255 {
                     let mut input = base;
@@ -477,6 +501,7 @@ mod tests {
                 }
             }
         }
+        let mut prev = clock.f1_order(b"2028-02-28T23:59:59Z").unwrap().word;
         for second in 0..86_400 {
             let s = format!(
                 "2028-02-29T{:02}:{:02}:{:02}Z",
@@ -485,7 +510,11 @@ mod tests {
                 second % 60
             );
             check_clock(&clock, s.as_bytes());
+            let current = clock.f1_order(s.as_bytes()).unwrap().word;
+            assert!(current > prev, "{s}");
+            prev = current;
         }
+        assert!(clock.f1_order(b"2028-03-01T00:00:00Z").unwrap().word > prev);
     }
 
     #[test]
@@ -496,15 +525,12 @@ mod tests {
             (parse_ts(b"1969-12-30T00:00:00Z"), parse_ts(b"1970-01-02T00:00:00Z")),
         ] {
             let clock = ManifestClock::new(ws, we);
-            assert!(clock.days.iter().map(Vec::len).sum::<usize>() <= 256);
-            for entries in &clock.days {
-                for entry in entries {
-                    let mut s = *b"0000-00-00T00:00:00Z";
-                    s[..8].copy_from_slice(&entry.first.to_le_bytes());
-                    s[8..10].copy_from_slice(&entry.last.to_le_bytes());
-                    assert_eq!(entry.midnight_seconds * 1000, want(&s), "{s:?}");
-                    check_clock(&clock, &s);
-                }
+            for entry in clock.days.iter().filter(|entry| entry.first != 0) {
+                let mut s = *b"0000-00-00T00:00:00Z";
+                s[..8].copy_from_slice(&entry.first.to_le_bytes());
+                s[8..11].copy_from_slice(&entry.tail_and_rank.to_le_bytes()[..3]);
+                assert_eq!(entry.midnight, want(&s), "{s:?}");
+                check_clock(&clock, &s);
             }
             for s in [
                 "0000-02-29T23:59:59Z",

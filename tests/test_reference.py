@@ -90,6 +90,38 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_late_boundary_mixed_utc_forms_and_exact_ingest_order(self):
+        t = "2028-02-29T23:59:59Z"
+        ingest = "2028-03-01T23:59:59Z"
+        ts_ms = ms(t)
+        ingest_ms = ms(ingest)
+        events = [
+            ev("f1", "f1", t, ingest=ingest),
+            ev("f2", "f2", "2028-03-01T00:59:59+01:00", ingest=ingest),
+            ev("f3", "f3", str(ts_ms + 1), ingest=ingest),
+            ev("over", "over", str(ts_ms - 1), ingest=ingest),
+            ev("before", "before", t, ingest="1969-12-31T23:59:59Z"),
+            ev("roll", "roll", "2028-03-01T00:00:00Z", ingest=ingest),
+            ev("nday", "nday", t, ingest="2028-03-02T00:00:00Z"),
+            ev("early", "loser", t, ingest=ingest),
+            ev("later", "later", t, ingest=ingest),
+            ev("invalid", "valid", t, ingest=ingest),
+            ev("far", "near", t, ingest=ingest),
+        ]
+        copies = [
+            ev("early", "", t, ingest=str(ingest_ms - 1)),
+            ev("later", "", t, ingest=str(ingest_ms + 1)),
+            ev("invalid", "", t, ingest="2028-03-01T23:59:60Z"),
+            ev("far", "", t, ingest="9223372036854775808"),
+        ]
+        users, _ = run_case(events, extra={"events/part-1.csv": copies},
+                            window=("2028-02-28T00:00:00Z", "2028-03-03T00:00:00Z"))
+        self.assertEqual(set(users), {
+            ("f1", "2028-02-29"), ("f2", "2028-02-29"), ("f3", "2028-02-29"),
+            ("before", "2028-02-29"), ("roll", "2028-03-01"),
+            ("later", "2028-02-29"), ("valid", "2028-02-29"), ("near", "2028-02-29"),
+        })
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"

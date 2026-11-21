@@ -18,24 +18,12 @@ const KEY_BITS: u32 = u64::BITS - NS.trailing_zeros();
 const KEY_MASK: u64 = (1 << KEY_BITS) - 1;
 const TARGET_HI_BITS: u32 = 32 - NS.trailing_zeros();
 const TARGET_HI_MASK: u64 = (1 << TARGET_HI_BITS) - 1;
-// Signed 39-bit seconds cover every four-digit F1 year. In the 40-bit field,
-// the two high bits are 00/11 for seconds and 01 for a side-table index.
-const SPILL_TAG: u64 = 1 << 38;
+// The 40-bit field holds the sortable day-rank/BCD word or a tagged
+// index into this chunk's exact, uncached ingest times.
+const SPILL_TAG: u64 = 1 << 39;
 const _: () = assert!(std::mem::size_of::<Claim>() == 16 && ((CHUNK / 6 + 1) as u64) < SPILL_TAG);
 
 impl Claim {
-    #[inline]
-    fn order(ingest: i64, seconds: i64, spill: &mut Vec<i64>) -> u64 {
-        if seconds != BAD {
-            debug_assert!((-(SPILL_TAG as i64)..SPILL_TAG as i64).contains(&seconds));
-            seconds as u64
-        } else {
-            let i = spill.len() as u64;
-            spill.push(ingest);
-            SPILL_TAG | i
-        }
-    }
-
     #[inline]
     fn new(mixed: u64, target: u32, order: u64) -> Self {
         Self {
@@ -55,13 +43,30 @@ impl Claim {
     }
 
     #[inline]
-    fn ingest(self, spill: &[i64]) -> i64 {
-        let order = (self.order_and_target as i64) >> TARGET_HI_BITS;
-        if order >= SPILL_TAG as i64 {
-            spill[(order as u64 ^ SPILL_TAG) as usize]
-        } else {
-            order * 1000
-        }
+    fn order(self) -> u64 {
+        self.order_and_target >> TARGET_HI_BITS
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn spill_ingest(s: &[u8], spill: &mut Vec<i128>, ts: i64, in_window: bool) -> (u64, bool) {
+    let ingest = ts::parse_ingest(s);
+    let index = spill.len();
+    spill.push(ingest);
+    (
+        SPILL_TAG | index as u64,
+        in_window && ingest <= i128::from(ts) + i128::from(DAY),
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn order_ms(order: u64, spill: &[i128], clock: &ManifestClock) -> i128 {
+    if order >= SPILL_TAG {
+        spill[(order ^ SPILL_TAG) as usize]
+    } else {
+        i128::from(clock.order_ms(order as u32))
     }
 }
 
@@ -110,7 +115,7 @@ fn parse<'a>(
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
-) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
+) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i128>) {
     let (ws, we, clock) = window;
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Payload> = (0..NS)
@@ -148,15 +153,20 @@ fn parse<'a>(
             return;
         }
         let claim_key = links::mix(people.codec.key(r[0]));
-        let (ingest, seconds) = clock.ingest_for_claim(r[3]);
         let ts = clock.parse_ts(r[2]);
+        let in_window = (ws..we).contains(&ts);
+        let (claim_order, on_time) = if let Some(ingest) = clock.f1_order(r[3]) {
+            (u64::from(ingest.word), in_window && ingest.on_time(ts))
+        } else {
+            spill_ingest(r[3], &mut spill, ts, in_window)
+        };
         let mut next = Pending {
             claim_key,
             ts,
-            claim_order: Claim::order(ingest, seconds, &mut spill),
+            claim_order,
             ..Default::default()
         };
-        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
+        if on_time && !r[1].is_empty() && !r[5].is_empty() {
             let purchase = match r[4] {
                 b"purchase" => parse_price(r[6]),
                 b"view" | b"cart" => Some(0),
@@ -218,7 +228,7 @@ fn prefetch(bloom: &[(u64, u64)], c: Claim, mask: usize) {
     let _ = ptr;
 }
 
-fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location> {
+fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i128>], clock: &ManifestClock) -> Vec<Location> {
     let n: usize = parts.iter().map(|(_, v)| v.len()).sum();
     // Local blocked Bloom: the second occurrence of any ID necessarily finds
     // both bits already set and marks it suspect. False positives go to an
@@ -260,18 +270,20 @@ fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location>
                 batch,
                 target: c.target(),
             };
-            let ingest = c.ingest(&spills[batch]);
+            let order = c.order();
             let lost = match best.entry(c.key()) {
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((ingest, loc));
+                    e.insert((order, loc));
                     continue;
                 }
                 std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if ingest < e.get().0 {
-                        e.insert((ingest, loc)).1
+                    let &(prev_order, ref prev_loc): &(u64, Location) = e.get();
+                    let earlier = if (order | prev_order) < SPILL_TAG {
+                        order < prev_order
                     } else {
-                        loc
-                    }
+                        order_ms(order, &spills[batch], clock) < order_ms(prev_order, &spills[prev_loc.batch], clock)
+                    };
+                    if earlier { e.insert((order, loc)).1 } else { loc }
                 }
             };
             if lost.target != NONE {
@@ -307,7 +319,10 @@ pub(super) fn by_person<'a>(
             }
         }
     }
-    let removals: Vec<_> = claims.into_par_iter().map(|parts| losers(parts, &spills)).collect();
+    let removals: Vec<_> = claims
+        .into_par_iter()
+        .map(|parts| losers(parts, &spills, window.2))
+        .collect();
     let mut by_batch: Vec<Vec<u32>> = (0..payloads.len()).map(|_| Vec::new()).collect();
     for locations in removals {
         for loc in locations {
@@ -346,15 +361,21 @@ mod tests {
 
     #[test]
     fn bloom_alias_keeps_distinct_id_and_invalid_winner_kills_valid_loser() {
+        let clock = ManifestClock::new(0, DAY);
         // Same shard, probe, and exact-table fingerprint, but distinct keys.
         let id = 13 | (217 << KEY_BITS);
         let alias = id ^ (1 << 24);
-        let later = Claim::new(id, 0, 3);
-        let distinct = Claim::new(alias, 1, 4);
+        let late = clock.f1_order(b"1970-01-01T00:00:03Z").unwrap();
+        let later = Claim::new(id, 0, u64::from(late.word));
+        let distinct = Claim::new(alias, 1, u64::from(late.word));
         assert_eq!(probe(later, 1023), probe(distinct, 1023));
         let mut spill = Vec::new();
-        let invalid = Claim::new(id, NONE, Claim::order(1234, BAD, &mut spill));
-        let lost = losers(vec![(0, vec![later, distinct]), (1, vec![invalid])], &[vec![], spill]);
+        let invalid = Claim::new(id, NONE, spill_ingest(b"1234", &mut spill, 0, false).0);
+        let lost = losers(
+            vec![(0, vec![later, distinct]), (1, vec![invalid])],
+            &[vec![], spill],
+            &clock,
+        );
         assert_eq!(lost.len(), 1);
         assert_eq!((lost[0].batch, lost[0].target), (0, 0));
     }
@@ -375,11 +396,16 @@ mod tests {
                     b"2000-02-29T00:00:00+00:00",
                     b"2000-02-29T00:00:60Z",
                     b"9999-12-31T23:59:60Z",
+                    b"9223372036854775807",
+                    b"9223372036854775808",
+                    b"000100000000000000000000",
                     b"not a timestamp",
                 ] {
-                    let (ms, secs) = clock.ingest_for_claim(s);
-                    let claim = Claim::new(mixed, target, Claim::order(ms, secs, &mut spill));
-                    assert_eq!(claim.ingest(&spill), ts::parse_ingest(s));
+                    let order = clock
+                        .f1_order(s)
+                        .map_or_else(|| spill_ingest(s, &mut spill, 0, false).0, |hit| u64::from(hit.word));
+                    let claim = Claim::new(mixed, target, order);
+                    assert_eq!(order_ms(claim.order(), &spill, &clock), ts::parse_ingest(s));
                     assert_eq!(claim.target(), target);
                     let reconstructed = claim.key() | ((mixed >> KEY_BITS) << KEY_BITS);
                     assert_eq!(id, codec.bytes(links::unmix(reconstructed), &mut [0; 9]));
