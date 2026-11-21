@@ -33,6 +33,7 @@ def main():
         p.add_argument(arg, type=lambda v: Path(v).resolve(strict=True))
     p.add_argument("--runs", type=int, default=5)
     p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--candidate-threads", type=int, help="override worker count for a pool-size experiment")
     p.add_argument("--no-warmup", action="store_true")
     p.add_argument("--json", type=Path)
     p.add_argument("--tmpdir", type=Path)
@@ -41,7 +42,8 @@ def main():
         p.add_argument(f"--{side}-env", metavar="NAME=VALUE", action="append", default=[],
                        help=f"Override an environment variable for the {side} process only")
     args = p.parse_args()
-    if min(args.threads, args.runs) < 1:
+    threads = [args.threads, args.threads if args.candidate_threads is None else args.candidate_threads]
+    if min(*threads, args.runs) < 1:
         p.error("runs and threads must be positive")
     bins = [args.baseline, args.candidate]
     try:
@@ -50,13 +52,13 @@ def main():
     except ValueError:
         p.error("environment overrides must use NAME=VALUE")
     if not args.no_warmup:
-        for b, env in zip(bins, envs):
-            measure(b, args.data, args.threads, args.tmpdir, env)
+        for b, t, env in zip(bins, threads, envs):
+            measure(b, args.data, t, args.tmpdir, env)
     pairs = []
     for i in range(args.runs):
         pair = [None, None]
         for j in ([0, 1] if i % 2 == 0 else [1, 0]):
-            pair[j] = measure(bins[j], args.data, args.threads, args.tmpdir, envs[j])
+            pair[j] = measure(bins[j], args.data, threads[j], args.tmpdir, envs[j])
         pairs.append(pair)
         print(f"pair {i+1}: baseline {pair[0]['seconds']:.3f} s, candidate {pair[1]['seconds']:.3f} s",
               flush=True)
@@ -75,7 +77,7 @@ def main():
             print(label, ", ".join(f"{k}: {statistics.median(v):.3f} s" for k, v in phases.items()))
     if args.json:
         args.json.write_text(json.dumps(dict(baseline=str(bins[0]), candidate=str(bins[1]),
-                                             data=str(args.data), threads=args.threads, pairs=pairs,
+                                             data=str(args.data), threads=threads, pairs=pairs,
                                              medians=[base, test], environments=envs), indent=2) + "\n")
 
 

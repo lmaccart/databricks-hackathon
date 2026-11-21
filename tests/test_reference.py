@@ -168,6 +168,10 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_no_survivors_still_writes_both_empty_tables(self):
+        u, c = run_case(events=[ev("e", "", WS)], clicks=[f"k,u,c_1,{WS}"])
+        self.assertEqual((u, c), ({}, {}))
+
     def test_long_digit_fields(self):
         zeros = "0" * 5000
         huge = "9" * 5000

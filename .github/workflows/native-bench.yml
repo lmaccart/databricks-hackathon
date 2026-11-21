@@ -1,6 +1,11 @@
 name: Native amd64 performance check
 on:
   workflow_dispatch:
+    inputs:
+      extended:
+        description: Also measure allocator and whole-binary ISA experiments
+        type: boolean
+        default: false
   push:
     branches: [bench/native-amd64]
 
@@ -67,6 +72,7 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Compare default allocator and mimalloc on the identical binary
+        if: ${{ inputs.extended }}
         shell: bash
         run: |
           set -euo pipefail
@@ -85,6 +91,7 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Compare a guarded x86 feature build with the portable binary
+        if: ${{ inputs.extended }}
         shell: bash
         run: |
           set -euo pipefail
@@ -105,5 +112,17 @@ jobs:
             echo '```'
             python3 tools/bench_pair.py "$SS_EXEC_DIR/base" "$SS_EXEC_DIR/dispatch" "$RUNNER_TEMP/practice" \
               --threads "$t" --tmpdir "$RUNNER_TEMP"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Compare one versus two workers per available logical CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          t=$(nproc); if (( t > 8 )); then t=8; fi
+          {
+            echo "### Pool size only: $t vs $((2*t)) workers"
+            echo '```'
+            python3 tools/bench_pair.py "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/practice" \
+              --threads "$t" --candidate-threads "$((2*t))" --tmpdir "$RUNNER_TEMP"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"

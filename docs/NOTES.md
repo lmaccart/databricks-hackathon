@@ -9,8 +9,18 @@ Scored baseline `cc9f33e` vs the SIMD/direct-routing/typed-writer candidate (`3f
 | M2 Pro, 8 workers, 20M seed 7 | 2.339 s | 0.833 s | 2.81× |
 | M2 Pro, 8 workers, 20M seed 15 (leap day) | 2.329 s | 0.773 s | 3.01× |
 | [Native Linux Intel Xeon 6975P-C](https://github.com/lmaccart/databricks-hackathon/actions/runs/44865536651), 4 workers, 20M seed 7 | 6.112 s | 2.078 s | 2.94× |
+| [Native Linux AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44865758103), 4 workers, 20M seed 7 | 7.708 s | 2.635 s | 2.93× |
 
 Medians of five warm, alternating-order process pairs. Mac used the equivalent rustfmt/lint cleanup build. These are end-to-end **local/CI** measurements, not hidden practice results. Rows in each table are compared by key, not by Parquet file bytes.
+
+Mac raw samples in run order, seconds:
+
+| Seed | Baseline | Candidate |
+|---|---|---|
+| 7 | 2.694, 2.271, 2.300, 2.339, 2.349 | 0.847, 0.905, 0.833, 0.780, 0.791 |
+| 15 | 2.381, 2.177, 2.329, 2.391, 2.226 | 0.688, 0.698, 0.916, 0.816, 0.773 |
+
+Seed 7 candidate median phase increments: setup/links 0.042 s, event parse and routing 0.304 s, exact duplicate resolution 0.064 s, click routing 0.075 s, gather/sort/session/attribution 0.189 s, merge and write 0.108 s, residual startup/exit 0.041 s. Per-phase medians need not add to the total median. The old full-record event dedup phase alone took a median of 0.651 s in the same pairs.
 
 The rebuilt binary repeated all **60 official-generator comparisons** against the Python oracle (20 seeds each at 10k, 100k, and 1M). All matched. Native final-scale exact diff and Docker dev/practice checks are detailed below.
 
@@ -40,6 +50,8 @@ The explicit prefetch hint dereferences no input and is issued only for an in-bo
 **Native Linux check, not Rosetta:** [GitHub Actions run 44864533547](https://github.com/lmaccart/databricks-hackathon/actions/runs/44864533547) used four workers on an Intel Xeon 6975P-C. `cc9f33e`: **6.385 s**; the rebuilt writer/prefetch checkpoint (`d2cd1b6`): **2.876 s**, or **2.22×** faster. All five candidate runs were 2.843–2.922 s, and the exact dev check passed. The harness times process start to exit on the runner, not an official eight-hyperthread container.
 
 **Allocator control:** identical amd64 executable under Rosetta, glibc vs Debian mimalloc: 3.534 vs 2.605 s across five interleaved full Docker runs. But on [native Intel](https://github.com/lmaccart/databricks-hackathon/actions/runs/44864914334), the identical-binary medians were 2.795 vs 2.721 s, only **2.6%**. No mimalloc dependency or preload in the submitted image. An emulation-only improvement is not enough.
+
+**Whole-binary CPU multiversioning:** on the EPYC runner, building the application and all dependencies for SSE4.2/POPCNT/AVX2/BMI1/BMI2/AES behind a baseline feature-detecting launcher gave 2.554 vs 2.616 s (2.4%). Exact dev results, but below cutoff. Production ships the single portable binary with runtime SIMD selection inside the parser; the dispatch launcher is for the manual CI experiment only.
 
 **Rebuilt candidate `3f1d667`:** restricted amd64 Docker build 59.61 s; dev matches both official tables. On 20M seed 7, the full starter invocation took 3.38 s under emulation and matched every reference-checkpoint row (2,242,393 user-days / 28,014 campaign-days), with zero stdout. On native 60M seed 13, the same click/event data path finished in **7.88 s** with **9.25 GiB** max RSS in one capacity run (other work on the host). Both tables matched the scored implementation **row-for-row**, including 6,587,957 distinct user-days; the separate global self-check passed. These are not hidden scorer times.
 
@@ -99,9 +111,9 @@ Interpret the phase labels carefully: “sessions” includes copying from the d
 
 **Practice-size Docker cross-check:** the final, emulated amd64 image processed seed 7 (20M events + 5M clicks) in 4.60 s for the complete starter shell invocation, 4.129 s to the binary's `written` log. Empty stdout; 2,242,393 unique user-days and 28,014 unique campaign-days; schema, keys and sums passed. This is a single local measurement, not the native five-run median or a practice submission.
 
-## Latency experiments to run in order
+## Original review: hypotheses before the rebuild
 
-These are code-review findings, not measured speedups. The current entry retains the validated sessionization, duplicate selection, byte ordering and attribution algorithms. Run `tools/bench.py` on the same official 20M input for both builds; compare five-run medians, dev answer, and peak memory at 60M. Measure start-to-exit, since moving work between phases can look like an improvement in one log line.
+These were hypotheses for the scored v1, not measured speedups. The controlled experiments at the top of this document record which ideas survived. Measure start-to-exit, since moving work between phases can look like an improvement in one log line.
 
 | Priority | Where | Change to isolate and why |
 |---|---|---|
