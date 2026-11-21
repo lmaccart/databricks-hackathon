@@ -1,6 +1,6 @@
 //! Build the canonical-name lookup in parallel, including transitive paths
 //! that span input files. Canonical node indexes also serve as exact sort ranks.
-use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows};
+use super::{Chunk, Codec, NS, SHARD_SHIFT, csv};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -136,12 +136,12 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         .map(|c| {
             let mut edges = Vec::new();
             let mut keys: Vec<Vec<u64>> = (0..LANES).map(|_| Vec::new()).collect();
-            for_rows(c, |r| {
+            csv::for_id_rows!(c, |r, mode| {
                 if r[0].is_empty() || r[1].is_empty() {
                     return;
                 }
-                let a = codec.key(r[0]);
-                let b = codec.key(r[1]);
+                let a = codec.key(mode, r[0]);
+                let b = codec.key(mode, r[1]);
                 edges.push((a, b));
                 for k in [a, b] {
                     keys[mix(k) as usize & (LANES - 1)].push(k);

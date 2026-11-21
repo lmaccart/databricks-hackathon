@@ -229,6 +229,39 @@ class CsvDialect(unittest.TestCase):
                          (1, 3, 1200))
 
 
+class OpaqueCodec(unittest.TestCase):
+    def test_codec_widths_in_dedup_links_click_ties_and_output(self):
+        t = "2026-10-02T12:00:00Z"
+        day = "2026-10-02"
+        alias = "z\0é-very-long-alias"
+        u, c = run_case(
+            events=[
+                ev("event008", alias, t, "purchase", price="17"),
+                ev('"event008"', "discard", t, "purchase", price="999",
+                   ingest="2026-10-02T12:00:01Z"),
+                ev("event008\0", alias, t),
+                ev("Event008", alias, t),
+                ev("event0089", "aBcDeFg", t),
+                ev("event0090", "aBcDeFghi", t),
+                ev("event0091", "aBcDeFgh\0", t),
+            ],
+            links=[f'"{alias}",aBcDeFgh', "aBcDeFgh,álias"],
+            clicks=[
+                f'Click008,álias,c_1,{t}',
+                f'Click008\0,"{alias}",c_2,{t}',
+                f'Click0089,aBcDeFgh,c_3,{t}',
+            ],
+        )
+        self.assertEqual({k: row["events"] for k, row in u.items()}, {
+            ("aBcDeFg", day): 1, ("aBcDeFgh", day): 3,
+            ("aBcDeFgh\0", day): 1, ("aBcDeFghi", day): 1,
+        })
+        self.assertEqual(u["aBcDeFgh", day]["revenue_cents"], 17)
+        self.assertEqual(c["c_1", day]["revenue_cents"], 17)
+        self.assertEqual([c[f"c_{i}", day]["assisted_sessions"] for i in (1, 2, 3)], [1, 1, 1])
+        self.assertEqual(c["organic", day]["sessions"], 3)
+
+
 class EventsOrder(unittest.TestCase):
     def test_line_wider_than_a_parse_chunk_does_not_shift_duplicate_targets(self):
         t = "2026-10-02T12:00:00Z"

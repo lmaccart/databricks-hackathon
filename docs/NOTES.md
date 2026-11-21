@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Runtime BMI2 ID codec experiment — 2026-11-21
+
+The existing nine 7-bit lanes, right zero padding, and spill tag are bit-for-bit unchanged. The AVX2 CSV dispatcher selects a specialized PEXT kernel once per event, click or link chunk; output selects PDEP once before writing user parts. AMD before family 19h (Zen 3), Hygon and unrecognized vendors use SWAR even if BMI2 is advertised. Short IDs use only in-bounds word loads or direct byte shifts. No process-wide ISA flags.
+
+ARM release tests and Clippy passed; both implementations passed 39 edge cases and all 36 official fixtures. Ten dirty seeds and the official dev output matched (117,038 user rows and 27,400 campaign rows). Official Rust 1.100 checked Linux/amd64 including tests; the emitted assembly contains PEXT directly in each of the three AVX2 chunk loops and PDEP in the output loop. The x86 Darwin suite passed under Rosetta, which does not advertise BMI2 here. Native x86 instruction parity and the 20M paired timing are pending the existing `native-bench.yml` challenge run after publication.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

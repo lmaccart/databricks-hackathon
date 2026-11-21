@@ -143,11 +143,11 @@ fn parse<'a>(
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
-    for_rows(c, |r| {
+    csv::for_id_rows!(c, |r, mode| {
         if r[0].is_empty() {
             return;
         }
-        let claim_key = links::mix(people.codec.key(r[0]));
+        let claim_key = links::mix(people.codec.key(mode, r[0]));
         let (ingest, seconds) = clock.ingest_for_claim(r[3]);
         let ts = clock.parse_ts(r[2]);
         let mut next = Pending {
@@ -168,7 +168,7 @@ fn parse<'a>(
                 } else {
                     sm.product_cat.get(r[5]).unwrap_or(sm.unknown_cat)
                 };
-                next.uid = people.codec.key(r[1]);
+                next.uid = people.codec.key(mode, r[1]);
                 next.hash = links::mix(next.uid);
                 people.prefetch(next.hash);
                 next.price = price;
@@ -365,7 +365,7 @@ mod tests {
         let mut spill = Vec::new();
         for id in [b"e1".as_slice(), b"e1\0", b"e123456789", "é".as_bytes()] {
             let codec = Codec::new();
-            let mixed = links::mix(codec.key(id));
+            let mixed = links::mix(codec.key(person::IdMode::SCALAR, id));
             for target in [0, 255, 256, 0x5555_aaaa, NONE] {
                 for s in [
                     b"0000-01-01T00:00:00Z".as_slice(),

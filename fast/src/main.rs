@@ -25,7 +25,7 @@ mod output;
 mod person;
 mod stream;
 use links::{Identity, People, person_names};
-use person::Codec;
+use person::{Codec, IdMode};
 use stream::{Packing, Payload, Stream, Temporal};
 
 const DAY: i64 = 86_400_000;
@@ -259,7 +259,7 @@ fn parse_clicks<'a>(
     };
     let mut ring = [PendingClick::default(); 16];
     let mut n = 0usize;
-    for_rows(c, |r| {
+    csv::for_id_rows!(c, |r, mode| {
         // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
         let (cid, uid, camp) = (r[0], r[1], r[2]);
         if cid.is_empty() || uid.is_empty() {
@@ -270,7 +270,7 @@ fn parse_clicks<'a>(
         if ts == BAD || ts < lo || ts >= we {
             return;
         }
-        let key = names.codec.key(uid);
+        let key = names.codec.key(mode, uid);
         let hash = links::mix(key);
         names.prefetch(hash);
         let i = n % ring.len();
@@ -281,7 +281,7 @@ fn parse_clicks<'a>(
             uid: key,
             hash,
             ts,
-            cid: names.codec.key(cid),
+            cid: names.codec.key(mode, cid),
             camp: ci,
         };
         n += 1;
@@ -622,13 +622,11 @@ fn main() {
     rayon::join(
         || output::campaign_daily(&cd.join("part-0.parquet"), &camp_rows),
         || {
-            output::user_daily(
-                &ud,
-                &shards,
-                parts,
-                &|p, out| out.extend_from_slice(names.codec.bytes(links::unmix(p), &mut [0; 9])),
-                &sm.cat_names,
-            )
+            #[cfg(target_arch = "x86_64")]
+            if let Some(mode) = IdMode::detect() {
+                return output::user_daily(&ud, &shards, parts, &names.codec, mode, &sm.cat_names);
+            }
+            output::user_daily(&ud, &shards, parts, &names.codec, IdMode::SCALAR, &sm.cat_names);
         },
     );
     log("written");

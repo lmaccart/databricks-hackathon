@@ -10,6 +10,8 @@
 //! Every string is checked to be UTF-8 before it reaches a page; NUL bytes
 //! and non-ASCII text are legal and byte-exact.
 use crate::UserRow;
+use crate::links::unmix;
+use crate::person::{Codec, IdMode};
 use bytes::Bytes;
 use parquet::basic::{ConvertedType, LogicalType, Repetition, Type as Physical};
 use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
@@ -147,12 +149,12 @@ fn file(path: &Path, schema: TypePtr) -> SerializedFileWriter<File> {
 }
 
 /// `user_daily`: shards are grouped into at most `parts` files, one thread each.
-/// `key` appends a person's name (byte-wise smallest of their IDs).
-pub fn user_daily(
+pub fn user_daily<const BMI2: bool>(
     dir: &Path,
     shards: &[&[UserRow]],
     parts: usize,
-    key: &(impl Fn(u64, &mut Vec<u8>) + Sync),
+    codec: &Codec<'_>,
+    mode: IdMode<BMI2>,
     cats: &[Vec<u8>],
 ) {
     let per = shards.len().div_ceil(parts.max(1)).max(1);
@@ -181,7 +183,7 @@ pub fn user_daily(
             let mut rg = w.next_row_group().expect("row group");
             let mut c = next(&mut rg);
             strings(&mut c, rows(), false, |r, out| {
-                key(r.person, out);
+                out.extend_from_slice(codec.bytes_with(mode, unmix(r.person), &mut [0; 9]));
                 true
             });
             close(c);

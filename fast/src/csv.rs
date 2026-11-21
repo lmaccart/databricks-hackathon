@@ -91,21 +91,64 @@ fn slots(c: &Chunk) -> Vec<u8> {
 /// Call f with the selected columns of every well-formed line of a chunk.
 #[inline]
 pub fn for_rows<'a>(c: &Chunk<'a>, mut f: impl FnMut(&[&'a [u8]; 8])) {
-    let slot = slots(c);
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: the CPU supports AVX2.
-            return unsafe { scan_avx2(c.data, &slot, &mut f) };
+            return unsafe { for_rows_avx2(c, &mut f) };
         }
     }
-    scan::<Native, _>(c.data, &slot, &mut f);
+    for_rows_native(c, &mut f);
+}
+
+#[inline]
+pub(crate) fn for_rows_native<'a>(c: &Chunk<'a>, f: &mut impl FnMut(&[&'a [u8]; 8])) {
+    scan::<Native, _>(c.data, &slots(c), f);
+}
+
+/// Specialize the ID-encoding callback once per chunk. The uncommon BMI2
+/// without usable AVX2 combination uses the regular scanner and scalar codec.
+macro_rules! for_id_rows {
+    ($chunk:expr, |$row:ident, $mode:ident| $body:block) => {{
+        let chunk = $chunk;
+        #[cfg(target_arch = "x86_64")]
+        let handled = if std::arch::is_x86_feature_detected!("avx2") {
+            if let Some($mode) = $crate::person::IdMode::detect() {
+                let mut row = $crate::csv::row_callback(chunk, |$row| $body);
+                // SAFETY: AVX2 was checked above.
+                unsafe { $crate::csv::for_rows_avx2(chunk, &mut row) };
+            } else {
+                let $mode = $crate::person::IdMode::SCALAR;
+                let mut row = $crate::csv::row_callback(chunk, |$row| $body);
+                // SAFETY: AVX2 was checked above.
+                unsafe { $crate::csv::for_rows_avx2(chunk, &mut row) };
+            }
+            true
+        } else {
+            false
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let handled = false;
+        if !handled {
+            let $mode = $crate::person::IdMode::SCALAR;
+            $crate::csv::for_rows_native(chunk, &mut |$row| $body);
+        }
+    }};
+}
+pub(crate) use for_id_rows;
+
+// Type the macro's callback outside the unsafe AVX2 call, so caller code
+// never gets an implicit unsafe scope and the fields borrow from the chunk.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn row_callback<'a, F: FnMut(&[&'a [u8]; 8])>(_: &Chunk<'a>, f: F) -> F {
+    f
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn scan_avx2<'a, F: FnMut(&[&'a [u8]; 8])>(data: &'a [u8], slot: &[u8], f: &mut F) {
-    scan::<Avx2, F>(data, slot, f);
+pub(crate) unsafe fn for_rows_avx2<'a, F: FnMut(&[&'a [u8]; 8])>(c: &Chunk<'a>, f: &mut F) {
+    scan::<Avx2, F>(c.data, &slots(c), f);
 }
 
 /// The row state machine. Every structural byte is consumed exactly once, so a
@@ -297,7 +340,7 @@ impl Classify for Sse2 {
     }
 }
 
-/// Only reached through `scan_avx2`, after runtime detection.
+/// Only reached through `for_rows_avx2`, after runtime detection.
 #[cfg(target_arch = "x86_64")]
 struct Avx2;
 
@@ -443,7 +486,7 @@ mod tests {
                 1 => scan::<Swar, _>(c.data, &slot, &mut f),
                 2 => scan::<Native, _>(c.data, &slot, &mut f),
                 #[cfg(target_arch = "x86_64")]
-                3 => unsafe { scan_avx2(c.data, &slot, &mut f) },
+                3 => unsafe { for_rows_avx2(&c, &mut f) },
                 _ => unreachable!(),
             }
         }
