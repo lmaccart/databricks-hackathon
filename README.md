@@ -25,7 +25,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install pyarrow polars
 for name in starter-duckdb generator dev-answer; do unzip -qo "fromsite/$name.zip" -d vendor; done
-make test test-bin diff fixtures
+make test test-rust test-bin diff fixtures
 make dev
 DATA_DIR=vendor/dev OUTPUT_DIR=out RAYON_NUM_THREADS=8 fast/target/release/shopping_sessions
 make check-dev OUT=out

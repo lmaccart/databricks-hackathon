@@ -24,7 +24,7 @@ GENERATOR = ROOT / "vendor/generator/target/release/generate"
 BINARY = ROOT / "fast/target/release/shopping_sessions"
 
 
-def compare(seed, events, base):
+def compare(seed, events, base, binary):
     case = Path(tempfile.mkdtemp(prefix=f"s{seed}-e{events}-", dir=base))
     data, ref, fast, scratch = (case / p for p in ("data", "ref", "fast", "scratch"))
     clicks = events // 4  # Same ratio as the starter's check-dev.
@@ -46,7 +46,7 @@ def compare(seed, events, base):
             if seed == 15 and not leap:
                 raise ValueError("Seed 15 no longer covers leap day; check generator version")
             run(PYTHON, ROOT / "reference/pipeline.py", data, ref)
-            run(BINARY)
+            run(binary)
             run(PYTHON, ROOT / "tools/compare_outputs.py", ref, fast)
     except BaseException:
         print(f"Unfinished case retained at {case} (see run.log)", file=sys.stderr)
@@ -60,6 +60,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seeds", type=int, nargs="+", default=range(1, 21))
     parser.add_argument("--sizes", type=int, nargs="+", default=[10000, 100000, 1000000])
+    parser.add_argument("--binary", type=Path, default=BINARY,
+                        help="immutable release binary to check when comparing several candidates")
     args = parser.parse_args()
     if any(not 1000 <= size <= 1000000 for size in args.sizes):
         parser.error("sizes must be between 1000 and 1000000")
@@ -67,9 +69,10 @@ def main():
         parser.error("seeds must be unsigned 64-bit integers")
     base = ROOT / "scratch/official-diff"
     base.mkdir(parents=True, exist_ok=True)
+    binary = args.binary.resolve(strict=True)
     for size in args.sizes:
         for seed in args.seeds:
-            compare(seed, size, base)
+            compare(seed, size, base, binary)
     print(f"Passed {len(args.seeds) * len(args.sizes)} comparisons.")
 
 

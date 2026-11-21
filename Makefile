@@ -7,13 +7,16 @@ DEV ?= vendor/dev
 ANSWER ?= vendor/dev-answer
 OUT ?= out
 
-.PHONY: test build test-bin diff check clean fixtures dev check-dev
+.PHONY: test build test-rust test-bin diff check clean fixtures dev check-dev
 
 test:            ## reference edge cases
 	python3 -m unittest discover -s tests -v
 
 build:           ## release build of the fast pipeline
 	cd fast && cargo build --locked --release
+
+test-rust:       ## parser differential, key encoding and forced collision tests
+	cd fast && cargo test --locked --release
 
 test-bin: build  ## same edge cases against the binary
 	SS_BIN=$(BIN) python3 -m unittest discover -s tests
