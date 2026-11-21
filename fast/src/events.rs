@@ -92,10 +92,16 @@ fn parse<'a>(
                 };
                 next.uid = people.codec.key(r[1]);
                 next.hash = links::mix(next.uid);
-                people.prefetch(next.hash);
+                if !cfg!(feature = "no-alias-prefetch") {
+                    people.prefetch(next.hash);
+                }
                 next.price = price;
                 next.cat = cat;
             }
+        }
+        if cfg!(feature = "no-alias-prefetch") {
+            emit(next);
+            return;
         }
         let i = n % ring.len();
         if n >= ring.len() {

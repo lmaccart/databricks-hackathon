@@ -1,5 +1,17 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Flat shopper-alias candidate — 2026-11-20 (Houston)
+
+The native Intel profile attributed 6.77% to the old lane-based prefetch. The
+candidate keeps the temporary union-find index but publishes only non-root IDs
+in one aligned 64-byte bucket array. The first address uses the high bits of the
+existing reversible token. Only an overfull bucket enters its exact sorted
+overflow; no prefix is sized from its worst-case occupancy.
+
+The default keeps the 16-row event prefetch batch to isolate the table change.
+Build with `--features no-alias-prefetch` to compare immediate lookup on the same
+table. Native Intel paired timings are pending.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.
