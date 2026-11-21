@@ -1,5 +1,10 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Role-local raw-word candidate — 2026-11-21
+
+- Shopper, event ID and click ID sample validated rows independently (up to four 16 KiB chunk prefixes per input, 256 IDs per role). A 75% eligible-prefix majority enables a big-endian raw suffix word; otherwise the generic codec remains in use. Full-byte interners handle all exceptions, and mixed inline/spill comparisons use original bytes.
+- Checks: 21 Rust tests; 39 reference and binary tests; 36/36 official fixtures for both; both dev-answer comparisons; 10 kit seeds × 20k; 20k opaque/reordered case with 1 and 8 workers. No native speed measurement here; parent will benchmark against the 1.57 s control.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

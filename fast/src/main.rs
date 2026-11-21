@@ -25,7 +25,7 @@ mod output;
 mod person;
 mod stream;
 use links::{Identity, People, person_names};
-use person::Codec;
+use person::{Codec, PrefixSample};
 use stream::{Packing, Payload, Stream, Temporal};
 
 const DAY: i64 = 86_400_000;
@@ -106,6 +106,67 @@ fn chunks_for<'a>(files: &'a [(PathBuf, Mmap)], cols: &[&str]) -> Vec<Chunk<'a>>
     let mut v: Vec<Chunk> = files.iter().flat_map(|(p, m)| chunks_of(&m[..], cols, p)).collect();
     v.sort_by_key(|c| std::cmp::Reverse(c.data.len())); // big tasks first
     v
+}
+
+/// Sampling is bounded and only chooses an encoding, never a validation rule.
+fn sample_prefixes(
+    events: &[Chunk],
+    clicks: &[Chunk],
+    links: &[Chunk],
+    sm: &Small,
+    ws: i64,
+    we: i64,
+    clock: &ManifestClock,
+) -> (Option<u8>, Option<u8>, Option<u8>) {
+    let (mut shoppers, mut event_ids, mut click_ids) = (
+        PrefixSample::default(),
+        PrefixSample::default(),
+        PrefixSample::default(),
+    );
+    for c in events.iter().take(4) {
+        for_rows(&c.sample(16 * 1024), |r| {
+            let ts = clock.parse_ts(r[2]);
+            let ingest = clock.ingest_for_claim(r[3]).0;
+            let valid_type = match r[4] {
+                b"view" | b"cart" => true,
+                b"purchase" => parse_price(r[6]).is_some(),
+                _ => false,
+            };
+            if !r[0].is_empty()
+                && !r[1].is_empty()
+                && !r[5].is_empty()
+                && ingest != BAD
+                && (ws..we).contains(&ts)
+                && ingest.saturating_sub(ts) <= DAY
+                && valid_type
+            {
+                shoppers.add(r[1]);
+                event_ids.add(r[0]);
+            }
+        });
+    }
+    for c in clicks.iter().take(4) {
+        for_rows(&c.sample(16 * 1024), |r| {
+            let ts = clock.parse_ts(r[3]);
+            if !r[0].is_empty()
+                && !r[1].is_empty()
+                && sm.camp_idx.get(r[2]).is_some()
+                && (ws.saturating_sub(WEEK)..we).contains(&ts)
+            {
+                shoppers.add(r[1]);
+                click_ids.add(r[0]);
+            }
+        });
+    }
+    for c in links.iter().take(4) {
+        for_rows(&c.sample(16 * 1024), |r| {
+            if !r[0].is_empty() && !r[1].is_empty() {
+                shoppers.add(r[0]);
+                shoppers.add(r[1]);
+            }
+        });
+    }
+    (shoppers.prefix(), event_ids.prefix(), click_ids.prefix())
 }
 
 struct Small<'a> {
@@ -226,6 +287,7 @@ fn parse_clicks<'a>(
     sm: &Small,
     window: (i64, i64, &ManifestClock),
     names: &People<'a>,
+    click_codec: &Codec<'a>,
     packed: bool,
 ) -> Vec<Clicks> {
     let (lo, we, clock) = window;
@@ -281,7 +343,7 @@ fn parse_clicks<'a>(
             uid: key,
             hash,
             ts,
-            cid: names.codec.key(cid),
+            cid: click_codec.key(cid),
             camp: ci,
         };
         n += 1;
@@ -333,6 +395,7 @@ fn process_stream<T: Temporal>(
     mut cls: Vec<PCl>,
     sm: &Small,
     people: &People,
+    click_codec: &Codec,
     layout: T::Layout,
     ShardOut { users, camps }: &mut ShardOut,
 ) {
@@ -425,9 +488,7 @@ fn process_stream<T: Temporal>(
 
             // slide the click window to [start - 7d, start]
             while hi < clicks.len() && clicks[hi].ts <= start {
-                if hi == 0
-                    || clicks[hi].ts != clicks[latest].ts
-                    || people.codec.less(clicks[hi].cid, clicks[latest].cid)
+                if hi == 0 || clicks[hi].ts != clicks[latest].ts || click_codec.less(clicks[hi].cid, clicks[latest].cid)
                 {
                     latest = hi;
                 }
@@ -488,6 +549,7 @@ fn process_shard(
     cls: Vec<Clicks>,
     sm: &Small,
     people: &People,
+    click_codec: &Codec,
     packing: Option<Packing>,
 ) -> ShardOut {
     let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
@@ -497,9 +559,9 @@ fn process_shard(
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        process_stream(packed, gather(pc), sm, people, click_codec, pack, &mut out);
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
+    process_stream(wide, gather(wc), sm, people, click_codec, (), &mut out);
     out
 }
 
@@ -554,16 +616,29 @@ fn main() {
         ],
     );
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
-    let names = person_names(&link_chunks);
+    let (shopper_prefix, event_prefix, click_prefix) =
+        sample_prefixes(&ev_chunks, &cl_chunks, &link_chunks, &sm, ws, we, &clock);
+    let names = person_names(&link_chunks, Codec::with_prefix(shopper_prefix));
+    let event_codec = Codec::with_prefix(event_prefix);
+    let click_codec = Codec::with_prefix(click_prefix);
     let packing = Packing::new(ws, we, names.count);
     log(&format!("links: {} linked ids", names.count));
 
-    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, &log);
+    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, &event_codec, (ws, we, &clock), packing, &log);
     log("events deduped");
 
     let cl_by_person = cl_chunks
         .par_iter()
-        .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names, packing.is_some()))
+        .map(|c| {
+            parse_clicks(
+                c,
+                &sm,
+                (ws.saturating_sub(WEEK), we, &clock),
+                &names,
+                &click_codec,
+                packing.is_some(),
+            )
+        })
         .collect();
     log("clicks routed");
 
@@ -582,7 +657,7 @@ fn main() {
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(e, c)| process_shard(e, c, &sm, &names, &click_codec, packing))
         .collect();
     log("sessions done");
 

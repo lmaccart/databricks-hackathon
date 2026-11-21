@@ -34,6 +34,21 @@ pub struct Chunk<'a> {
     idx: [usize; 8],
 }
 
+impl<'a> Chunk<'a> {
+    /// Keep only complete rows while bounding the work of a sampling scan.
+    pub fn sample(&self, max_bytes: usize) -> Self {
+        let end = if self.data.len() <= max_bytes {
+            self.data.len()
+        } else {
+            memchr::memrchr(b'\n', &self.data[..max_bytes]).map_or(0, |i| i + 1)
+        };
+        Self {
+            data: &self.data[..end],
+            ..*self
+        }
+    }
+}
+
 pub fn chunks_of<'a>(file: &'a [u8], cols: &[&str], path: &Path) -> Vec<Chunk<'a>> {
     chunks_sized(file, cols, path, crate::CHUNK)
 }

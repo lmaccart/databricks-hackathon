@@ -129,8 +129,7 @@ fn root(parent: &[AtomicU32], mut x: u32) -> u32 {
     }
 }
 
-pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
-    let codec = Codec::new();
+pub(super) fn person_names<'a>(chunks: &[Chunk<'a>], codec: Codec<'a>) -> People<'a> {
     let parsed: Vec<_> = chunks
         .par_iter()
         .map(|c| {
@@ -209,8 +208,8 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
                     }
                     let ka = keys[a as usize];
                     let kb = keys[b as usize];
-                    // The ASCII encoding is order preserving for its domain.
-                    // Spill numbers are not; compare their original bytes.
+                    // Both inline codecs preserve byte order. Spill numbers
+                    // do not; compare their original bytes.
                     let swap = if (ka | kb) >> 63 == 0 {
                         ka > kb
                     } else {

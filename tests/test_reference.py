@@ -90,6 +90,32 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_role_prefixes_unrepresentative_sample_and_reordered_header(self):
+        from unittest.mock import patch
+        t = "2026-10-02T10:00:00Z"
+        # The sample sees A/B/C, but later IDs span all roles, longer values,
+        # embedded and trailing NULs, UTF-8, and a bytewise-smaller link name.
+        reordered = "price_cents,product_id,event_type,ingest_ts,ts,user_id,event_id"
+        def row(eid, uid, ingest=t):
+            return f",p1,view,{ingest},{t},{uid},{eid}"
+        rows = [row(f"A{i:06}", f"B{i:06}") for i in range(270)]
+        rows += [row(e, "Btarget") for e in
+                 ("A\0x", "A\0", "Aé", "A12345678", "Btarget", "Ctarget")]
+        rows += [row("A000000", "Btarget", "2026-10-02T10:00:01Z"),
+                 row('"Ctarget"', "", "2026-10-02T09:59:59Z"),
+                 row("A\0x", "Btarget", "2026-10-02T10:00:01Z")]
+        clicks = [f"C{i:06},B{i:06},c_1,{t}" for i in range(270)]
+        clicks += [f"{cid},Btarget,{camp},{t}" for cid, camp in
+                   (("Cz", "c_1"), ("C\0", "c_2"), ("Cé", "c_3"), ("Aother", "c_3"))]
+        with patch.dict(HEADERS, events=reordered):
+            users, camps = run_case(
+                clicks=clicks, links=["Btarget,Acanonical"],
+                extra={"events/part-1.csv": rows})
+        target = users[("Acanonical", "2026-10-02")]
+        self.assertEqual(target["events"], 5)  # A000000 already belongs to B000000
+        self.assertEqual(camps[("c_3", "2026-10-02")]["sessions"], 1)
+        self.assertEqual(camps[("c_2", "2026-10-02")]["assisted_sessions"], 1)
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"

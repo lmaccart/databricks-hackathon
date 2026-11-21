@@ -108,6 +108,7 @@ fn parse<'a>(
     c: &Chunk<'a>,
     sm: &Small,
     people: &People<'a>,
+    event_codec: &Codec<'a>,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
 ) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
@@ -147,7 +148,7 @@ fn parse<'a>(
         if r[0].is_empty() {
             return;
         }
-        let claim_key = links::mix(people.codec.key(r[0]));
+        let claim_key = links::mix(event_codec.key(r[0]));
         let (ingest, seconds) = clock.ingest_for_claim(r[3]);
         let ts = clock.parse_ts(r[2]);
         let mut next = Pending {
@@ -286,13 +287,14 @@ pub(super) fn by_person<'a>(
     chunks: &[Chunk<'a>],
     sm: &Small,
     people: &People<'a>,
+    event_codec: &Codec<'a>,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Payload>> {
     let parsed: Vec<_> = chunks
         .par_iter()
-        .map(|c| parse(c, sm, people, window, packing))
+        .map(|c| parse(c, sm, people, event_codec, window, packing))
         .collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
