@@ -8,14 +8,15 @@ Seed 7 has 1.921 GB of event, click and link CSVs before the dimension files and
 
 ### Allocator selection
 
-The candidate for the next practice run is [`14ccc10`](https://github.com/lmaccart/databricks-hackathon/commit/14ccc10f1dfc0845760640eeee2fa3db62b3e87a): it combines physical identity slots, person-local temporal ranges, typed Parquet columns, bounded worker-local campaign/day counters and linked mimalloc 3.3.2 on Linux. Its `fast/` Git tree is `4f81720222297220b46c957167e202e3709c1091`. The default allocator policy is deliberate; the extra parser reservation logic and allocator overrides did not consistently clear the incremental practice threshold in direct comparisons.
+**Practice SHA:** [`1a3d0fdf38c14e858a92ba53bfa29da2f0f9b94a`](https://github.com/lmaccart/databricks-hackathon/commit/1a3d0fdf38c14e858a92ba53bfa29da2f0f9b94a). Its Docker inputs and tests match the [timed `14ccc10` trial](https://github.com/lmaccart/databricks-hackathon/commit/14ccc10f1dfc0845760640eeee2fa3db62b3e87a). It combines physical identity slots, person-local temporal ranges, typed Parquet columns, bounded worker-local campaign/day counters and linked mimalloc 3.3.2 on Linux. Its `fast/` Git tree is `4f81720222297220b46c957167e202e3709c1091`. Extra parser reservations and allocator overrides did not consistently clear the incremental practice threshold head-to-head.
 
-Direct comparisons against the production source of the 1.54 s entry, on four-worker native AMD EPYC 9V74 runners. Each arrow is a pair of medians in seconds, control → candidate. The Docker clock starts before `docker run` and includes container creation and removal. Both executables receive a warmup and write fresh output on every run.
+Direct comparisons against the production source of the 1.54 s entry, on four-worker native AMD runners. Each arrow is a pair of medians in seconds, control → candidate. The Docker clock starts before `docker run` and includes container creation and removal. Both executables receive a warmup and write fresh output on every run. The candidate won **53/54 pairs**, including all nine 60M pairs.
 
 | Release check | 20M seed 7, native | 20M seed 15, native | 20M seed 7, full Docker | 60M seed 13, full Docker | Pairs won |
 |---|---:|---:|---:|---:|---:|
 | [Python oracle and packaged entry](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937040474) | 1.744 → 1.113 | 1.731 → 1.116 | 2.359 → **1.683** (−28.7%) | 6.617 → **4.627** (−30.1%) | 17/18 |
 | [Independent run and second 60M input](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937344723) | 1.727 → 1.119 | 1.720 → 1.116 | 2.239 → **1.541** (−31.2%) | 6.633 → **4.676** (−29.5%) | 18/18 |
+| [Repeat on EPYC 7763 with Python and peak memory](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937264092) | 2.100 → 1.349 | 2.081 → 1.330 | 2.357 → **1.552** (−34.2%) | 7.120 → **4.729** (−33.6%) | 18/18 |
 
 **Correctness:** both 20M inputs, 60 independent Python comparisons, the official dev answer, all 36 official fixtures, opaque IDs, malformed CSV, and colliding/transitive identity graphs matched. The restricted image matched every row against `7fd1b76` on two 60M inputs: **6,615,971** rows on seed 13 and **6,629,430** on seed 948307. With 14 GiB and no swap, Linux `wait4` reported **7.80 and 7.76 GiB peak RSS** respectively; the corresponding cgroup charges were 3.20 and 3.11 GiB. Shared mapped input can be resident without being charged to this cgroup. Timings and memory were taken in separate runs.
 
@@ -64,6 +65,8 @@ A [separate Intel diagnostic using the production event grammar](https://github.
 | Include both real payload and claim scatter streams | 0.6339 s | 2.62 GB/s |
 
 Adding exact owner lookup cost about 83 ms in this comparison; writing the two streams added about 104 ms. The full program's parse/route interval was 0.717 s rather than 0.634 s: it runs in a fresh process with different allocator, cache and scheduling state. Even the isolated complete event decoder takes longer than 0.30 s on this host; a faster sort or writer cannot close the gap alone.
+
+The [release commit profiled against its production-identical trial](https://github.com/lmaccart/databricks-hackathon/actions/runs/44938196873) took **1.170 s** at 20M on four Intel workers; the trial took 1.161 s. Event parsing and routing remained the largest interval (**0.611 s**), then sessions (0.243 s), clicks (0.121 s) and dedup (0.095 s). Of about 4,000 user-space CPU samples, 31.5% landed in the inlined event chunk worker, 11.5% in its parse closure, and 7.9% in F1 seconds conversion. These are symbol-level measurements; the inlined worker includes more than the CSV decoder.
 
 ## Two-seed trials
 
