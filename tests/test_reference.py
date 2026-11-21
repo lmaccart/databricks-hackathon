@@ -382,6 +382,28 @@ class ByteDistinctIds(unittest.TestCase):
 
 
 class DedupMalformedVsInvalid(unittest.TestCase):
+    def test_event_field_boundary_fallback(self):
+        t = "2026-10-03T10:00:00Z"
+        later = "2026-10-03T10:00:01Z"
+        user = "É" + "u" * 130 + "\r"
+        events = [
+            ev("bad-ts", "uid", "2026-02-30T00:00:00Z", ingest=t),
+            ev("bad-ts", "uid", t, ingest=later),
+            ev("bad-ignored", "uid", t, price='"text,inside"', ingest=t),
+            ev("bad-ignored", "uid", t, ingest=later),
+            ev("bad-cr", "uid", t, "purchase", price="100\r", ingest=t),
+            ev("bad-cr", "uid", t, "purchase", price="200", ingest=later),
+            ev("offset", f'"{user}"', '"2026-10-03T05:00:00-05:00"', '"cart"',
+               '"p1"', '"ignored\r"', f'"{t}"'),
+            ev("long-epoch", user, "0" * 130 + str(ms(t)), "purchase", price="0250", ingest=t),
+            ev("wide-price", "uid", t, price=f'"{"a" * 200}\r"', ingest=t),
+            ev("cr-ignored", "uid", t, price="\r", ingest=t),
+        ]
+        daily, _ = run_case(events, links=[f"{user},uid"])
+        self.assertEqual(len(daily), 1)
+        row = daily[("uid", "2026-10-03")]
+        self.assertEqual((row["events"], row["revenue_cents"], row["top_category"]), (5, 250, "shoes"))
+
     def test_earliest_copy_malformed_or_invalid(self):
         t = "2026-10-02T10:00:00Z"
         ing = lambda sec: f"2026-10-02T10:{sec // 60:02d}:{sec % 60:02d}Z"

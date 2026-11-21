@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Events-only typed CSV experiment — 2026-11-21 UTC
+
+For the identity event header, the parser uses bounded SWAR for opaque fields and proves timestamp and type spans with their grammar. It produces typed events or claim-only rows without separately looking for LF. Any structural or timestamp assumption that fails sends the original physical line to the existing CSV decoder. Other headers and input tables are unchanged.
+
+Native Mac, public 1M dev, eight workers, five alternating process pairs: **0.071 s → 0.072 s** (event parse phase **0.022 s → 0.024 s**); no measured speedup on that host. The official dev answer and 36 fixtures match; the Rust mutation regression, 10 kit oracle seeds, and six official-generator oracle comparisons (seeds 7/15/19 at 10k/100k, including leap day) pass. No 20M, Docker, or native amd64 timing run in this worktree.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.

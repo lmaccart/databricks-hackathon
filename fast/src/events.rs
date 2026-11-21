@@ -3,6 +3,8 @@
 //! must be removed. In particular, an invalid copy has a claim but no payload.
 use super::*;
 
+mod typed;
+
 #[derive(Clone, Copy)]
 struct Claim {
     id: u64,
@@ -31,6 +33,52 @@ struct Pending {
     ingest: i64,
     price: u32,
     cat: u32,
+}
+
+impl Pending {
+    #[inline(always)]
+    fn set_payload(&mut self, uid: u64, product: &[u8], price: u32, sm: &Small) {
+        self.uid = uid;
+        self.hash = links::mix(uid);
+        self.price = price;
+        self.cat = if price == 0 {
+            0
+        } else {
+            *sm.product_cat.get(product).unwrap_or(&sm.unknown_cat)
+        };
+    }
+}
+
+#[inline(always)]
+fn eligible(uid: &[u8], product: &[u8], ts: i64, ingest: i64, ws: i64, we: i64) -> bool {
+    !uid.is_empty() && !product.is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY
+}
+
+#[inline]
+fn decode_fields<'a>(r: &[&'a [u8]; 8], sm: &Small, codec: &Codec<'a>, ws: i64, we: i64) -> Pending {
+    if r[0].is_empty() {
+        return Pending::default();
+    }
+    let id = codec.key(r[0]);
+    let ingest = parse_ingest(r[3]);
+    let ts = parse_ts(r[2]);
+    let mut next = Pending {
+        id,
+        ts,
+        ingest,
+        ..Pending::default()
+    };
+    if eligible(r[1], r[5], ts, ingest, ws, we) {
+        let purchase = match r[4] {
+            b"purchase" => parse_price(r[6]),
+            b"view" | b"cart" => Some(0),
+            _ => None,
+        };
+        if let Some(price) = purchase {
+            next.set_payload(codec.key(r[1]), r[5], price, sm);
+        }
+    }
+    next
 }
 
 fn parse<'a>(
@@ -65,37 +113,12 @@ fn parse<'a>(
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
-    for_rows(c, |r| {
-        if r[0].is_empty() {
+    typed::for_events(c, sm, &people.codec, ws, we, |next| {
+        if next.id == 0 {
             return;
         }
-        let id = people.codec.key(r[0]);
-        let ingest = parse_ingest(r[3]);
-        let ts = parse_ts(r[2]);
-        let mut next = Pending {
-            id,
-            ts,
-            ingest,
-            ..Default::default()
-        };
-        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
-            let purchase = match r[4] {
-                b"purchase" => parse_price(r[6]),
-                b"view" | b"cart" => Some(0),
-                _ => None,
-            };
-            if let Some(price) = purchase {
-                let cat = if price == 0 {
-                    0
-                } else {
-                    *sm.product_cat.get(r[5]).unwrap_or(&sm.unknown_cat)
-                };
-                next.uid = people.codec.key(r[1]);
-                next.hash = links::mix(next.uid);
-                people.prefetch(next.hash);
-                next.price = price;
-                next.cat = cat;
-            }
+        if next.uid != 0 {
+            people.prefetch(next.hash);
         }
         let i = n % ring.len();
         if n >= ring.len() {
