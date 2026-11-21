@@ -110,7 +110,7 @@ fn chunks_for<'a>(files: &'a [(PathBuf, Mmap)], cols: &[&str]) -> Vec<Chunk<'a>>
 
 struct Small<'a> {
     product_cat: dims::Dimension<'a>,
-    cat_names: Vec<Vec<u8>>, // index -> name; last one is "unknown"
+    cat_names: Vec<&'a str>, // index -> name; last one is "unknown"
     cat_rank: Vec<u32>,      // index -> byte-wise rank among all names
     unknown_cat: u32,
     camp_idx: dims::Dimension<'a>,
@@ -119,25 +119,26 @@ struct Small<'a> {
 }
 
 fn read_small<'a>(prod: &'a [u8], camp: &'a [u8], pp: &Path, cp: &Path) -> Small<'a> {
-    let mut cat_id: HashMap<Vec<u8>, u32> = HashMap::new();
-    let mut cat_names: Vec<Vec<u8>> = Vec::new();
+    let mut cat_id: HashMap<&[u8], u32> = HashMap::new();
+    let mut cat_names = Vec::new();
     let mut product_cat = Map::with_hasher(rs());
     let mut first_product = None;
     for c in chunks_of(prod, &["product_id", "category"], pp) {
         for_rows(&c, |r| {
             first_product.get_or_insert(r[0]);
-            let n = cat_names.len() as u32;
-            let id = *cat_id.entry(r[1].to_vec()).or_insert_with(|| {
-                cat_names.push(r[1].to_vec());
+            let n = u32::try_from(cat_names.len()).expect("category count");
+            let id = *cat_id.entry(r[1]).or_insert_with(|| {
+                cat_names.push(std::str::from_utf8(r[1]).expect("categories must be UTF-8"));
                 n
             });
             product_cat.insert(r[0], id);
         });
     }
-    let unknown_cat = cat_names.len() as u32;
-    cat_names.push(b"unknown".to_vec());
+    let unknown_cat = u32::try_from(cat_names.len()).expect("category count");
+    assert_ne!(unknown_cat, u32::MAX, "no room for unknown category");
+    cat_names.push("unknown");
     let mut order: Vec<u32> = (0..cat_names.len() as u32).collect();
-    order.sort_by(|&a, &b| cat_names[a as usize].cmp(&cat_names[b as usize]));
+    order.sort_by_key(|&a| cat_names[a as usize].as_bytes());
     let mut cat_rank = vec![0u32; cat_names.len()];
     for (rank, &i) in order.iter().enumerate() {
         cat_rank[i as usize] = rank as u32;
@@ -294,17 +295,8 @@ fn parse_clicks<'a>(
 
 // ------------------------------------------------------------------ sessions
 
-struct UserRow {
-    person: u64,
-    day: i32,
-    sessions: i64,
-    events: i64,
-    revenue: i64,
-    top: Option<u32>,
-}
-
 struct ShardOut {
-    users: Vec<UserRow>,
+    users: output::UserColumns,
     camps: Map<u64, [i64; 4]>, // (camp << 32 | day) -> sessions, purchasing, revenue, assisted
 }
 
@@ -326,6 +318,27 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
         };
     }
     best.map(|b| b as u32)
+}
+
+#[inline]
+fn finish_user_day(
+    users: &mut output::UserColumns,
+    day: i32,
+    sessions: i64,
+    events: i64,
+    revenue: i64,
+    catsum: &mut [i64],
+    rank: &[u32],
+) {
+    // Every surviving purchase has a strictly positive price.
+    let top = if revenue == 0 {
+        None
+    } else {
+        let top = top_category(catsum, rank);
+        catsum.fill(0);
+        top
+    };
+    users.push_day(day, sessions, events, revenue, top);
 }
 
 fn process_stream<T: Temporal>(
@@ -392,16 +405,7 @@ fn process_stream<T: Temporal>(
             let day = start.div_euclid(DAY) as i32;
             if day != cur_day {
                 if cur_day != i32::MIN {
-                    let top = top_category(&catsum, &sm.cat_rank);
-                    users.push(UserRow {
-                        person,
-                        day: cur_day,
-                        sessions: d_sess,
-                        events: d_ev,
-                        revenue: d_rev,
-                        top,
-                    });
-                    catsum.iter_mut().for_each(|x| *x = 0);
+                    finish_user_day(users, cur_day, d_sess, d_ev, d_rev, &mut catsum, &sm.cat_rank);
                 }
                 cur_day = day;
                 (d_sess, d_ev, d_rev) = (0, 0, 0);
@@ -464,16 +468,8 @@ fn process_stream<T: Temporal>(
             }
             k = m;
         }
-        let top = top_category(&catsum, &sm.cat_rank);
-        users.push(UserRow {
-            person,
-            day: cur_day,
-            sessions: d_sess,
-            events: d_ev,
-            revenue: d_rev,
-            top,
-        });
-        catsum.iter_mut().for_each(|x| *x = 0);
+        finish_user_day(users, cur_day, d_sess, d_ev, d_rev, &mut catsum, &sm.cat_rank);
+        users.finish_person(person);
         for &a in &active {
             cnt[a as usize] = 0;
         }
@@ -493,7 +489,7 @@ fn process_shard(
     let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
     let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
     let mut out = ShardOut {
-        users: Vec::new(),
+        users: output::UserColumns::default(),
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
@@ -617,19 +613,11 @@ fn main() {
             }
         })
         .collect();
-    let shards: Vec<&[UserRow]> = outs.iter().map(|o| &o.users[..]).collect();
+    let shards: Vec<_> = outs.iter().map(|o| &o.users).collect();
     let parts = rayon::current_num_threads().clamp(1, 16);
     rayon::join(
         || output::campaign_daily(&cd.join("part-0.parquet"), &camp_rows),
-        || {
-            output::user_daily(
-                &ud,
-                &shards,
-                parts,
-                &|p, out| out.extend_from_slice(names.codec.bytes(links::unmix(p), &mut [0; 9])),
-                &sm.cat_names,
-            )
-        },
+        || output::user_daily(&ud, &shards, parts, &names.codec, &sm.cat_names),
     );
     log("written");
     // Everything is on disk; skip tearing down the shard tables and mmaps.

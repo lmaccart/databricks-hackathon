@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Experimental columnar user-day finalization — 2026-11-21
+
+Replace user row structs with per-shard typed columns and exact person runs. The output writer decodes and checks each person name once per run; repeated days reference a Parquet dictionary. Category bytes are checked once when loading the dimension, and definition levels preserve nulls. Groups are capped by rows and dictionary bytes except for single oversized values; dense cents remain PLAIN, while sparse and all-zero groups use dictionary/RLE. No campaign aggregation changes.
+
+Both dev checkers matched (117,038 user rows and 27,400 campaign rows; empty stdout), all 36 starter fixtures passed for both implementations, all 41 edge tests passed against each implementation, and 10 dirty seeds matched. Five light native dev pairs with four workers were inconclusive (0.085 s control → 0.086 s candidate median; candidate won 3/5). No 20M/60M or Docker timing and no scale RSS measurement for this experiment.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).
