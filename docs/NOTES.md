@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Click record size: keep the release layout — 2026-11-21
+
+The [16-byte click trial](https://github.com/lmaccart/databricks-hackathon/actions/runs/44938958482) matched every row but lost 14/18 pairs against the practice build. Full Docker medians rose from **1.231 to 1.235 s** at 20M and **3.758 to 3.805 s** at 60M. Recommendation: `1a3d0fd`.
+
 ## Verified cold-input comparison — 2026-11-21
 
 Keep `1a3d0fd` for practice. On the same four-worker Intel machine the change saved **27.3% / 28.4%** with fully resident inputs and **8.2% / 7.0%** with no input pages resident (20M / 60M). It won all six cold pairs and all six warm pairs. Outputs matched after every timed run. [Timing and cache verification](PERF_154.md#input-page-cache).

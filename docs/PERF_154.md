@@ -157,6 +157,7 @@ Each row compares a component with and without the other change on the **same** 
 | [Add live allocation hints to otherwise identical `14ccc10`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937042928) | 1.487 → 1.481 | 4.619 → 4.523 |
 | [Disable mimalloc page purging vs its defaults](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937148686) | 1.245 → 1.231 | 3.811 → 3.663 |
 | [Align mimalloc purge regions to transparent huge pages vs its defaults](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937148704) | 1.296 → 1.277 | 3.886 → 3.815 |
+| [Keep ranked clicks in 16 bytes through sorting and attribution (`d4f2df2` vs `14ccc10`)](https://github.com/lmaccart/databricks-hackathon/actions/runs/44938958482) | **1.231** → 1.235 | **3.758** → 3.805 |
 
 The initial singleton technique by itself added almost nothing to the columns in the two full-Docker comparisons on the Xeon 8370C. Replacing the graph construction as well made a measurable difference on the 6975P-C: every pair favored physical slots, including all three final-scale pairs. Keeping a slot as the union node eliminates endpoint sorting/deduplication and gives the parser a direct rank to write.
 
@@ -171,6 +172,8 @@ The linked Linux allocator won more than a library microbenchmark: every practic
 The alternative with live allocation hints (`894f6a7`) also matched all 2,378,604 rows on this odd-sized input at **2.64 GiB RSS**. Emulated start-to-exit medians were **1.227 s without vs 1.260 s with hints**, with hints winning 2/5 pairs. Both images were about 116 MB as reported by Docker, run as uid 1000, and link the allocator into the executable; no preload or runtime package installation is necessary.
 
 On native AMD, adding those hints to `14ccc10` saved only **0.4% at 20M and 2.1% at 60M** (median paired final-scale savings: **0.4%**). Disabling purging and forcing huge-page-aligned purging also missed the two-seed 3% cutoff: disabling purging saved 0.9% / 1.8% in the native practice medians despite its 3.9% full-Docker gain at 60M. The release uses the allocator defaults and the simpler parser.
+
+The 16-byte click trial preserved the full click ID and packed the rank, campaign and millisecond offset only when the actual dimensions and seven-day lookback fit. All 6,615,971 final-scale rows matched. Click routing took 0.394 s instead of 0.409 s at 60M, but the full container took 1.2% longer. The trial won only **4/18** pairs, so `1a3d0fd` keeps the simpler click record.
 
 For `7619fa6` on the M2 Pro, eight-worker native medians vs `7fd1b76` were **0.622 → 0.502 s**, **0.599 → 0.479 s**, and **1.753 → 1.409 s** on the independent 60M seed (all 15 pairs won). A separate same-executable comparison of four versus eight workers went **0.708 → 0.476 s** on seed 7 and **2.322 → 1.471 s** on the 60M holdout: 1.49× and 1.58× throughput, not 2×. This host has eight performance cores and four efficiency cores; these measured ratios do not predict the speed of eight pinned x86 hyperthreads.
 

@@ -2,7 +2,7 @@
 
 These are hosted CI comparisons, not organizer times. Each row comes from a completed job with timings on **both** 20M seeds. Each arrow is control → candidate, in seconds; parentheses are candidate wins / pairs. The last two columns are full `docker run`; a dash means that scope was not run. CPU models vary, so compare across an arrow, not down a column.
 
-**63 two-seed jobs**, **44 distinct candidate revisions** including diagnostic controls. [Interpretation and practice pick](PERF_154.md).
+**64 two-seed jobs**, **45 distinct candidate revisions** including diagnostic controls. [Interpretation and practice pick](PERF_154.md).
 
 | CI run | Candidate / control | CPU | 20M seed 7 native | 20M seed 15 native | 20M Docker | 60M Docker |
 |---|---|---|---:|---:|---:|---:|
@@ -69,3 +69,4 @@ These are hosted CI comparisons, not organizer times. Each row comes from a comp
 | [second60-gridmi](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937344723) | `14ccc10` / `7fd1b76` | AMD EPYC 9V74 | 1.727 → 1.119 (5/5) | 1.720 → 1.116 (5/5) | 2.239 → 1.541 (5/5) | 6.633 → 4.676 (3/3) |
 | [second60-mi](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937347254) | `894f6a7` / `7fd1b76` | AMD EPYC 7763 | 2.073 → 1.311 (5/5) | 2.061 → 1.308 (5/5) | 2.248 → 1.467 (5/5) | 6.840 → 4.473 (3/3) |
 | [selected-profile](https://github.com/lmaccart/databricks-hackathon/actions/runs/44938196873) | `1a3d0fd` / `14ccc10` | Intel Xeon 6975P-C | 1.161 → 1.170 (1/5) | 1.139 → 1.150 (3/5) | — | — |
+| [compact-ranked-clicks](https://github.com/lmaccart/databricks-hackathon/actions/runs/44938958482) | `d4f2df2` / `14ccc10` | Intel Xeon 6975P-C | 1.131 → 1.142 (0/5) | 1.121 → 1.137 (2/5) | 1.231 → 1.235 (1/5) | 3.758 → 3.805 (1/3) |
