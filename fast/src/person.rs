@@ -93,3 +93,31 @@ impl<'a> Codec<'a> {
         &buf[..len]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::links::{mix, unmix};
+
+    #[test]
+    fn every_ascii_lane_survives_routing_and_decoding() {
+        let codec = Codec::new();
+        // Include embedded/trailing zeros, ASCII controls, and all seven bits
+        // at every lane rather than testing just generator-shaped names.
+        let inputs: Vec<_> = (1..=9)
+            .flat_map(|n| {
+                (0..n).flat_map(move |i| {
+                    (0..=127).map(move |v| {
+                        let mut b = vec![b'x'; n];
+                        b[i] = v;
+                        b
+                    })
+                })
+            })
+            .collect();
+        for input in &inputs {
+            let key = codec.key(input);
+            assert_eq!(codec.bytes(unmix(mix(key)), &mut [0; 9]), input.as_slice());
+        }
+    }
+}

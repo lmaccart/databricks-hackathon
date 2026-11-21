@@ -16,6 +16,11 @@ Leif reports **5.03 s** for `cc9f33e`. At the user-reported 0.68 s lead that is 
 | Direct payload routing + small duplicate claims vs person keys | 1.556 s | 1.253 s | 19.5% |
 | Parallel identity graph + exact flat lookup vs direct routing | 1.525 s | 1.346 s | 11.7% |
 | Reversible routing token, sampled bucket reservations and consuming gather vs flat lookup | 1.194 s | 1.157 s | 3.1% |
+| Prefetch the canonical-name slot 16 rows ahead vs routing | 1.223 s | 1.089 s | 11.0% |
+
+The explicit prefetch hint dereferences no input and is issued only for an in-bounds slot in the live alias table. A small FIFO overlaps that lookup with the next rows' parsing. Other architectures can run the same FIFO without an ISA-specific hint.
+
+Rejected trials: a second round of hash bucketing before the session sorts gave 1.879 vs 1.836 s on the compact-key control. Direct click routing plus lazy interval assist counters gave 1.841 vs 1.572 s in a noisy batch. Neither result meets the five-run end-to-end acceptance threshold; retain the existing sorts and click path for that checkpoint.
 
 Opus also tried the opposite event layout, first scattering 40-byte source-span rows by event ID, then passing only frequency-filter collisions to a full byte comparison. On the unmodified scored pipeline this measured 2.149 → 1.927 s (10.3%). The integrated entry uses direct payload routing instead; these are alternative algorithms, not additive gains.
 

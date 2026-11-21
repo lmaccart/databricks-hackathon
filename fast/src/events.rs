@@ -22,6 +22,17 @@ struct Location {
     target: u32,
 }
 
+#[derive(Clone, Copy, Default)]
+struct Pending {
+    id: u64,
+    uid: u64, // zero is never the key of a nonempty ID
+    hash: u64,
+    ts: i64,
+    ingest: i64,
+    price: u32,
+    cat: u32,
+}
+
 fn parse<'a>(
     c: &Chunk<'a>,
     sm: &Small,
@@ -35,6 +46,27 @@ fn parse<'a>(
     let mut claims: Vec<Vec<Claim>> = (0..NS)
         .map(|_| Vec::with_capacity(reserve + reserve / 8))
         .collect();
+    let mut emit = |e: Pending| {
+        let mut target = NONE;
+        if e.uid != 0 {
+            let person = people.lookup(e.uid, e.hash);
+            let p = shard(person);
+            target = (payload[p].len() * NS + p) as u32;
+            payload[p].push(PEv {
+                person,
+                ts: e.ts,
+                price: e.price,
+                cat: e.cat,
+            });
+        }
+        claims[shard(hs.hash_one(e.id))].push(Claim {
+            id: e.id,
+            ingest: e.ingest,
+            target,
+        });
+    };
+    let mut ring = [Pending::default(); 16];
+    let mut n = 0usize;
     for_rows(c, |r| {
         if r[0].is_empty() {
             return;
@@ -45,7 +77,12 @@ fn parse<'a>(
             t => t,
         };
         let ts = parse_ts(r[2]);
-        let mut target = NONE;
+        let mut next = Pending {
+            id,
+            ts,
+            ingest,
+            ..Default::default()
+        };
         if !r[1].is_empty()
             && !r[5].is_empty()
             && (ws..we).contains(&ts)
@@ -62,19 +99,23 @@ fn parse<'a>(
                 } else {
                     *sm.product_cat.get(r[5]).unwrap_or(&sm.unknown_cat)
                 };
-                let person = people.resolve(r[1]);
-                let p = shard(person);
-                target = (payload[p].len() * NS + p) as u32;
-                payload[p].push(PEv {
-                    person,
-                    ts,
-                    price,
-                    cat,
-                });
+                next.uid = people.codec.key(r[1]);
+                next.hash = links::mix(next.uid);
+                people.prefetch(next.hash);
+                next.price = price;
+                next.cat = cat;
             }
         }
-        claims[shard(hs.hash_one(id))].push(Claim { id, ingest, target });
+        let i = n % ring.len();
+        if n >= ring.len() {
+            emit(ring[i]);
+        }
+        ring[i] = next;
+        n += 1;
     });
+    for i in n.saturating_sub(ring.len())..n {
+        emit(ring[i % ring.len()]);
+    }
     (payload, claims)
 }
 

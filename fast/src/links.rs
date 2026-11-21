@@ -66,9 +66,35 @@ impl<'a> People<'a> {
     pub(super) fn resolve(&self, uid: &'a [u8]) -> u64 {
         let key = self.codec.key(uid);
         let h = mix(key);
+        self.lookup(key, h)
+    }
+
+    #[inline]
+    pub(super) fn lookup(&self, key: u64, h: u64) -> u64 {
         let lane = &self.lanes[h as usize & (LANES - 1)];
         let s = lane.slots[lane.find(key, h)];
         if s.key != 0 { s.value } else { h }
+    }
+
+    #[inline]
+    pub(super) fn prefetch(&self, h: u64) {
+        let lane = &self.lanes[h as usize & (LANES - 1)];
+        let i = (h >> LANES.trailing_zeros()) as usize & lane.mask;
+        let addr = &lane.slots[i] as *const Slot;
+        // Only an in-bounds address in an immutable, live table; prefetch is
+        // a hint, never an actual read used for a decision.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            _mm_prefetch(addr.cast(), _MM_HINT_T0);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) addr,
+                            options(readonly, nostack, preserves_flags));
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let _ = addr;
     }
 }
 
