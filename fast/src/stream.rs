@@ -43,7 +43,6 @@ pub(super) trait Temporal: Copy + Ord {
     fn ts(self, layout: Self::Layout) -> i64;
     // Only compared within one person's ordered keys.
     fn gap(self, prev: Self) -> u64;
-    fn name(person: u64, people: &People) -> u64;
 }
 
 impl Temporal for Wide {
@@ -63,11 +62,6 @@ impl Temporal for Wide {
     fn gap(self, prev: Self) -> u64 {
         self.ts.abs_diff(prev.ts)
     }
-
-    #[inline]
-    fn name(person: u64, _: &People) -> u64 {
-        person
-    }
 }
 
 impl Temporal for u64 {
@@ -86,11 +80,6 @@ impl Temporal for u64 {
     #[inline]
     fn gap(self, prev: Self) -> u64 {
         self - prev
-    }
-
-    #[inline]
-    fn name(rank: u64, people: &People) -> u64 {
-        people.original(rank as u32)
     }
 }
 

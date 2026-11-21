@@ -1,5 +1,20 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 2 follow-up: exact local ranks for standalone events — 2026-11-20
+
+On top of `e81c18d`, pack the previously wide standalone events during shard
+gather. Four probes in a cache-sized direct table compare the full routed
+token; a bounded exact overflow map handles collisions. Slot indices double
+as the inverse map for output. Clicks use the same ranks and click-only people
+never reach the sort. Linked ranks and link resolution are unchanged.
+
+The 256 KiB direct table and half-million event limit are per-worker bounds,
+independent of dataset size. Oversized or crowded shards and windows that
+do not fit retain the existing wide path. Both official dev checkers matched,
+36/36 fixtures and 34/34 Python tests passed for each implementation, and all
+16 Rust tests and 10 small differential seeds passed. Parent owns performance
+A/B and the 60M capacity check.
+
 ## Round 2 challenger: compact linked rank + purchase stream — 2026-11-20
 
 The link graph already assigns each exact ID a node. Reuse its canonical root

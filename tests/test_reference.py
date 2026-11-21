@@ -346,6 +346,41 @@ class LinkedIds(unittest.TestCase):
 
 
 class Clicks(unittest.TestCase):
+    def test_standalone_click_ties_at_packed_window_edges(self):
+        start = WS_MS
+        end = start + (1 << 31)
+        last = end - 1
+        a, b = "long standalone á", "long standalone à"
+        u, c = run_case(
+            window=(WS, str(end)),
+            events=[
+                ev("e1", a, str(start)),
+                ev("e2", a, str(last), "purchase", "p1", "19"),
+                ev("e3", a, str(last), "purchase", "p2", "23"),
+                ev("e4", b, str(last), "purchase", "p3", "5"),
+                ev("e5", b, str(end), "purchase", "p3", "999"),
+            ],
+            clicks=[
+                f"old,{a},c_1,{start - 7 * DAY}",
+                f"2,{a},c_2,{last}",
+                f"10,{a},c_3,{last}",
+                f"00,{a},c_1,{end}",
+                f"0,click-only,c_2,{last}",
+            ],
+        )
+        first_day, last_day = "2026-10-01", "2026-10-25"
+        self.assertEqual(set(u), {(a, first_day), (a, last_day), (b, last_day)})
+        self.assertEqual(u[(a, last_day)]["revenue_cents"], 42)
+        self.assertEqual(u[(a, last_day)]["top_category"], "hats")
+        self.assertEqual(u[(b, last_day)]["revenue_cents"], 5)
+        got = {k: (r["sessions"], r["revenue_cents"], r["assisted_sessions"]) for k, r in c.items()}
+        self.assertEqual(got, {
+            ("c_1", first_day): (1, 0, 1),
+            ("c_2", last_day): (0, 0, 1),
+            ("c_3", last_day): (1, 42, 1),
+            ("organic", last_day): (1, 5, 0),
+        })
+
     def test_credit_boundaries(self):
         s = ms("2026-10-09T12:00:00Z")
         events = [ev(f"e{i}", f"u{i}", str(s)) for i in range(1, 7)]

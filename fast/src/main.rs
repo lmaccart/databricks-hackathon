@@ -22,10 +22,11 @@ mod events;
 mod links;
 mod output;
 mod person;
+mod standalone;
 mod stream;
 use links::{Identity, People, person_names};
 use person::Codec;
-use stream::{Packing, Payload, Stream, Temporal};
+use stream::{Packing, Payload, Purchase, Stream, Temporal};
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
@@ -288,11 +289,12 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
 
 fn process_stream<T: Temporal>(
     pieces: Vec<Stream<T>>,
-    mut cls: Vec<PCl>,
+    cls: Vec<PCl>,
     sm: &Small,
     people: &People,
     layout: T::Layout,
-    ShardOut { users, camps }: &mut ShardOut,
+    name: impl Fn(u64) -> u64,
+    out: &mut ShardOut,
 ) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
     let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
@@ -306,6 +308,21 @@ fn process_stream<T: Temporal>(
         evs.extend(s.purchases.iter().map(|p| p.key));
         purchases.extend_from_slice(&s.purchases);
     }
+    sort_and_process(evs, purchases, cls, sm, &people.codec, layout, name, out);
+}
+
+#[inline]
+fn sort_and_process<T: Temporal>(
+    mut evs: Vec<T>,
+    mut purchases: Vec<Purchase<T>>,
+    mut cls: Vec<PCl>,
+    sm: &Small,
+    codec: &Codec,
+    layout: T::Layout,
+    name: impl Fn(u64) -> u64,
+    ShardOut { users, camps }: &mut ShardOut,
+) {
+    let np = purchases.len();
     evs.sort_unstable();
     purchases.sort_unstable_by_key(|p| p.key);
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
@@ -320,7 +337,7 @@ fn process_stream<T: Temporal>(
     let mut pi = 0usize;
     while i < evs.len() {
         let rank = evs[i].person(layout);
-        let person = T::name(rank, people);
+        let person = name(rank);
         let mut j = i;
         while j < evs.len() && evs[j].person(layout) == rank {
             j += 1;
@@ -383,10 +400,7 @@ fn process_stream<T: Temporal>(
 
             // slide the click window to [start - 7d, start]
             while hi < clicks.len() && clicks[hi].ts <= start {
-                if hi == 0
-                    || clicks[hi].ts != clicks[latest].ts
-                    || people.codec.less(clicks[hi].cid, clicks[latest].cid)
-                {
+                if hi == 0 || clicks[hi].ts != clicks[latest].ts || codec.less(clicks[hi].cid, clicks[latest].cid) {
                     latest = hi;
                 }
                 let c = clicks[hi].camp as usize;
@@ -447,6 +461,7 @@ fn process_shard(
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
+    window: (i64, i64),
 ) -> ShardOut {
     let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
     let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
@@ -455,9 +470,33 @@ fn process_shard(
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        process_stream(
+            packed,
+            gather(pc),
+            sm,
+            people,
+            pack,
+            |rank| people.original(rank as u32),
+            &mut out,
+        );
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
+    if (packing.is_some() || people.count == 0)
+        && let Some(c) = standalone::compact(&wide, window)
+    {
+        drop(wide);
+        sort_and_process(
+            c.times,
+            c.purchases,
+            c.ranks.clicks(wc),
+            sm,
+            &people.codec,
+            c.packing,
+            |rank| c.ranks.original(rank),
+            &mut out,
+        );
+    } else {
+        process_stream(wide, gather(wc), sm, people, (), |person| person, &mut out);
+    }
     out
 }
 
@@ -541,7 +580,7 @@ fn main() {
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(e, c)| process_shard(e, c, &sm, &names, packing, (ws, we)))
         .collect();
     log("sessions done");
 
