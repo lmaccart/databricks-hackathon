@@ -90,6 +90,66 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_sparse_rank_directory_ignores_click_only_people(self):
+        links = [f"guest_{i},guest_{i}" for i in range(4096)]
+        links += ["guest_100,active_客"]
+        events = [ev("a", "guest_100", str(WS_MS))]
+        clicks = [f"c{i},guest_{i},c_1,{WS_MS}" for i in range(4096) if i != 100]
+        clicks += [f"active_click,active_客,c_2,{WS_MS - 7 * DAY}"]
+        users, campaigns = run_case(events, clicks, links)
+        self.assertEqual(list(users), [("active_客", "2026-10-01")])
+        self.assertEqual(list(campaigns), [("c_2", "2026-10-01")])
+        self.assertEqual(campaigns["c_2", "2026-10-01"]["sessions"], 1)
+        self.assertEqual(campaigns["c_2", "2026-10-01"]["assisted_sessions"], 1)
+
+    def test_ranked_and_wide_singletons_finish_separate_column_runs(self):
+        # With no links the flat table has 256 slots, so these cannot all
+        # receive slot ranks. Every person still has exactly two output days.
+        pairs = []
+        clicks = []
+        for i in range(1024):
+            uid = f"solo{i}_é"
+            pairs.append(ev(f"first{i}", uid, WS, "purchase", "p2", str(i + 1)))
+            pairs.append(ev(f"second{i}", uid, str(WS_MS + DAY)))
+            clicks.append(f"click{i},{uid},c_1,{WS_MS + 1}")
+        users, campaigns = run_case(pairs, clicks)
+        self.assertEqual(len(users), 2048)
+        for i in range(1024):
+            first = users[f"solo{i}_é", "2026-10-01"]
+            second = users[f"solo{i}_é", "2026-10-02"]
+            self.assertEqual((first["events"], first["revenue_cents"], first["top_category"]),
+                             (1, i + 1, "hats"))
+            self.assertEqual((second["events"], second["revenue_cents"], second["top_category"]),
+                             (1, 0, None))
+        self.assertEqual(campaigns["organic", "2026-10-01"]["sessions"], 1024)
+        self.assertEqual(campaigns["c_1", "2026-10-02"]["sessions"], 1024)
+
+    def test_hot_person_exact_gap_after_midnight_with_sparse_purchases(self):
+        midnight = WS_MS + DAY
+        left = midnight - 1
+        right = left + 30 * MIN
+        split = right + 30 * MIN + 1
+        events = [ev(f"hot_{i}", "别名" if i % 2 else "alias", str(left + i % 2))
+                  for i in range(8192)]
+        events += [
+            ev("bridge", "alias", str(right), "purchase", "p2", "300"),
+            ev("new", "别名", str(split), "purchase", "p1", "500"),
+            ev("standalone", "different_é", str(right)),
+        ]
+        clicks = [f"é,alias,c_1,{left}", f"z,别名,c_2,{left}", f"x,alias,c_3,{left + 1}"]
+        users, campaigns = run_case(events, clicks, ["alias,别名", "0root,alias"])
+        self.assertEqual(
+            {k: (r["sessions"], r["events"], r["revenue_cents"], r["top_category"])
+             for k, r in users.items()},
+            {("0root", "2026-10-01"): (1, 8193, 300, "hats"),
+             ("0root", "2026-10-02"): (1, 1, 500, "shoes"),
+             ("different_é", "2026-10-02"): (1, 1, 0, None)},
+        )
+        self.assertEqual(campaigns["c_2", "2026-10-01"]["sessions"], 1)
+        self.assertEqual(campaigns["c_1", "2026-10-01"]["assisted_sessions"], 1)
+        self.assertNotIn(("c_3", "2026-10-01"), campaigns)
+        self.assertEqual(campaigns["c_3", "2026-10-02"]["revenue_cents"], 500)
+
     def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
         stamp = "2026-10-03T10:00:00Z"
         early = "2026-10-03T09:59:59Z"

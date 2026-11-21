@@ -14,6 +14,7 @@
 use ahash::RandomState;
 use memmap2::Mmap;
 use rayon::prelude::*;
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -23,10 +24,11 @@ mod events;
 mod links;
 mod output;
 mod person;
+mod ranges;
 mod stream;
 use links::{Identity, People, person_names};
 use person::Codec;
-use stream::{Packing, Payload, Stream, Temporal};
+use stream::{Packing, Payload, Purchase, Stream, Temporal, Wide};
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
@@ -169,16 +171,30 @@ fn read_small<'a>(prod: &'a [u8], camp: &'a [u8], pp: &Path, cp: &Path) -> Small
 // ------------------------------------------------------------------ events & clicks
 
 #[derive(Clone, Copy)]
-struct PCl {
-    person: u64,
+struct Click {
     ts: i64,
     cid: u64,
     camp: u32,
 }
 
-#[inline]
-fn shard(h: u64) -> usize {
-    ((h >> SHARD_SHIFT) as usize) % NS
+#[derive(Clone, Copy)]
+struct PCl {
+    person: u64,
+    click: Click,
+}
+
+#[derive(Clone, Copy)]
+struct RankedClick {
+    ts: i64,
+    cid: u64,
+    rank: u32,
+    camp: u32,
+}
+
+impl Borrow<Click> for PCl {
+    fn borrow(&self) -> &Click {
+        &self.click
+    }
 }
 
 // A small live sample is only an allocation hint. Vectors still grow normally
@@ -218,7 +234,7 @@ fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
 
 #[derive(Default)]
 struct Clicks {
-    packed: Vec<PCl>,
+    packed: Vec<RankedClick>,
     wide: Vec<PCl>,
 }
 
@@ -246,16 +262,28 @@ fn parse_clicks<'a>(
         camp: u32,
     }
     let mut emit = |row: PendingClick| {
-        let (dest, person) = match names.lookup(row.uid, row.hash) {
-            Identity::Linked(p) if packed => (&mut b[shard(p)].packed, u64::from(p as u32)),
-            Identity::Linked(p) => (&mut b[shard(p)].wide, names.original(p as u32)),
-            Identity::Standalone(p) => (&mut b[shard(p)].wide, p),
+        let identity = names.lookup(row.uid, row.hash);
+        let bucket = &mut b[identity.owner()];
+        let person = match identity {
+            Identity::Ranked(p) if packed => {
+                bucket.packed.push(RankedClick {
+                    rank: p >> NS.trailing_zeros(),
+                    ts: row.ts,
+                    cid: row.cid,
+                    camp: row.camp,
+                });
+                return;
+            }
+            Identity::Ranked(p) => names.original(p),
+            Identity::Standalone(p) => p,
         };
-        dest.push(PCl {
+        bucket.wide.push(PCl {
             person,
-            ts: row.ts,
-            cid: row.cid,
-            camp: row.camp,
+            click: Click {
+                ts: row.ts,
+                cid: row.cid,
+                camp: row.camp,
+            },
         });
     };
     let mut ring = [PendingClick::default(); 16];
@@ -341,14 +369,143 @@ fn finish_user_day(
     users.push_day(day, sessions, events, revenue, top);
 }
 
-fn process_stream<T: Temporal>(
-    pieces: Vec<Stream<T>>,
-    mut cls: Vec<PCl>,
-    sm: &Small,
-    people: &People,
-    layout: T::Layout,
-    ShardOut { users, camps }: &mut ShardOut,
-) {
+fn ordered_sessions<T: Temporal>(mut times: &[T]) -> impl Iterator<Item = (T, T, usize)> {
+    std::iter::from_fn(move || {
+        let &first = times.first()?;
+        let mut end = 1;
+        while end < times.len() && times[end].gap(times[end - 1]) <= GAP as u64 {
+            end += 1;
+        }
+        let last = times[end - 1];
+        times = &times[end..];
+        Some((first, last, end))
+    })
+}
+
+struct Reduce<'a, 'b, 'c> {
+    sm: &'a Small<'b>,
+    codec: &'a Codec<'c>,
+    out: &'a mut ShardOut,
+    cnt: Vec<usize>,
+    active: Vec<u32>,
+    pos: Vec<u32>,
+    catsum: Vec<i64>,
+}
+
+impl<'a, 'b, 'c> Reduce<'a, 'b, 'c> {
+    fn new(sm: &'a Small<'b>, codec: &'a Codec<'c>, out: &'a mut ShardOut) -> Self {
+        let ncamp = sm.camp_names.len();
+        Self {
+            sm,
+            codec,
+            out,
+            cnt: vec![0; ncamp],
+            active: Vec::new(),
+            pos: vec![0; ncamp],
+            catsum: vec![0; sm.cat_names.len()],
+        }
+    }
+
+    fn person<T: Temporal>(
+        &mut self,
+        person: u64,
+        sessions: impl Iterator<Item = (T, T, usize)>,
+        purchases: &[Purchase<T>],
+        clicks: &[impl Borrow<Click>],
+        layout: T::Layout,
+    ) {
+        let Self {
+            sm,
+            codec,
+            out: ShardOut { users, camps },
+            cnt,
+            active,
+            pos,
+            catsum,
+        } = self;
+        let mut pi = 0;
+        let (mut lo, mut hi) = (0usize, 0usize);
+        let mut latest = 0;
+
+        let mut cur_day: i32 = i32::MIN;
+        let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
+
+        for (first, end, count) in sessions {
+            let start = first.ts(layout);
+            let day = start.div_euclid(DAY) as i32;
+            if day != cur_day {
+                if cur_day != i32::MIN {
+                    finish_user_day(users, cur_day, d_sess, d_ev, d_rev, catsum, &sm.cat_rank);
+                }
+                cur_day = day;
+                (d_sess, d_ev, d_rev) = (0, 0, 0);
+            }
+            let mut rev = 0i64;
+            // Each retained purchase contributed one immutable temporal key
+            // before the sort. Sessions end on inclusive, disjoint key ranges:
+            // consume ALL purchases at the last instant, including exact ties.
+            let p0 = pi;
+            debug_assert!(purchases.get(pi).is_none_or(|p| p.key >= first));
+            while pi < purchases.len() && purchases[pi].key <= end {
+                let e = &purchases[pi];
+                rev += e.price as i64;
+                catsum[e.cat as usize] += e.price as i64;
+                pi += 1;
+            }
+            d_sess += 1;
+            d_ev += count as i64;
+            d_rev += rev;
+
+            // slide the click window to [start - 7d, start]
+            while hi < clicks.len() && clicks[hi].borrow().ts <= start {
+                let click = clicks[hi].borrow();
+                let previous = clicks[latest].borrow();
+                if hi == 0 || click.ts != previous.ts || codec.less(click.cid, previous.cid) {
+                    latest = hi;
+                }
+                let c = click.camp as usize;
+                if cnt[c] == 0 {
+                    pos[c] = active.len() as u32;
+                    active.push(c as u32);
+                }
+                cnt[c] += 1;
+                hi += 1;
+            }
+            while lo < hi && clicks[lo].borrow().ts < start.saturating_sub(WEEK) {
+                let c = clicks[lo].borrow().camp as usize;
+                cnt[c] -= 1;
+                if cnt[c] == 0 {
+                    let p = pos[c] as usize;
+                    let last = active.pop().unwrap();
+                    if last as usize != c {
+                        active[p] = last;
+                        pos[last as usize] = p as u32;
+                    }
+                }
+                lo += 1;
+            }
+            // The entire latest timestamp run expires together. Identical
+            // copies change neither the tie winner nor campaign membership.
+            let credit = if lo < hi { clicks[latest].borrow().camp } else { ORGANIC };
+            let e = camps.entry(ckey(credit, day)).or_insert([0; 4]);
+            e[0] += 1;
+            e[1] += (pi != p0) as i64;
+            e[2] += rev;
+            for &a in active.iter() {
+                camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
+            }
+        }
+        finish_user_day(users, cur_day, d_sess, d_ev, d_rev, catsum, &sm.cat_rank);
+        users.finish_person(person);
+        for &a in active.iter() {
+            cnt[a as usize] = 0;
+        }
+        active.clear();
+        debug_assert_eq!(pi, purchases.len());
+    }
+}
+
+fn process_wide(pieces: Vec<Stream<Wide>>, click_pieces: Vec<Vec<PCl>>, reduce: &mut Reduce) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
     let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
     if ne == 0 {
@@ -363,139 +520,60 @@ fn process_stream<T: Temporal>(
     }
     evs.sort_unstable();
     purchases.sort_unstable_by_key(|p| p.key);
-    cls.sort_unstable_by_key(|c| (c.person, c.ts));
-    let ncamp = sm.camp_names.len();
-    let mut cnt = vec![0usize; ncamp]; // copies enter and leave the window together
-    let mut active: Vec<u32> = Vec::new(); // campaigns with cnt > 0
-    let mut pos = vec![0u32; ncamp]; // index of a campaign inside `active`
-    let mut catsum = vec![0i64; sm.cat_names.len()];
-
-    let mut ci = 0usize;
-    let mut i = 0usize;
-    let mut pi = 0usize;
+    let mut cls = gather(click_pieces);
+    cls.sort_unstable_by_key(|c| (c.person, c.click.ts));
+    let (mut i, mut pi, mut ci) = (0, 0, 0);
     while i < evs.len() {
-        let rank = evs[i].person(layout);
-        let person = T::name(rank, people);
-        let mut j = i;
-        while j < evs.len() && evs[j].person(layout) == rank {
+        let person = evs[i].person;
+        let mut j = i + 1;
+        while j < evs.len() && evs[j].person == person {
             j += 1;
         }
-        while ci < cls.len() && cls[ci].person < rank {
+        let p0 = pi;
+        while pi < purchases.len() && purchases[pi].key.person == person {
+            pi += 1;
+        }
+        while ci < cls.len() && cls[ci].person < person {
             ci += 1;
         }
         let c0 = ci;
-        while ci < cls.len() && cls[ci].person == rank {
+        while ci < cls.len() && cls[ci].person == person {
             ci += 1;
         }
-        let clicks = &cls[c0..ci];
-        let (mut lo, mut hi) = (0usize, 0usize);
-        let mut latest = 0;
-
-        let mut cur_day: i32 = i32::MIN;
-        let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
-
-        let mut k = i;
-        while k < j {
-            // one session is evs[k..m]
-            let start = evs[k].ts(layout);
-            let mut m = k + 1;
-            while m < j && evs[m].gap(evs[m - 1]) <= GAP as u64 {
-                m += 1;
-            }
-            let day = start.div_euclid(DAY) as i32;
-            if day != cur_day {
-                if cur_day != i32::MIN {
-                    finish_user_day(users, cur_day, d_sess, d_ev, d_rev, &mut catsum, &sm.cat_rank);
-                }
-                cur_day = day;
-                (d_sess, d_ev, d_rev) = (0, 0, 0);
-            }
-            let mut rev = 0i64;
-            // Each retained purchase contributed one immutable temporal key
-            // before the sort. Sessions end on inclusive, disjoint key ranges:
-            // consume ALL purchases at the last instant, including exact ties.
-            let p0 = pi;
-            let end = evs[m - 1];
-            debug_assert!(purchases.get(pi).is_none_or(|p| p.key >= evs[k]));
-            while pi < np && purchases[pi].key <= end {
-                let e = &purchases[pi];
-                rev += e.price as i64;
-                catsum[e.cat as usize] += e.price as i64;
-                pi += 1;
-            }
-            d_sess += 1;
-            d_ev += (m - k) as i64;
-            d_rev += rev;
-
-            // slide the click window to [start - 7d, start]
-            while hi < clicks.len() && clicks[hi].ts <= start {
-                if hi == 0
-                    || clicks[hi].ts != clicks[latest].ts
-                    || people.codec.less(clicks[hi].cid, clicks[latest].cid)
-                {
-                    latest = hi;
-                }
-                let c = clicks[hi].camp as usize;
-                if cnt[c] == 0 {
-                    pos[c] = active.len() as u32;
-                    active.push(c as u32);
-                }
-                cnt[c] += 1;
-                hi += 1;
-            }
-            while lo < hi && clicks[lo].ts < start.saturating_sub(WEEK) {
-                let c = clicks[lo].camp as usize;
-                cnt[c] -= 1;
-                if cnt[c] == 0 {
-                    let p = pos[c] as usize;
-                    let last = active.pop().unwrap();
-                    if last as usize != c {
-                        active[p] = last;
-                        pos[last as usize] = p as u32;
-                    }
-                }
-                lo += 1;
-            }
-            // The entire latest timestamp run expires together. Identical
-            // copies change neither the tie winner nor campaign membership.
-            let credit = if lo < hi { clicks[latest].camp } else { ORGANIC };
-            let e = camps.entry(ckey(credit, day)).or_insert([0; 4]);
-            e[0] += 1;
-            e[1] += (pi != p0) as i64;
-            e[2] += rev;
-            for &a in &active {
-                camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
-            }
-            k = m;
-        }
-        finish_user_day(users, cur_day, d_sess, d_ev, d_rev, &mut catsum, &sm.cat_rank);
-        users.finish_person(person);
-        for &a in &active {
-            cnt[a as usize] = 0;
-        }
-        active.clear();
+        reduce.person(
+            person,
+            ordered_sessions(&evs[i..j]),
+            &purchases[p0..pi],
+            &cls[c0..ci],
+            (),
+        );
         i = j;
     }
     debug_assert_eq!(pi, np);
 }
 
 fn process_shard(
+    owner: usize,
     evs: Vec<Payload>,
     cls: Vec<Clicks>,
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
 ) -> ShardOut {
-    let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
-    let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
     let mut out = ShardOut {
         users: output::UserColumns::default(),
         camps: Map::with_hasher(rs()),
     };
-    if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+    if evs.is_empty() {
+        return out;
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
+    let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
+    let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
+    let mut reduce = Reduce::new(sm, &people.codec, &mut out);
+    if let Some(pack) = packing {
+        ranges::process(owner, packed, pc, people, pack, &mut reduce);
+    }
+    process_wide(wide, wc, &mut reduce);
     out
 }
 
@@ -551,7 +629,7 @@ fn main() {
     );
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
     let names = person_names(&link_chunks);
-    let packing = Packing::new(ws, we, names.rank_limit);
+    let packing = Packing::new(ws, we);
     log(&format!("links: {} linked ids", names.count));
 
     let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, &log);
@@ -570,15 +648,16 @@ fn main() {
         .zip(by_destination(cl_by_person, |c| {
             !c.packed.is_empty() || !c.wide.is_empty()
         }))
+        .enumerate()
         .collect();
-    jobs.sort_unstable_by_key(|(e, c)| {
+    jobs.sort_unstable_by_key(|(_, (e, c))| {
         std::cmp::Reverse(
             e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
         )
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(owner, (e, c))| process_shard(owner, e, c, &sm, &names, packing))
         .collect();
     log("sessions done");
 

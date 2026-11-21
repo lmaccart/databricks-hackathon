@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Practice candidate: physical-slot identity graph and direct person ranges — 2026-11-21
+
+[`0558eaa`](https://github.com/lmaccart/databricks-hackathon/commit/0558eaa7acd59463d21a888e1d418d676301e07f) beat the scored build in 18/18 pairs including full Docker **1.792 → 1.617 s** at 20M and **5.451 → 4.618 s** at 60M. Against the physical-slot graph and column writer alone on a different CPU it also won 18/18, including 3.6% / 3.1% in Docker. All rows on two 60M inputs, the Linux Python matrix and new graph-contention checks matched. [Results](PERF_154.md#verified-release-checkpoint).
+
 ## Practice candidate: exact singleton ranks and direct Parquet columns — 2026-11-21
 
 [`4ad0e5d` won 18/18 release pairs](https://github.com/lmaccart/databricks-hackathon/actions/runs/44934668743) against the 1.54 s control. Under restricted Docker, medians fell **1.816 → 1.722 s** at 20M and **5.532 → 5.199 s** at 60M. It matched both 60M inputs (seeds 13 and 948307), all 60 Linux Python comparisons, dev, fixtures and opaque/malformed inputs. [Full evidence](PERF_154.md#verified-release-checkpoint). The latest organizer score is still 1.54 s.

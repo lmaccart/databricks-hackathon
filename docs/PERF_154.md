@@ -6,6 +6,8 @@ Seed 7 has 1.921 GB of event, click and link CSVs before the dimension files and
 
 ## Verified release checkpoint
 
+[`0558eaa`](https://github.com/lmaccart/databricks-hackathon/commit/0558eaa7acd59463d21a888e1d418d676301e07f) superseded the first checkpoint below. Its physical-slot identity graph and direct temporal ranges won **18/18 pairs** [against the scored control](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935810599) and **18/18** [against the otherwise identical build without direct ranges](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935810612). The latter comparison gained 3.6% / 3.1% in restricted Docker at 20M / 60M on another model of AMD CPU and passed the 60-case Python oracle. Details below.
+
 [`4ad0e5d`](https://github.com/lmaccart/databricks-hackathon/commit/4ad0e5d) combines the singleton slots and column writer. It won all **18/18** alternating pairs on a four-worker Xeon 6975P-C in the [packaged comparison against `7fd1b76`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44934668743).
 
 | Input and timing scope | Pairs | Control | Candidate | Less time |
@@ -95,6 +97,7 @@ Each row compares a component with and without the other change on the **same** 
 | [Scored control → slot-based union alone, AMD EPYC 9V74](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935468441) | 2.227 → **2.150** | 6.723 → **6.257** |
 | [Scored control → slot-based union + columns, AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935468450) | 2.258 → **2.096** | 6.870 → **6.332** |
 | [Scored control → slot-based union, direct time ranges and columns (`0558eaa`), AMD EPYC 9V45](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935810599) | 1.792 → **1.617** | 5.451 → **4.618** |
+| [Add direct per-person ranges to `4933dbe`, AMD EPYC 9V74](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935810612) | 2.042 → **1.968** | 5.917 → **5.734** |
 
 The initial singleton technique by itself added almost nothing to the columns in the two full-Docker comparisons on the Xeon 8370C. Replacing the graph construction as well made a measurable difference on the 6975P-C: every pair favored physical slots, including all three final-scale pairs. Keeping a slot as the union node eliminates endpoint sorting/deduplication and gives the parser a direct rank to write.
 

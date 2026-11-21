@@ -1,6 +1,6 @@
 //! Most events carry only a temporal key. Purchases carry their own full
 //! payload until dedup, then contribute a key to the temporal stream as well.
-use super::{Identity, People};
+use super::{Identity, NS, People};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Wide {
@@ -9,50 +9,31 @@ pub(super) struct Wide {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct Packing {
-    origin: i64,
-    bits: u32,
-    mask: u64,
-}
+pub(super) struct Packing(pub i64);
 
 impl Packing {
-    pub fn new(ws: i64, we: i64, ranks: usize) -> Option<Self> {
-        let span = (we as i128 - ws as i128 - 1).try_into().ok()?;
-        let bits = u64::BITS - u64::leading_zeros(span);
-        let rank_bits = usize::BITS - ranks.checked_sub(1)?.leading_zeros();
-        // The top bit stays clear, leaving u64::MAX as a tombstone.
-        if bits + rank_bits >= u64::BITS {
-            return None;
-        }
-        Some(Self {
-            origin: ws,
-            bits,
-            mask: (1 << bits) - 1,
-        })
+    pub fn new(ws: i64, we: i64) -> Option<Self> {
+        u32::try_from(i128::from(we) - i128::from(ws) - 1).ok()?;
+        Some(Self(ws))
     }
 
     #[inline]
     pub fn encode(self, rank: u32, ts: i64) -> u64 {
-        (u64::from(rank) << self.bits) | (ts as u64).wrapping_sub(self.origin as u64)
+        // Destination supplies the low byte of rank. The top byte remains
+        // zero, leaving u64::MAX available as a dedup tombstone.
+        (u64::from(rank >> NS.trailing_zeros()) << 32) | (ts - self.0) as u64
     }
 }
 
 pub(super) trait Temporal: Copy + Ord {
     type Layout: Copy;
-    fn person(self, layout: Self::Layout) -> u64;
     fn ts(self, layout: Self::Layout) -> i64;
     // Only compared within one person's ordered keys.
     fn gap(self, prev: Self) -> u64;
-    fn name(person: u64, people: &People) -> u64;
 }
 
 impl Temporal for Wide {
     type Layout = ();
-
-    #[inline]
-    fn person(self, (): ()) -> u64 {
-        self.person
-    }
 
     #[inline]
     fn ts(self, (): ()) -> i64 {
@@ -63,34 +44,19 @@ impl Temporal for Wide {
     fn gap(self, prev: Self) -> u64 {
         self.ts.abs_diff(prev.ts)
     }
-
-    #[inline]
-    fn name(person: u64, _: &People) -> u64 {
-        person
-    }
 }
 
-impl Temporal for u64 {
+impl Temporal for u32 {
     type Layout = Packing;
 
     #[inline]
-    fn person(self, pack: Packing) -> u64 {
-        self >> pack.bits
-    }
-
-    #[inline]
     fn ts(self, pack: Packing) -> i64 {
-        (self & pack.mask).wrapping_add(pack.origin as u64) as i64
+        pack.0 + i64::from(self)
     }
 
     #[inline]
     fn gap(self, prev: Self) -> u64 {
-        self - prev
-    }
-
-    #[inline]
-    fn name(rank: u64, people: &People) -> u64 {
-        people.original(rank as u32)
+        u64::from(self - prev)
     }
 }
 
@@ -149,8 +115,7 @@ impl Payload {
     ) -> usize {
         let purchase = usize::from(price != 0);
         let person = match identity {
-            Identity::Linked(routed) => {
-                let rank = routed as u32;
+            Identity::Ranked(rank) => {
                 if let Some(p) = packing {
                     return self.packed.push(p.encode(rank, ts), price, cat) * 4 + purchase;
                 }
@@ -167,19 +132,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn packing_checks_total_width_and_preserves_signed_millisecond_order() {
-        let p = Packing::new(-5000, 5000, 4).unwrap();
-        assert!(p.encode(1, -5000) > p.encode(0, 4999));
-        assert!(p.encode(1, -1) < p.encode(1, 0));
-        assert_eq!(p.encode(3, -5000).ts(p), -5000);
-        assert_eq!(p.encode(3, 4999).ts(p), 4999);
-        assert_eq!(p.encode(3, 4999).person(p), 3);
-        assert!(Packing::new(i64::MIN + 1, i64::MAX, 4).is_none());
-        assert!(Packing::new(0, 1i64 << 48, 1 << 17).is_none());
-        let p = Packing::new(0, 1i64 << 31, u32::MAX as usize).unwrap();
-        assert_eq!(
-            p.encode(u32::MAX - 1, (1i64 << 31) - 1).person(p),
-            (u32::MAX - 1) as u64
-        );
+    fn packing_checks_offset_width_and_keeps_dedup_sentinel_outside_domain() {
+        let p = Packing::new(-5000, (1i64 << 32) - 5000).unwrap();
+        assert_eq!(p.encode(999, -5000) as u32, 0);
+        assert_eq!((p.encode(999, -5001 + (1i64 << 32)) as u32).ts(p), -5001 + (1i64 << 32));
+        assert_eq!(p.encode(u32::MAX, -5000) >> 32, 0x00ff_ffff);
+        assert_ne!(p.encode(u32::MAX, -5001 + (1i64 << 32)), u64::MAX);
+        assert!(Packing::new(-5000, (1i64 << 32) - 4999).is_none());
+        assert!(Packing::new(i64::MIN + 1, i64::MAX).is_none());
     }
 }
