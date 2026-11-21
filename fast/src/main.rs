@@ -21,6 +21,7 @@ use std::time::Instant;
 mod events;
 mod links;
 mod output;
+mod permutation;
 mod person;
 use links::{People, person_names};
 use person::Codec;
@@ -31,6 +32,7 @@ const WEEK: i64 = 7 * DAY;
 const BAD: i64 = i64::MIN;
 const MAX_PRICE: i64 = 10_000_000;
 const NS: usize = 256; // shards for every hash partition
+const SHARD_SHIFT: u32 = 40;
 const CHUNK: usize = 8 << 20; // bytes per parse task
 const ORGANIC: u32 = u32::MAX;
 
@@ -177,7 +179,7 @@ struct PCl {
 
 #[inline]
 fn shard(h: u64) -> usize {
-    ((h >> 40) as usize) % NS
+    ((h >> SHARD_SHIFT) as usize) % NS
 }
 
 // A small live sample is only an allocation hint. Vectors still grow normally
@@ -276,9 +278,7 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
     best.map(|b| b as u32)
 }
 
-fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec) -> ShardOut {
-    evs.sort_unstable_by_key(|e| (e.person, e.ts));
-    cls.sort_unstable_by_key(|c| (c.person, c.ts));
+fn process_shard(evs: Vec<PEv>, cls: Vec<PCl>, sm: &Small, codec: &Codec) -> ShardOut {
     let ncamp = sm.camp_names.len();
     let mut users = Vec::new();
     let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
@@ -477,7 +477,11 @@ fn main() {
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(gather(e), gather(c), &sm, &names.codec))
+        .map(|(e, c)| {
+            let evs = permutation::gather_sorted(e, ws, we - 1, |e| (e.person, e.ts));
+            let cls = permutation::gather_sorted(c, ws - WEEK, we - 1, |c| (c.person, c.ts));
+            process_shard(evs, cls, &sm, &names.codec)
+        })
         .collect();
     log("sessions done");
 

@@ -1,5 +1,18 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Speculative numeric permutation sort — 2026-11-20 (Houston)
+
+Events and clicks independently budget a 64-bit descriptor from their shard
+lengths and the manifest time span. Removing the fixed routing bits preserves
+the order of the remaining person bits within a shard. The full person is
+checked while writing out each sorted prefix run; collisions use the exact
+person/time comparator. A descending timestamp in an otherwise single-person
+run must be inside one coarse bucket, so repairs sort only inverted buckets.
+Small or unrepresentable layouts use the existing exact comparison sort.
+Both implementations passed all 36 official fixtures; the candidate matched
+both dev-answer tables and the Python oracle on ten 12,000-event dirty seeds.
+Native 20M timings are pending the parent session's paired CI.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.
