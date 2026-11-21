@@ -1,5 +1,19 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Prefix-only radix permutation — 2026-11-20 (Houston)
+
+On top of `bf938da`, sort only the descriptor's person-prefix/time bits;
+source indices still identify payloads but no longer break ties. The first
+8-bit MSD pass scatters sequential input into a single word buffer; small
+subruns use comparison sort, while large subruns repartition in place. Each
+pass starts at its highest varying bit and stops before the source index.
+Exact person and timestamp reconciliation and the spill path are unchanged.
+All 19 Rust tests passed, along with both 31-test Python runs, 10 dirty
+seeds, and all 36 official fixtures on both implementations. Both dev
+checkers matched 117,038 user rows and 27,400 campaign rows exactly.
+The parent candidate's [Intel A/B](https://github.com/lmaccart/databricks-hackathon/actions/runs/44869797256)
+saved 2.5% and 3.8% total on two seeds. No 20M timing was run for this follow-up.
+
 ## Speculative numeric permutation sort — 2026-11-20 (Houston)
 
 Events and clicks independently budget a 64-bit descriptor from their shard

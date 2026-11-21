@@ -67,6 +67,103 @@ fn compare_sort<T: Copy>(pieces: Vec<Vec<T>>, key: impl Fn(&T) -> (u64, i64)) ->
     rows
 }
 
+const DIGIT_BITS: u32 = 8;
+const RADIX: usize = 1 << DIGIT_BITS;
+const COMPARISON_LIMIT: usize = 256;
+
+#[derive(Clone, Copy)]
+struct Digit {
+    shift: u32,
+    mask: usize,
+}
+
+impl Digit {
+    fn highest_varying(words: &[u64], index_bits: u32) -> Option<Self> {
+        let first = words[0];
+        let varying = words.iter().fold(0, |bits, &w| bits | (w ^ first));
+        let high = u64::BITS - varying.leading_zeros();
+        if high <= index_bits {
+            return None;
+        }
+        let width = (high - index_bits).min(DIGIT_BITS);
+        Some(Self {
+            shift: high - width,
+            mask: (1 << width) - 1,
+        })
+    }
+
+    #[inline]
+    fn of(self, word: u64) -> usize {
+        (word >> self.shift) as usize & self.mask
+    }
+
+    fn bounds(self, words: &[u64]) -> [usize; RADIX + 1] {
+        let mut bounds = [0; RADIX + 1];
+        for &word in words {
+            bounds[self.of(word) + 1] += 1;
+        }
+        for i in 1..=self.mask + 1 {
+            bounds[i] += bounds[i - 1];
+        }
+        bounds
+    }
+}
+
+/// Sort only person-prefix/time bits; the low bits travel as opaque payload.
+fn sort_prefix(words: &mut Vec<u64>, index_bits: u32) {
+    if words.len() <= COMPARISON_LIMIT {
+        words.sort_unstable_by_key(|word| word >> index_bits);
+        return;
+    }
+    let Some(digit) = Digit::highest_varying(words, index_bits) else {
+        return;
+    };
+    let bounds = digit.bounds(words);
+    let mut next = bounds;
+    // Read the large shard sequentially, scattering to at most 256 output
+    // cursors. Once partitioned, work on one contiguous subrun at a time.
+    let len = words.len();
+    let mut partitioned = Vec::with_capacity(len);
+    let dest = partitioned.spare_capacity_mut();
+    for &word in words.iter() {
+        let cursor = &mut next[digit.of(word)];
+        dest[*cursor].write(word);
+        *cursor += 1;
+    }
+    // SAFETY: the histogram assigns disjoint ranges that cover 0..len. Each
+    // range receives exactly its counted number of words.
+    unsafe { partitioned.set_len(len) };
+    if digit.shift > index_bits {
+        finish_buckets(&mut partitioned, &bounds[..=digit.mask + 1], index_bits);
+    }
+    *words = partitioned;
+}
+
+fn finish_buckets(words: &mut [u64], bounds: &[usize], index_bits: u32) {
+    for pair in bounds.windows(2) {
+        let bucket = &mut words[pair[0]..pair[1]];
+        if bucket.len() <= COMPARISON_LIMIT {
+            bucket.sort_unstable_by_key(|word| word >> index_bits);
+        } else if let Some(digit) = Digit::highest_varying(bucket, index_bits) {
+            // Large/skewed subruns get another MSD partition in place. The
+            // varying bits are strictly lower than in the parent partition.
+            let bounds = digit.bounds(bucket);
+            let mut next = bounds;
+            for i in 0..=digit.mask {
+                while next[i] < bounds[i + 1] {
+                    let slot = next[i];
+                    let target = digit.of(bucket[slot]);
+                    bucket.swap(slot, next[target]);
+                    next[target] += 1;
+                }
+            }
+            if digit.shift > index_bits {
+                finish_buckets(bucket, &bounds[..=digit.mask + 1], index_bits);
+            }
+        }
+    }
+}
+
 /// All pieces must belong to the same person shard and their accepted
 /// timestamps must lie in the inclusive [lo, hi] manifest bounds.
 pub(super) fn gather_sorted<T: Copy>(pieces: Vec<Vec<T>>, lo: i64, hi: i64, key: impl Fn(&T) -> (u64, i64)) -> Vec<T> {
@@ -92,7 +189,7 @@ pub(super) fn gather_sorted<T: Copy>(pieces: Vec<Vec<T>>, lo: i64, hi: i64, key:
             rows.push(row);
         }
     }
-    words.sort_unstable();
+    sort_prefix(&mut words, layout.index_bits);
 
     // Gather and verify together. Distinct prefix runs are already ordered.
     // A full-width timestamp bucket needs no tie repair. With coarse buckets,
@@ -133,6 +230,46 @@ pub(super) fn gather_sorted<T: Copy>(pieces: Vec<Vec<T>>, lo: i64, hi: i64, key:
 mod tests {
     use super::*;
 
+    fn check_word_order(mut got: Vec<u64>, index_bits: u32) {
+        let mut want = got.clone();
+        want.sort_unstable();
+        sort_prefix(&mut got, index_bits);
+        assert!(
+            got.iter()
+                .map(|w| w >> index_bits)
+                .eq(want.iter().map(|w| w >> index_bits))
+        );
+        got.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn ignores_reversed_indices_in_a_constant_prefix() {
+        let mut words: Vec<_> = (0..4096).rev().map(|i| (0x1234 << 12) | i).collect();
+        let original = words.clone();
+        sort_prefix(&mut words, 12);
+        assert!(words == original, "no work needed when only payload indices vary");
+    }
+
+    #[test]
+    fn sorts_meaningful_digits_and_preserves_the_word_multiset() {
+        for index_bits in [0, 1, 13, 24, 55, 63] {
+            for len in [0, 1, 128, COMPARISON_LIMIT as u64, COMPARISON_LIMIT as u64 + 1, 8192] {
+                let mask = (1 << index_bits) - 1;
+                let spread = (0..len).rev().map(|i| crate::links::mix(i) & !mask | (i & mask));
+                check_word_order(spread.collect(), index_bits);
+
+                // Sparse varying digits and a dominant top bucket; force the
+                // sorter to skip constant high digits again inside that bucket.
+                let skewed = (0..len).rev().map(|i| {
+                    let high = if i % 16 == 0 { 1u64 << 63 } else { 0 };
+                    high | ((i & 31) << 37) & !mask | (i & mask)
+                });
+                check_word_order(skewed.collect(), index_bits);
+            }
+        }
+    }
+
     fn compare(pieces: Vec<Vec<(u64, i64, usize)>>, lo: i64, hi: i64) {
         let mut want: Vec<_> = pieces.iter().flatten().copied().collect();
         want.sort_unstable();
@@ -148,7 +285,8 @@ mod tests {
 
     #[test]
     fn repairs_shared_prefix_and_reversed_bucket() {
-        let layout = Layout::new(256, i64::MIN, i64::MAX).unwrap();
+        let len = 4096;
+        let layout = Layout::new(len, i64::MIN, i64::MAX).unwrap();
         let p = 0xabc0_7a00_0000_0000;
         let q = p + 1;
         let r = 0xabd0_7a00_0000_0000;
@@ -159,13 +297,15 @@ mod tests {
 
         // p and q interleave by time; r has no collision but a reversed tie.
         // Duplicates have distinct payloads and must not be lost in repair.
-        let rows: Vec<_> = (0..256)
+        let rows: Vec<_> = (0..len)
             .map(|i| {
                 let (person, ts) = [(q, i64::MIN), (p, i64::MAX), (r, -2), (r, -3), (p, i64::MIN)][i % 5];
                 (person, ts, i)
             })
             .collect();
-        compare(rows.chunks(19).map(|c| c.to_vec()).collect(), i64::MIN, i64::MAX);
+        for rows in [rows.clone(), rows.into_iter().rev().collect()] {
+            compare(rows.chunks(19).map(|c| c.to_vec()).collect(), i64::MIN, i64::MAX);
+        }
     }
 
     #[test]
