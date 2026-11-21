@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Sort physical timelines before joining owners — 2026-11-21
+
+Detached experiment off `b136db4`. After all event claims have been resolved, sort the physical event, purchase and click arrays in their raw-user partitions. Probe the exact link table once per distinct active physical ID. Keep unlinked runs local and route a 16-byte reference per active linked ID (not rows). Canonical owners union exact session intervals and borrow the accompanying purchases and clicks. The single-run path reads slices directly, two runs merge linearly, and larger groups use a heap over run heads. No second time sort or generator-specific ID/window assumptions.
+
+Tradeoff: this replaces the baseline's packed 8-byte sort for linked events with the raw 16-byte sort, and retains the sorted click arrays through aggregation. The gain from dropping per-row lookup/cache checks and owner redistribution is unmeasured at 20M/60M; compare end-to-end and check peak RSS before choosing it.
+
+Checks: 43 edge cases against each implementation, 18 Rust tests, 36/36 official fixtures against each implementation, exact public dev parity with both comparers and empty stdout, 10 kit dirty seeds at 30k, 10 official generator comparisons at 10k/100k including leap-day seed 15, and transformed opaque-ID seed 15 parity at one and eight workers. New cases cover cross-file invalid and malformed copies, click-only aliases, inclusive click and session bounds, and nested intervals from 140 aliases.
+
 ## Raw-user partitioned identity join experiment — 2026-11-21
 
 Parse typed event and click payloads by raw-user shard, dedup events against those raw slot locations, and join each shard against its own exact link-table lane. A direct-mapped exact-token cache avoids repeated probes for hot IDs. Standalone events/clicks stay in their original buffers; linked rows move to canonical-owner shards. Link graph construction remains complete and precedes parsing. This increases interim event width and linked-row copying, so performance and 60M peak RSS need parent-side measurement; no 20M/60M benchmark was run here.

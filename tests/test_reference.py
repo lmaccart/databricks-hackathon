@@ -90,6 +90,93 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_two_alias_runs_expire_ties_together_and_skip_unseen_clicks(self):
+        start = WS_MS + DAY
+        after = start + 7 * DAY + DAY
+        a, b = "one-device-long", "two-device-long"
+        events = [
+            ev("a1", a, str(start)),
+            ev("b1", b, str(start + 15 * MIN)),
+            ev("a2", '"one-device-long"', str(after), "purchase", "p1", "5"),
+            ev("b2", b, str(after), "purchase", "p1", "7"),
+        ]
+        clicks = [
+            f"Z,{a},c_1,{start}",
+            f"002,{b},c_2,{start}",
+            f"03,{b},c_3,{start + 1}",
+            f"still-active,{a},c_1,{after - 7 * DAY}",
+            f"misses-by-ms,{b},c_2,{after + 1}",
+        ]
+        users, camps = run_case(events, clicks, [f"{a},{b}"])
+        self.assertEqual(set(users), {(a, "2026-10-02"), (a, "2026-10-10")})
+        self.assertTrue(all(r["events"] == 2 for r in users.values()))
+        self.assertEqual(users[(a, "2026-10-10")]["revenue_cents"], 12)
+        self.assertEqual(set(camps), {
+            ("c_1", "2026-10-02"), ("c_2", "2026-10-02"), ("c_1", "2026-10-10"),
+        })
+        self.assertEqual(camps[("c_2", "2026-10-02")]["sessions"], 1)
+        self.assertEqual(camps[("c_1", "2026-10-10")]["sessions"], 1)
+
+    def test_alias_intervals_bridge_and_keep_cross_file_winners_and_click_ties(self):
+        day1, day2 = "2026-10-01", "2026-10-02"
+        start = ms(f"{day1}T23:30:00Z")
+        a, b, c = "device alpha\0", "device-beta-very-long", "é-device"
+        events = [
+            ev("first", a, str(start), "purchase", "p1", "50"),
+            ev("next", a, str(start + 60 * MIN + 1), "purchase", "p2", "200"),
+            ev("overlap1", b, str(start + 30 * MIN), "purchase", "p2", "25"),
+            ev("survives-malformed", b, str(start + 30 * MIN), "purchase", "p1", "10"),
+            ev("would-bridge", c, str(start + 45 * MIN)),
+        ]
+        extra = {
+            "events/part-1.csv": [
+                ev("overlap2", c, str(start + 30 * MIN), "purchase", "p2", "25"),
+                ev("would-bridge", b, "bad", ingest=f"{day1}T23:29:59Z"),
+                ev('survives-malformed', '"broken', str(start), ingest=f"{day1}T23:29:59Z"),
+            ],
+            "clicks/part-1.csv": [f'"A-long-click-id",{c},c_2,{start}'],
+            "links/part-1.csv": [f"{b},{c}", f"{c},click-only-user-long"],
+        }
+        clicks = [
+            f"Z,{b},c_1,{start}",
+            f"A-long-click-id,{c},c_2,{start}",
+            f"week,click-only-user-long,c_3,{start - 7 * DAY}",
+            f"late,{a},c_1,{start + 1}",
+        ]
+        users, camps = run_case(events, clicks, [f"!unused,{a}", f"{a},{b}"], extra=extra)
+        self.assertEqual(set(users), {("!unused", day1), ("!unused", day2)})
+        fields = ("sessions", "events", "revenue_cents", "top_category")
+        self.assertEqual(tuple(users[("!unused", day1)][k] for k in fields), (1, 4, 110, "shoes"))
+        self.assertEqual(tuple(users[("!unused", day2)][k] for k in fields), (1, 1, 200, "hats"))
+        fields = ("sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions")
+        expected = {
+            ("c_1", day1): (0, 0, 0, 1), ("c_2", day1): (1, 1, 110, 1),
+            ("c_3", day1): (0, 0, 0, 1), ("c_1", day2): (1, 1, 200, 1),
+            ("c_2", day2): (0, 0, 0, 1),
+        }
+        self.assertEqual({k: tuple(row[f] for f in fields) for k, row in camps.items()}, expected)
+
+    def test_shared_alias_heap_keeps_end_of_containing_interval(self):
+        start = WS_MS + 2 * HOUR
+        ids = [f"opaque physical device {i:03}" for i in range(140)]
+        # The many point intervals are nested in device 0's long interval.
+        # Device 139 sits exactly 30 minutes past its end.
+        events = [ev(f"long{i}", ids[0], str(start + i * 30 * MIN)) for i in range(5)]
+        events += [
+            ev(f"point{i}", uid, str(start + 45 * MIN), "purchase", "p1", "5")
+            for i, uid in enumerate(ids[1:-1], 1)
+        ]
+        events += [ev("last", ids[-1], str(start + 150 * MIN), "purchase", "p2", "700")]
+        clicks = [f"click{i:03},{uid},c_{1 + i % 3},{start}" for i, uid in enumerate(ids)]
+        users, camps = run_case(events[::-1], clicks[::-1], [f"{a},{b}" for a, b in zip(ids, ids[1:])])
+        day = "2026-10-01"
+        self.assertEqual(set(users), {(ids[0], day)})
+        row = users[(ids[0], day)]
+        self.assertEqual((row["sessions"], row["events"], row["revenue_cents"], row["top_category"]),
+                         (1, len(events), 1390, "hats"))
+        self.assertEqual(camps[("c_1", day)]["sessions"], 1)
+        self.assertEqual({r["assisted_sessions"] for r in camps.values()}, {1})
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"
