@@ -8,6 +8,8 @@
 
 The [16-byte click trial](https://github.com/lmaccart/databricks-hackathon/actions/runs/44938958482) matched every row but lost 14/18 pairs against the practice build. Full Docker medians rose from **1.231 to 1.235 s** at 20M and **3.758 to 3.805 s** at 60M. Recommendation: `1a3d0fd`.
 
+On the contended eight-worker Mac, five-pair medians were **5.057 → 4.838 s** (seed 7) and **4.155 → 4.152 s** (seed 15). The trial won 3/5 on each seed; only the first median cleared 3%. All 29 Rust tests, 46 cases per implementation, ten dirty-seed checks, the official fixtures and both dev comparers passed.
+
 ## Verified cold-input comparison — 2026-11-21
 
 Keep `1a3d0fd` for practice. On the same four-worker Intel machine the change saved **27.3% / 28.4%** with fully resident inputs and **8.2% / 7.0%** with no input pages resident (20M / 60M). It won all six cold pairs and all six warm pairs. Outputs matched after every timed run. [Timing and cache verification](PERF_154.md#input-page-cache).
