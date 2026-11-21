@@ -348,8 +348,8 @@ fn process_stream<T: Temporal>(
         evs.extend(s.purchases.iter().map(|p| p.key));
         purchases.extend_from_slice(&s.purchases);
     }
-    evs.sort_unstable();
-    purchases.sort_unstable_by_key(|p| p.key);
+    T::sort_keys(&mut evs);
+    T::sort_purchases(&mut purchases);
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
     let ncamp = sm.camp_names.len();
     let mut cnt = vec![0usize; ncamp]; // copies enter and leave the window together

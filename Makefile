@@ -7,7 +7,7 @@ DEV ?= vendor/dev
 ANSWER ?= vendor/dev-answer
 OUT ?= out
 
-.PHONY: test build test-rust test-bin diff check clean fixtures dev check-dev
+.PHONY: test build build-highway test-rust test-rust-highway test-bin diff check clean fixtures dev check-dev
 
 test:            ## reference edge cases
 	python3 -m unittest discover -s tests -v
@@ -15,8 +15,14 @@ test:            ## reference edge cases
 build:           ## release build of the fast pipeline
 	cd fast && cargo build --locked --release
 
+build-highway:   ## opt-in Google Highway sort candidate (requires libhwy-contrib)
+	cd fast && cargo build --locked --release --features highway-sort
+
 test-rust:       ## parser differential, key encoding and forced collision tests
 	cd fast && cargo test --locked --release
+
+test-rust-highway: ## Rust tests with Highway sort candidate (requires libhwy-contrib)
+	cd fast && cargo test --locked --release --features highway-sort
 
 test-bin: build  ## same edge cases against the binary
 	SS_BIN=$(BIN) python3 -m unittest discover -s tests

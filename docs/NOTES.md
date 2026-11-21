@@ -1,5 +1,36 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Opt-in vectorized sort candidate — 2026-11-21
+
+Added an experimental `highway-sort` feature using the pinned `vqsort-rs`
+0.3.0 wrapper and Google Highway 1.0.3 (BSD-3-Clause / Apache-2.0, both
+MIT-compatible). The tiny upstream wrapper is vendored at its published
+upstream commit; its build script is minimally patched to pass pkg-config's
+include paths to the C++ compiler. The Docker build argument
+`HIGHWAY_SORT=1` installs the exact Debian Bookworm Highway package version;
+the ordinary build remains dependency-free and uses Rust's portable sort.
+Highway does runtime CPU dispatch rather than requiring application ISA flags.
+
+The packed linked-person timeline uses Highway's `u64` sort. Standalone and
+wide-fallback timelines use a lossless `u128` encoding
+`(person_u64, signed_timestamp_ordered_u64)`, so arbitrary person keys and all
+signed timestamp values retain lexicographic order without a global rank
+map. The key/value API is used only for packed purchases, where only the
+primary temporal key affects output; its value is the payload, whose order
+among equal timestamps is immaterial. Wide purchase records retain the exact
+Rust comparison sort.
+
+On the available ARM64 macOS host with Highway 1.4.0, 24 Rust tests passed
+both with and without the feature, all 36 official fixtures passed against
+the Highway binary, ten 20k-event generator seeds matched, and both dev
+checkers matched exactly (117,038 user-days and 27,400 campaign-days).
+`cargo clippy --all-targets --features highway-sort -- -D warnings` and
+`cargo fmt --check` passed. No Docker build, Debian Highway 1.0.3 build,
+Linux/amd64 or older-x86 dispatch check, or 20M timing was run. The feature
+is therefore **opt-in and not a production speed claim**; compare five paired
+20M runs before enabling it by default. The default build remains the
+portable Rust-sort fallback.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).

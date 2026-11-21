@@ -8,6 +8,8 @@ A native Rust entry for the [Databricks Shopping Sessions buildathon](https://ww
 
 ```sh
 docker build --platform linux/amd64 -t shopping-sessions .
+# Optional SIMD-sort experiment (requires Highway 1.0.3 build/runtime libraries):
+docker build --platform linux/amd64 --build-arg HIGHWAY_SORT=1 -t shopping-sessions-highway .
 # Create an empty output directory writable by uid 1000.
 mkdir -p out
 chmod 777 out
@@ -16,7 +18,7 @@ docker run --rm --platform linux/amd64 --network none --read-only --user 1000:10
   -v "$PWD/data:/data:ro" -v "$PWD/out:/output" shopping-sessions
 ```
 
-For a native build, run `make build`. Set `DATA_DIR`, `OUTPUT_DIR` and, for reproducible eight-worker timing, `RAYON_NUM_THREADS=8`. Use a **fresh output directory** each run; row order and part count are immaterial. The binary logs phase times to stderr.
+For a native build, run `make build`. `make build-highway` opts into the experimental Highway sorter and requires Google Highway's `libhwy-contrib` development package. The experiment is disabled by default until measured. Set `DATA_DIR`, `OUTPUT_DIR` and, for reproducible eight-worker timing, `RAYON_NUM_THREADS=8`. Use a **fresh output directory** each run; row order and part count are immaterial. The binary logs phase times to stderr.
 
 ## Verify against the organizers’ answers
 
@@ -41,4 +43,4 @@ The **Native amd64 performance check** workflow accepts `revision` and `baseline
 
 ## Credits
 
-Rust: Rayon, memchr, memmap2, aHash, serde_json, bytes, and the Apache Arrow project's Parquet crate. Python: PyArrow; Polars in the organizers’ test harness. The official generator, fixtures and dev answer are distributed by the organizers and are not checked in. Entry code: [MIT](LICENSE).
+Rust: Rayon, memchr, memmap2, aHash, serde_json, bytes, the Apache Arrow project's Parquet crate, and `vqsort-rs` 0.3.0 with Google Highway 1.0.3 (Apache-2.0/BSD-3-Clause, both MIT-compatible). Python: PyArrow; Polars in the organizers’ test harness. The official generator, fixtures and dev answer are distributed by the organizers and are not checked in. Entry code: [MIT](LICENSE).

@@ -39,6 +39,8 @@ impl Packing {
 
 pub(super) trait Temporal: Copy + Ord {
     type Layout: Copy;
+    fn sort_keys(values: &mut [Self]);
+    fn sort_purchases(purchases: &mut [Purchase<Self>]);
     fn person(self, layout: Self::Layout) -> u64;
     fn ts(self, layout: Self::Layout) -> i64;
     // Only compared within one person's ordered keys.
@@ -48,6 +50,32 @@ pub(super) trait Temporal: Copy + Ord {
 
 impl Temporal for Wide {
     type Layout = ();
+
+    fn sort_keys(values: &mut [Self]) {
+        #[cfg(feature = "highway-sort")]
+        {
+            const SIGN: u64 = 1 << 63;
+            // This is an exact 128-bit (person, ordered timestamp) key; no
+            // truncated identity or global rank can merge distinct people.
+            let mut keys: Vec<u128> = values
+                .iter()
+                .map(|wide| (u128::from(wide.person) << 64) | u128::from((wide.ts as u64) ^ SIGN))
+                .collect();
+            vqsort_rs::sort(&mut keys);
+            for (wide, key) in values.iter_mut().zip(keys) {
+                *wide = Self {
+                    person: (key >> 64) as u64,
+                    ts: (key as u64 ^ SIGN) as i64,
+                };
+            }
+        }
+        #[cfg(not(feature = "highway-sort"))]
+        values.sort_unstable();
+    }
+
+    fn sort_purchases(purchases: &mut [Purchase<Self>]) {
+        purchases.sort_unstable_by_key(|purchase| purchase.key);
+    }
 
     #[inline]
     fn person(self, (): ()) -> u64 {
@@ -72,6 +100,38 @@ impl Temporal for Wide {
 
 impl Temporal for u64 {
     type Layout = Packing;
+
+    fn sort_keys(values: &mut [Self]) {
+        #[cfg(feature = "highway-sort")]
+        vqsort_rs::sort(values);
+        #[cfg(not(feature = "highway-sort"))]
+        values.sort_unstable();
+    }
+
+    fn sort_purchases(purchases: &mut [Purchase<Self>]) {
+        #[cfg(feature = "highway-sort")]
+        {
+            use vqsort_rs::{Key64Value64, sort};
+
+            // Highway compares only `key` for K64V64. Equal-time payload
+            // order is immaterial, but the full payload must travel with it.
+            let mut pairs: Vec<_> = purchases
+                .iter()
+                .map(|purchase| Key64Value64 {
+                    key: purchase.key,
+                    value: (u64::from(purchase.price) << 32) | u64::from(purchase.cat),
+                })
+                .collect();
+            sort(&mut pairs);
+            for (purchase, pair) in purchases.iter_mut().zip(pairs) {
+                purchase.key = pair.key;
+                purchase.price = (pair.value >> 32) as u32;
+                purchase.cat = pair.value as u32;
+            }
+        }
+        #[cfg(not(feature = "highway-sort"))]
+        purchases.sort_unstable_by_key(|purchase| purchase.key);
+    }
 
     #[inline]
     fn person(self, pack: Packing) -> u64 {
@@ -165,6 +225,87 @@ impl Payload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_temporal_sort_preserves_full_unsigned_people_and_signed_times() {
+        let mut input = vec![
+            Wide {
+                person: u64::MAX,
+                ts: i64::MIN,
+            },
+            Wide {
+                person: 0,
+                ts: i64::MAX,
+            },
+            Wide {
+                person: 1 << 63,
+                ts: -1,
+            },
+            Wide {
+                person: 1 << 63,
+                ts: i64::MIN,
+            },
+            Wide {
+                person: 1 << 63,
+                ts: i64::MAX,
+            },
+            Wide {
+                person: 1 << 63,
+                ts: -1,
+            },
+        ];
+        let mut expected = input.clone();
+        expected.sort_unstable();
+
+        <Wide as Temporal>::sort_keys(&mut input);
+        assert!(input.iter().eq(expected.iter()));
+    }
+
+    #[test]
+    fn packed_temporal_sort_covers_unsigned_edges_and_duplicates() {
+        let mut input = vec![u64::MAX, 0, 1 << 63, 7, 1 << 63, u64::MAX, 1];
+        let mut expected = input.clone();
+        expected.sort_unstable();
+
+        <u64 as Temporal>::sort_keys(&mut input);
+        assert_eq!(input, expected);
+    }
+
+    #[test]
+    fn packed_purchase_sort_keeps_payloads_attached_to_equal_time_keys() {
+        let mut input = vec![
+            Purchase {
+                key: u64::MAX,
+                price: 7,
+                cat: 3,
+            },
+            Purchase {
+                key: 4,
+                price: 9,
+                cat: 1,
+            },
+            Purchase {
+                key: 4,
+                price: 2,
+                cat: 8,
+            },
+            Purchase {
+                key: 0,
+                price: 1,
+                cat: 0,
+            },
+        ];
+        let expected_payloads: Vec<_> = input.iter().map(|p| (p.price, p.cat)).collect();
+
+        <u64 as Temporal>::sort_purchases(&mut input);
+
+        assert!(input.windows(2).all(|pair| pair[0].key <= pair[1].key));
+        let mut actual_payloads: Vec<_> = input.iter().map(|p| (p.price, p.cat)).collect();
+        let mut expected_payloads = expected_payloads;
+        actual_payloads.sort_unstable();
+        expected_payloads.sort_unstable();
+        assert_eq!(actual_payloads, expected_payloads);
+    }
 
     #[test]
     fn packing_checks_total_width_and_preserves_signed_millisecond_order() {
