@@ -23,6 +23,7 @@ mod events;
 mod links;
 mod output;
 mod person;
+mod rowlocal;
 mod stream;
 use links::{Identity, People, person_names};
 use person::Codec;
@@ -334,6 +335,7 @@ fn process_stream<T: Temporal>(
     sm: &Small,
     people: &People,
     layout: T::Layout,
+    window: (i64, i64),
     ShardOut { users, camps }: &mut ShardOut,
 ) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
@@ -341,13 +343,12 @@ fn process_stream<T: Temporal>(
     if ne == 0 {
         return;
     }
-    let mut evs = Vec::with_capacity(ne);
-    let mut purchases = Vec::with_capacity(np);
-    for s in pieces {
-        evs.extend_from_slice(&s.times);
-        evs.extend(s.purchases.iter().map(|p| p.key));
-        purchases.extend_from_slice(&s.purchases);
-    }
+    let rowlocal::Gathered {
+        keys: mut evs,
+        mut purchases,
+        hot,
+        sessions,
+    } = rowlocal::gather(pieces, (ne, np), layout, window);
     evs.sort_unstable();
     purchases.sort_unstable_by_key(|p| p.key);
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
@@ -381,14 +382,20 @@ fn process_stream<T: Temporal>(
         let mut cur_day: i32 = i32::MIN;
         let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
 
+        let compressed = hot == Some(rank);
         let mut k = i;
         while k < j {
-            // one session is evs[k..m]
             let start = evs[k].ts(layout);
-            let mut m = k + 1;
-            while m < j && evs[m].gap(evs[m - 1]) <= GAP as u64 {
-                m += 1;
-            }
+            let (end, m, count) = if compressed {
+                let span = sessions[k - i];
+                (span.end, k + 1, span.count)
+            } else {
+                let mut m = k + 1;
+                while m < j && evs[m].gap(evs[m - 1]) <= GAP as u64 {
+                    m += 1;
+                }
+                (evs[m - 1], m, m - k)
+            };
             let day = start.div_euclid(DAY) as i32;
             if day != cur_day {
                 if cur_day != i32::MIN {
@@ -407,11 +414,9 @@ fn process_stream<T: Temporal>(
                 (d_sess, d_ev, d_rev) = (0, 0, 0);
             }
             let mut rev = 0i64;
-            // Each retained purchase contributed one immutable temporal key
-            // before the sort. Sessions end on inclusive, disjoint key ranges:
-            // consume ALL purchases at the last instant, including exact ties.
+            // Purchases supply temporal keys (possibly compressed), but payloads
+            // stay separate. Consume all purchases through the inclusive end.
             let p0 = pi;
-            let end = evs[m - 1];
             debug_assert!(purchases.get(pi).is_none_or(|p| p.key >= evs[k]));
             while pi < np && purchases[pi].key <= end {
                 let e = &purchases[pi];
@@ -420,7 +425,7 @@ fn process_stream<T: Temporal>(
                 pi += 1;
             }
             d_sess += 1;
-            d_ev += (m - k) as i64;
+            d_ev += count as i64;
             d_rev += rev;
 
             // slide the click window to [start - 7d, start]
@@ -489,6 +494,7 @@ fn process_shard(
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
+    window: (i64, i64),
 ) -> ShardOut {
     let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
     let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
@@ -497,9 +503,9 @@ fn process_shard(
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        process_stream(packed, gather(pc), sm, people, pack, window, &mut out);
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
+    process_stream(wide, gather(wc), sm, people, (), window, &mut out);
     out
 }
 
@@ -582,7 +588,7 @@ fn main() {
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(e, c)| process_shard(e, c, &sm, &names, packing, (ws, we)))
         .collect();
     log("sessions done");
 

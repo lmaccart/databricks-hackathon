@@ -89,6 +89,43 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
     return f"{eid},{uid},{ts},{ingest},{etype},{pid},{price}"
 
 
+class LocalIntervals(unittest.TestCase):
+    def test_disordered_tiles_bridge_midnight_and_count_purchases_once(self):
+        midnight = WS_MS + DAY
+        minute = lambda offset: str(midnight + offset * MIN)
+        # Part 0 by itself has two components; part 1 bridges the first pair
+        # across midnight. Part 2's nested span must not shorten the union.
+        # Part 3 starts a separate session exactly GAP + 1 ms after the end.
+        events = [ev(f"a{i}", "alias", minute(offset))
+                  for i, offset in enumerate((20, -40, -20, -40) * 2200)]
+        tiles = {
+            "events/part-1.csv": [
+                ev("bridge", "hot", minute(0)),
+                ev("buy", "hot", minute(40), "purchase", "p2", "50"),
+                ev("duplicate", "hot", minute(60), "purchase", "p1", "900",
+                   ingest="2026-10-02T01:01:00Z"),
+            ],
+            "events/part-2.csv": [
+                ev("nested", "hot", minute(-35)),
+                ev("duplicate", "", minute(60), ingest="2026-10-02T01:00:00Z"),
+            ],
+            "events/part-3.csv": [
+                ev("other", "alias", str(int(minute(70)) + 1), "purchase", "p1", "80"),
+                ev("cold", "cold", minute(0)),
+            ],
+        }
+        clicks = ["a,hot,c_1," + minute(-40), "b,alias,c_2," + minute(0)]
+        users, campaigns = run_case(events, clicks, ["hot,alias"], extra=tiles)
+        first, second = users["alias", "2026-10-01"], users["alias", "2026-10-02"]
+        self.assertEqual((first["sessions"], first["events"], first["revenue_cents"], first["top_category"]),
+                         (1, len(events) + 3, 50, "hats"))
+        self.assertEqual((second["sessions"], second["events"], second["revenue_cents"]), (1, 1, 80))
+        self.assertEqual(set(users), {("alias", "2026-10-01"), ("alias", "2026-10-02"),
+                                      ("cold", "2026-10-02")})
+        self.assertEqual(campaigns["c_1", "2026-10-01"]["purchasing_sessions"], 1)
+        self.assertEqual(campaigns["c_2", "2026-10-02"]["revenue_cents"], 80)
+
+
 class EventClaims(unittest.TestCase):
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"

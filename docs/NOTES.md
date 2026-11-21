@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 3 candidate: tile-local hot-person spans — 2026-11-21
+
+After global dedup, sample up to 256 keys from the largest source tile in each eligible person-shard stream. At most one exact person token per stream uses tile-local gap-width buckets. Each nonempty bucket is already connected; adjacent buckets and then sorted tile spans merge only when the actual endpoints are within the gap. The final merge retains the maximum end. Cold keys use the original sort, and sparse purchase records still get counted once through the inclusive session end.
+
+Both 39-case edge suites, 21 Rust tests, all 36 official fixtures per implementation, 10 dirty seeds and both official dev comparers passed. Five alternating native pairs on the 1M dev set (two workers) gave **0.114 → 0.111 s**; the session-phase median was **0.027 → 0.027 s**, so this does not establish a speedup. No practice-size, final-size or Docker measurements were run for this experiment.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.
