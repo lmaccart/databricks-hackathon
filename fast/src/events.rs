@@ -3,6 +3,8 @@
 use super::*;
 use std::hash::{BuildHasherDefault, Hasher};
 
+mod word;
+
 #[derive(Clone, Copy)]
 struct Claim {
     key_and_target: u64,
@@ -93,6 +95,7 @@ struct Location {
 }
 
 #[derive(Clone, Copy, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 struct Pending {
     claim_key: u64,
     uid: u64, // zero is never the key of a nonempty ID
@@ -103,13 +106,52 @@ struct Pending {
     cat: u32,
 }
 
+#[inline]
+fn decode_fields<'a>(
+    r: &[&'a [u8]; 8],
+    sm: &Small,
+    codec: &Codec<'a>,
+    (ws, we, clock): (i64, i64, &ManifestClock),
+    spill: &mut Vec<i64>,
+) -> Option<Pending> {
+    if r[0].is_empty() {
+        return None;
+    }
+    let claim_key = links::mix(codec.key(r[0]));
+    let (ingest, seconds) = clock.ingest_for_claim(r[3]);
+    let ts = clock.parse_ts(r[2]);
+    let mut next = Pending {
+        claim_key,
+        ts,
+        claim_order: Claim::order(ingest, seconds, spill),
+        ..Default::default()
+    };
+    if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
+        let purchase = match r[4] {
+            b"purchase" => parse_price(r[6]),
+            b"view" | b"cart" => Some(0),
+            _ => None,
+        };
+        if let Some(price) = purchase {
+            next.uid = codec.key(r[1]);
+            next.hash = links::mix(next.uid);
+            next.price = price;
+            next.cat = if price == 0 {
+                0
+            } else {
+                sm.product_cat.get(r[5]).unwrap_or(sm.unknown_cat)
+            };
+        }
+    }
+    Some(next)
+}
+
 fn parse<'a>(
     c: &Chunk<'a>,
     sm: &Small,
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
 ) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
-    let (ws, we, clock) = window;
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Payload> = (0..NS)
         .map(|_| {
@@ -120,7 +162,7 @@ fn parse<'a>(
         .collect();
     let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
     let mut spill = Vec::new();
-    let mut emit = |e: Pending| {
+    let emit = |e: Pending| {
         let mut target = NONE;
         if e.uid != 0 {
             let p = shard(e.hash);
@@ -131,39 +173,7 @@ fn parse<'a>(
         // the stored low bits is equality of the full byte-exact ID token.
         claims[(e.claim_key >> KEY_BITS) as usize].push(Claim::new(e.claim_key, target, e.claim_order));
     };
-    for_rows(c, |r| {
-        if r[0].is_empty() {
-            return;
-        }
-        let claim_key = links::mix(people.codec.key(r[0]));
-        let (ingest, seconds) = clock.ingest_for_claim(r[3]);
-        let ts = clock.parse_ts(r[2]);
-        let mut next = Pending {
-            claim_key,
-            ts,
-            claim_order: Claim::order(ingest, seconds, &mut spill),
-            ..Default::default()
-        };
-        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
-            let purchase = match r[4] {
-                b"purchase" => parse_price(r[6]),
-                b"view" | b"cart" => Some(0),
-                _ => None,
-            };
-            if let Some(price) = purchase {
-                let cat = if price == 0 {
-                    0
-                } else {
-                    sm.product_cat.get(r[5]).unwrap_or(sm.unknown_cat)
-                };
-                next.uid = people.codec.key(r[1]);
-                next.hash = links::mix(next.uid);
-                next.price = price;
-                next.cat = cat;
-            }
-        }
-        emit(next);
-    });
+    word::for_events(c, sm, &people.codec, window, &mut spill, emit);
     (payload, claims, spill)
 }
 
