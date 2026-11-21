@@ -1,5 +1,26 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Contiguous event rows with tiled claim references — 2026-11-21
+
+Completed the interrupted alternative in `fast/src/events.rs`: each parse chunk
+keeps event tokens and a row-aligned temporal/payload descriptor, while the
+event-ID partition stores compact 8-byte `(token, row ordinal)` references in
+small per-shard pages. The exact duplicate pass dereferences only Bloom
+suspects; the survivor pass routes the row columns after winner selection.
+Per-shard lane counts provide safe upper-bound reservations, including when
+duplicates later remove rows. Exceptional ingest milliseconds remain exact in
+a side table; ordinary valid F1 ingests use a guarded relative-second encoding.
+
+Validation: 20 Rust tests, 39 Python edge tests, both implementations on all
+36 official fixtures, both dev-answer comparers (117,038 user rows and 27,400
+campaign rows; zero missing/extra/differing), and 10 kit-generated 30k-event
+seeds all passed. `cargo fmt --check` and release Clippy with `-D warnings`
+passed. The supplied 1.57 s control was not benchmarked against this candidate:
+the requested no-large-benchmarks constraint prevents a meaningful speed claim.
+Treat this as a correctness-tested representation experiment, not a replacement
+for the measured control until paired performance and memory measurements are
+authorized.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

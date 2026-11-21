@@ -90,6 +90,29 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_chunk_crossing_winners_and_transitive_person(self):
+        ts = "2026-10-01T00:20:00Z"
+        early = "2026-10-01T00:19:59Z"
+        malformed = ev("mixed3", "wrong", ts, pid='p"1', ingest=early)
+        pad = "x" * (8 << 20) + '"'
+        users, camps = run_case(
+            events=[
+                ev("mixed1", "z1", ts, "purchase", "p1", "123"),
+                ev("mixed2", "wrong", ts, "purchase", "p2", "400"),
+                malformed, pad,
+                ev('"mixed1"', "unlinked", "bad", ingest=early),
+                ev("mixed2", "z2", ts, "purchase", "p3", "57", ingest=early),
+                ev("mixed3", "z1", ts),
+            ],
+            links=["z2,bridge", "z1,z2"],
+            clicks=[f"click,z1,c_1,{ts}"],
+            extra={"links/other.csv": ["bridge,aaa"]},
+        )
+        self.assertEqual(set(users), {("aaa", "2026-10-01")})
+        u = users["aaa", "2026-10-01"]
+        self.assertEqual((u["sessions"], u["events"], u["revenue_cents"], u["top_category"]), (1, 2, 57, "bags"))
+        self.assertEqual(camps["c_1", "2026-10-01"]["sessions"], 1)
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"

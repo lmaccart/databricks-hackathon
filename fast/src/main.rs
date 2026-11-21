@@ -5,8 +5,8 @@
 //! Phases (see ARCHITECTURE.md):
 //!   0. small tables (manifest, products, campaigns)
 //!   1. links  -> union-find -> id -> person name
-//!   2. events -> payloads by person, claims by event ID
-//!   3. reject losing payloads after exact minimum-ingest selection on suspect IDs
+//!   2. events -> parse-order columns and compact claim references by event ID
+//!   3. choose exact minimum-ingest copies, route only survivors by person
 //!   4. clicks -> parse, validate and bucket directly by person (identical copies are idempotent)
 //!   5. per person shard: sort, sessionize, credit, assists, aggregate
 //!   6. write Parquet in parallel
