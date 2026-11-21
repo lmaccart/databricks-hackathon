@@ -67,6 +67,160 @@ impl Claim {
     }
 }
 
+const CLAIMS_PER_CACHE_LINE: usize = 64 / std::mem::size_of::<Claim>();
+const CLAIM_NT_MIN_BYTES: usize = 1 << 20;
+const _: () = assert!(std::mem::size_of::<Claim>() == 16 && CLAIMS_PER_CACHE_LINE == 4);
+
+/// Per-shard software combining for the fixed-size event-ID stream. Full
+/// cache lines bypass write allocation only for sufficiently large chunks;
+/// short chunks and alignment heads/tails stay on Vec's initialized path.
+struct ClaimBuckets {
+    buckets: Vec<Vec<Claim>>,
+    staged: Vec<Claim>,
+    pending: [u8; NS],
+    use_nt: bool,
+    has_streamed: bool,
+    #[cfg(all(test, target_arch = "x86_64"))]
+    streamed_lines: usize,
+}
+
+impl ClaimBuckets {
+    fn with_capacity(capacity: usize, use_nt: bool) -> Self {
+        let buckets = (0..NS).map(|_| Vec::with_capacity(capacity)).collect();
+        let zero = Claim {
+            key_and_target: 0,
+            order_and_target: 0,
+        };
+        ClaimBuckets {
+            buckets,
+            staged: vec![zero; NS * CLAIMS_PER_CACHE_LINE],
+            pending: [0; NS],
+            use_nt,
+            has_streamed: false,
+            #[cfg(all(test, target_arch = "x86_64"))]
+            streamed_lines: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, bucket: usize, claim: Claim) {
+        if !self.use_nt {
+            self.buckets[bucket].push(claim);
+            return;
+        }
+        let count = self.pending[bucket] as usize;
+        self.staged[bucket * CLAIMS_PER_CACHE_LINE + count] = claim;
+        self.pending[bucket] = (count + 1) as u8;
+        if count + 1 == CLAIMS_PER_CACHE_LINE {
+            self.flush(bucket, false);
+        }
+    }
+
+    fn ensure_room(&mut self, bucket: usize, additional: usize) {
+        let rows = &self.buckets[bucket];
+        if rows.capacity() - rows.len() < additional {
+            // Vec growth copies initialized rows and may read lines that were
+            // written with streaming stores; make those stores visible first.
+            if self.has_streamed {
+                sfence();
+                self.has_streamed = false;
+            }
+            self.buckets[bucket].reserve(additional);
+        }
+    }
+
+    fn drain_temporal(&mut self, bucket: usize, count: usize) {
+        let n = self.pending[bucket] as usize;
+        debug_assert!(count > 0 && count <= n);
+        self.ensure_room(bucket, count);
+        let start = bucket * CLAIMS_PER_CACHE_LINE;
+        self.buckets[bucket].extend_from_slice(&self.staged[start..start + count]);
+        self.staged.copy_within(start + count..start + n, start);
+        self.pending[bucket] = (n - count) as u8;
+    }
+
+    fn flush(&mut self, bucket: usize, finalizing: bool) {
+        while self.pending[bucket] != 0 {
+            let count = self.pending[bucket] as usize;
+            if count < CLAIMS_PER_CACHE_LINE && !finalizing {
+                return;
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            if self.use_nt && count == CLAIMS_PER_CACHE_LINE {
+                self.ensure_room(bucket, CLAIMS_PER_CACHE_LINE);
+                let len = self.buckets[bucket].len();
+                let dst = unsafe { self.buckets[bucket].as_mut_ptr().add(len) };
+                let address = dst as usize;
+
+                // Claim's alignment is 8 bytes, so do not assume a Vec's
+                // allocation is 16/64-byte aligned. A non-16-aligned base
+                // cannot reach a cache-line boundary by appending claims.
+                if address % 16 == 0 {
+                    let head = ((64 - address % 64) % 64) / std::mem::size_of::<Claim>();
+                    if head != 0 {
+                        self.drain_temporal(bucket, head);
+                        continue;
+                    }
+
+                    let start = bucket * CLAIMS_PER_CACHE_LINE;
+                    // SAFETY: dst is 64-byte aligned, has four Claims of
+                    // spare capacity, and staged holds four initialized
+                    // Claims. Each SSE2 store covers one complete 16-byte
+                    // record; Claim contains only valid u64 bit patterns.
+                    unsafe {
+                        stream_claim_line(dst, self.staged.as_ptr().add(start));
+                        self.buckets[bucket].set_len(len + CLAIMS_PER_CACHE_LINE);
+                    }
+                    self.pending[bucket] = 0;
+                    self.has_streamed = true;
+                    #[cfg(all(test, target_arch = "x86_64"))]
+                    {
+                        self.streamed_lines += 1;
+                    }
+                    continue;
+                }
+            }
+
+            self.drain_temporal(bucket, count);
+        }
+    }
+
+    fn finish(mut self) -> Vec<Vec<Claim>> {
+        for bucket in 0..NS {
+            self.flush(bucket, true);
+        }
+        if self.has_streamed {
+            // Publish every streamed cache line before claims can move to a
+            // different Rayon worker for duplicate resolution.
+            sfence();
+        }
+        self.buckets
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn stream_claim_line(dst: *mut Claim, src: *const Claim) {
+    use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_stream_si128};
+    for i in 0..CLAIMS_PER_CACHE_LINE {
+        // SAFETY: caller provides a full aligned destination line and four
+        // readable staged claims; unaligned loads are allowed for the source.
+        unsafe {
+            let value = _mm_loadu_si128(src.add(i).cast::<__m128i>());
+            _mm_stream_si128(dst.add(i).cast::<__m128i>(), value);
+        }
+    }
+}
+
+#[inline]
+fn sfence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence();
+    }
+}
+
 #[derive(Default)]
 struct ClaimHasher(u64);
 
@@ -167,7 +321,8 @@ fn parse<'a>(
             p
         })
         .collect();
-    let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
+    let use_nt = cfg!(target_arch = "x86_64") && c.data.len() >= CLAIM_NT_MIN_BYTES;
+    let mut claims = ClaimBuckets::with_capacity(reserve + reserve / 8, use_nt);
     let mut spill = Vec::new();
     let mut emit = |e: Pending| {
         let mut target = NONE;
@@ -181,7 +336,10 @@ fn parse<'a>(
         }
         // This shard supplies the omitted high bits; within it equality of
         // the stored low bits is equality of the full byte-exact ID token.
-        claims[(e.claim_key >> KEY_BITS) as usize].push(Claim::new(e.claim_key, target, e.claim_order));
+        claims.push(
+            (e.claim_key >> KEY_BITS) as usize,
+            Claim::new(e.claim_key, target, e.claim_order),
+        );
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
@@ -199,7 +357,7 @@ fn parse<'a>(
     for i in n.saturating_sub(ring.len())..n {
         emit(ring[i % ring.len()]);
     }
-    (payload, claims, spill)
+    (payload, claims.finish(), spill)
 }
 
 #[inline]
@@ -400,5 +558,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn claim_write_combining_handles_empty_short_odd_aligned_and_growing_buckets() {
+        // Prefix lengths vary the cache-line offset. A tiny initial capacity
+        // forces growth after at least one complete staged line; the odd tail
+        // must still be published exactly once.
+        for prefix in 0..4u64 {
+            let mut buckets = ClaimBuckets::with_capacity(4, true);
+            #[cfg(target_arch = "x86_64")]
+            let initially_streamable = buckets.buckets[0].as_ptr() as usize % 16 == 0;
+            for i in 0..prefix {
+                buckets.push(0, Claim::new(100 + i, i as u32, i + 1));
+            }
+            for i in 0..19u64 {
+                buckets.push(0, Claim::new(1_000 + i, (i * 7) as u32, i + 50));
+            }
+            #[cfg(target_arch = "x86_64")]
+            if initially_streamable {
+                assert!(buckets.streamed_lines > 0);
+            }
+            let mut result = buckets.finish();
+            let claims = std::mem::take(&mut result[0]);
+            let mut expected = (0..prefix)
+                .map(|i| Claim::new(100 + i, i as u32, i + 1))
+                .collect::<Vec<_>>();
+            expected.extend((0..19u64).map(|i| Claim::new(1_000 + i, (i * 7) as u32, i + 50)));
+            assert_eq!(claims.len(), expected.len());
+            for (actual, expected) in claims.iter().zip(expected) {
+                assert_eq!(actual.key_and_target, expected.key_and_target);
+                assert_eq!(actual.order_and_target, expected.order_and_target);
+            }
+        }
+
+        let empty = ClaimBuckets::with_capacity(0, true).finish();
+        assert!(empty.iter().all(Vec::is_empty));
+
+        let mut one = ClaimBuckets::with_capacity(0, true);
+        one.push(3, Claim::new(17, 29, 41));
+        let one = one.finish();
+        assert_eq!(one[3].len(), 1);
+        assert_eq!(one[3][0].key_and_target, Claim::new(17, 29, 41).key_and_target);
+        assert_eq!(one[3][0].order_and_target, Claim::new(17, 29, 41).order_and_target);
     }
 }
