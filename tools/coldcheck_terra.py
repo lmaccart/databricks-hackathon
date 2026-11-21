@@ -99,6 +99,7 @@ def main():
     print("Host page cache only; no device, hypervisor or remote-storage cache eviction. "
           "Docker CLI start-to-exit; image build, setup and output checking excluded.",
           flush=True)
+    cold_failures = []
     with tempfile.TemporaryDirectory(prefix="coldcheck-owned-", dir=root) as name:
         work = Path(name)
         work.chmod(0o755)
@@ -113,6 +114,16 @@ def main():
             print(f"\n{label}: seed={seed} events={events} clicks={clicks} "
                   f"input bytes={sum(p.stat().st_size for p in files)} files={len(files)}",
                   flush=True)
+            print(f"input owner uid={files[0].stat().st_uid}, checker euid={os.geteuid()}",
+                  flush=True)
+            # Check whether eviction works even before a Docker process maps the input.
+            try:
+                setup_cache(files, "cold")
+                print(f"{label}: pre-container eviction succeeded", flush=True)
+            except RuntimeError as exc:
+                if "Cold precondition failed" not in str(exc):
+                    raise
+                print(f"{label}: pre-container eviction FAILED: {exc}", flush=True)
             ref = work / "reference"
             ref.mkdir(mode=0o777)
             ref.chmod(0o777)
@@ -122,7 +133,8 @@ def main():
             setup_cache(files, "warm")
             run_image("coldcheck:control", data, ref, scratch)
             results = {"cold": [[], []], "warm": [[], []]}
-            for mode in ("cold", "warm"):
+            for mode in ("warm", "cold"):
+                failed = False
                 for pair in range(3):
                     for side in ([0, 1] if pair % 2 == 0 else [1, 0]):
                         out = work / "output"
@@ -131,7 +143,16 @@ def main():
                         shutil.rmtree(scratch)
                         scratch.mkdir(mode=0o777)
                         scratch.chmod(0o777)
-                        setup_cache(files, mode)
+                        try:
+                            setup_cache(files, mode)
+                        except RuntimeError as exc:
+                            if mode != "cold" or "Cold precondition failed" not in str(exc):
+                                raise
+                            print(f"{label}: COLD NOT MEASURED: {exc}", flush=True)
+                            cold_failures.append(label)
+                            failed = True
+                            shutil.rmtree(out)
+                            break
                         seconds = run_image(("coldcheck:control", "coldcheck:finalist")[side],
                                             data, out, scratch)
                         results[mode][side].append(seconds)
@@ -141,13 +162,19 @@ def main():
                         subprocess.run([str(python), str(compare), str(ref), str(out)],
                                        env=env, check=True)
                         shutil.rmtree(out)
-            for mode, (a, b) in results.items():
+                    if failed:
+                        break
+                if failed:
+                    continue
+                a, b = results[mode]
                 ma, mb = statistics.median(a), statistics.median(b)
                 print(f"RESULT {label} {mode}: control={ma:.3f}s finalist={mb:.3f}s "
                       f"less={(1-mb/ma)*100:.1f}% pairs={len(a)}", flush=True)
             shutil.rmtree(data)
             shutil.rmtree(ref)
             shutil.rmtree(scratch)
+    if cold_failures:
+        raise RuntimeError(f"Cold comparison not performed: eviction failed on {cold_failures}")
 
 
 if __name__ == "__main__":
