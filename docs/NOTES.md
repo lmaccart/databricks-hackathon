@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Experimental event-ID cut-through candidate — 2026-11-21
+
+Against `5fd0d05`, each structurally valid event is held in one 24-byte ID-owned row with exact ingest order and raw user token. Bloom-filtered exact dedup emits only winning valid payloads; sparse per-chunk side tables preserve purchases, wide time offsets, and exceptional ingests. This removes the initial person scatter and loser-retain pass. It has not been timed at scale: native paired comparisons remain necessary before selection.
+
+Local checks: 21 Rust tests including Bloom aliases, invalid earliest copies and compact-row fallbacks; 39 oracle cases against each implementation; 36/36 official fixtures for both implementations; ten 20k dirty seeds plus three 60-day/300-category seeds; both dev-answer comparers match. No large timing or Docker runs.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

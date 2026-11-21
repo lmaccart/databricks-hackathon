@@ -125,6 +125,10 @@ class EventWindows(unittest.TestCase):
         self.check(WS, str(WS_MS + 2**32))
         self.check(WS, str(WS_MS + 2**32 + 1))
 
+    def test_last_millisecond_on_both_sides_of_2_pow_31(self):
+        self.check(WS, str(WS_MS + 2**31))
+        self.check(WS, str(WS_MS + 2**31 + 1))
+
     def test_long_and_pre_epoch_windows(self):
         self.check(WS, "2027-10-01T00:00:00Z")
         self.check("1969-12-20T00:00:00Z", "1970-01-10T00:00:00Z")
