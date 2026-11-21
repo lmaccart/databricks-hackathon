@@ -40,12 +40,16 @@ def write(path, header, lines):
 
 
 def run_case(events=(), clicks=(), links=(), products=("p1,shoes", "p2,hats", "p3,bags"),
-             campaigns=("c_1,search", "c_2,social", "c_3,email")):
+             campaigns=("c_1,search", "c_2,social", "c_3,email"), extra=None):
     with tempfile.TemporaryDirectory() as tmp:
-        return _run_case_at(tmp, events, clicks, links, products, campaigns)
+        return _run_case_at(tmp, events, clicks, links, products, campaigns, extra)
 
 
-def _run_case_at(tmp, events, clicks, links, products, campaigns):
+HEADERS = {"events": "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents",
+           "clicks": "click_id,user_id,campaign_id,ts", "links": "user_id_a,user_id_b"}
+
+
+def _run_case_at(tmp, events, clicks, links, products, campaigns, extra=None):
     data, out = os.path.join(tmp, "data"), os.path.join(tmp, "out")
     os.makedirs(data)
     with open(os.path.join(data, "manifest.json"), "w") as fh:
@@ -58,6 +62,8 @@ def _run_case_at(tmp, events, clicks, links, products, campaigns):
           "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents", [])  # header only
     write(os.path.join(data, "clicks", "part-0.csv"), "click_id,user_id,campaign_id,ts", clicks)
     write(os.path.join(data, "links", "part-0.csv"), "user_id_a,user_id_b", links)
+    for rel, lines in (extra or {}).items():  # more part files; may replace the header-only events/part-1
+        write(os.path.join(data, rel), HEADERS[rel.split("/")[0]], lines)
     if os.environ.get("SS_BIN"):  # run an implementation binary instead of the reference
         import subprocess
         subprocess.run([os.environ["SS_BIN"]], check=True, stderr=subprocess.DEVNULL,
@@ -309,6 +315,113 @@ class Clicks(unittest.TestCase):
         self.assertEqual(set(u), {("laptop", "2026-10-09")})
         r = c[("c_2", "2026-10-09")]
         self.assertEqual((r["sessions"], r["purchasing_sessions"], r["revenue_cents"]), (1, 1, 1234))
+
+
+class ByteDistinctIds(unittest.TestCase):
+    def test_lookalike_ids_and_lexical_click_tie(self):
+        s = ms("2026-10-09T12:00:00Z")
+        k = s - HOUR
+        u, c = run_case(
+            events=[
+                ev("e1", "u1", str(s), "purchase", "p1", "100"),     # shoes 100
+                ev("E1", "u1", str(s), "purchase", "P1", "100"),     # event_id case differs: kept; P1 unknown
+                ev("e01", "u1", str(s), "purchase", "p01", "0150"),  # zero-padded ids: kept; unknown 150
+                ev("e2", "u01", str(s)),
+                ev("e3", "U1", str(s)),
+                ev("e4", '"u1 "', str(s)),                            # trailing space: its own person
+            ],
+            clicks=[
+                f"10,u1,c_2,{k}", f"2,u1,c_1,{k}",        # "10" < "2" bytewise, not numerically -> c_2
+                f"k1,u01,c_1,{k}", f"K1,u01,c_3,{k}",     # "K1" < "k1" -> c_3
+                f"7,U1,c_1,{k}", f"007,U1,c_2,{k}",       # "007" < "7" -> c_2
+                f"x,U1,c_01,{k}", f"y,U1,C_1,{k}",        # not in campaigns.csv: invalid
+            ],
+        )
+        d = "2026-10-09"
+        self.assertEqual(set(u), {(n, d) for n in ("u1", "u01", "U1", "u1 ")})
+        r = u[("u1", d)]
+        self.assertEqual((r["sessions"], r["events"], r["revenue_cents"], r["top_category"]),
+                         (1, 3, 350, "unknown"))
+        for n in ("u01", "U1", "u1 "):
+            self.assertEqual((u[(n, d)]["events"], u[(n, d)]["revenue_cents"]), (1, 0))
+        got = {cid: tuple(c[(cid, d)][f] for f in ("sessions", "purchasing_sessions",
+                                                    "revenue_cents", "assisted_sessions"))
+               for cid in ("c_1", "c_2", "c_3", "organic") if (cid, d) in c}
+        self.assertEqual(got, {
+            "c_1": (0, 0, 0, 3),      # u1, u01, U1 assisted, nobody credited
+            "c_2": (2, 1, 350, 2),    # u1 and U1 credited; both assisted
+            "c_3": (1, 0, 0, 1),      # u01
+            "organic": (1, 0, 0, 0),  # "u1 " has no clicks
+        })
+        self.assertEqual(len(c), 4)
+
+
+class DedupMalformedVsInvalid(unittest.TestCase):
+    def test_earliest_copy_malformed_or_invalid(self):
+        t = "2026-10-02T10:00:00Z"
+        ing = lambda sec: f"2026-10-02T10:{sec // 60:02d}:{sec % 60:02d}Z"
+        u, _ = run_case(events=[
+            # malformed earliest copy is dropped in parse, so the later copy is the kept one
+            f"eA,uX,{t},{ing(0)},view,p1",                            # 6 fields
+            ev("eA", "uA", t, ingest=ing(5)),
+            ev("eA", "uA2", t, ingest=ing(9)),                        # later still: ignored
+            ev("ea", "uAlow", t, ingest=ing(5)),                      # event_id case differs: own event
+            # well-formed but invalid earliest copy is kept, and kills the event
+            ev("eB", "uB1", "2026-13-02T10:00:00Z", ingest=ing(0)),   # bad ts
+            ev("eB", "uB2", t, ingest=ing(5)),
+            ev("eC", "uC1", t, "View", ingest=ing(0)),                # bad type
+            ev("eC", "uC2", t, ingest=ing(5)),
+            ev("eD", "", t, ingest=ing(0)),                           # empty user
+            ev("eD", "uD2", t, ingest=ing(5)),
+            ev("eG", "uG1", t, "purchase", price="0", ingest=ing(0)), # bad price
+            ev("eG", "uG2", t, "purchase", price="5", ingest=ing(5)),
+            ev("eF", "uF1", t, ingest="2026-10-04T10:00:00Z"),        # kept copy is 48 h late
+            ev("eF", "uF2", "2026-10-04T09:00:00Z", ingest="2026-10-04T10:00:01Z"),
+            # malformed earliest, valid middle, different-user last: middle wins
+            f'eE,u"E0",{t},{ing(0)},view,p1,',                        # stray quote
+            ev("eE", "uE1", t, ingest=ing(10)),
+            ev("eE", "uE2", t, ingest=ing(20)),
+        ])
+        self.assertEqual(set(u), {("uA", "2026-10-02"), ("uAlow", "2026-10-02"), ("uE1", "2026-10-02")})
+        self.assertTrue(all(r["events"] == 1 for r in u.values()))
+
+
+class CrossFilePeople(unittest.TestCase):
+    def test_links_events_clicks_and_dups_across_files(self):
+        s = ms("2026-10-09T12:00:00Z")
+        k = s - HOUR
+        u, c = run_case(
+            events=[ev("e1", "u3", str(s))],
+            clicks=[f"10,u2,c_1,{k}"],
+            links=["u02,u2"],
+            extra={
+                "events/part-1.csv": [
+                    ev("e3", "u2", str(s + 20 * MIN)),
+                    ev("e2", "zz", str(s + 10 * MIN), "purchase", "p2", "300",
+                       ingest="2026-10-09T12:20:00Z"),                # later copy, other user: ignored
+                    ev("e4", "U02", str(s)),                          # upper-case: separate person
+                ],
+                "events/part-2.csv": [
+                    ev("e2", "u10", str(s + 10 * MIN), "purchase", "p2", "300",
+                       ingest="2026-10-09T12:10:00Z")],
+                "clicks/part-1.csv": [f"2,u3,c_2,{k}"],
+                "links/part-1.csv": ["u2,u10"],
+                "links/part-2.csv": ["u10,u3"],
+            },
+        )
+        d = "2026-10-09"
+        self.assertEqual(set(u), {("u02", d), ("U02", d)})   # u02 < u10 < u2 < u3; named though only linked
+        r = u[("u02", d)]
+        self.assertEqual((r["sessions"], r["events"], r["revenue_cents"], r["top_category"]),
+                         (1, 3, 300, "hats"))
+        self.assertEqual((u[("U02", d)]["events"], u[("U02", d)]["revenue_cents"]), (1, 0))
+        got = {cid: tuple(c[(cid, d)][f] for f in ("sessions", "purchasing_sessions",
+                                                    "revenue_cents", "assisted_sessions"))
+               for cid in ("c_1", "c_2", "organic") if (cid, d) in c}
+        self.assertEqual(got, {"c_1": (1, 1, 300, 1),   # "10" < "2" across click files
+                               "c_2": (0, 0, 0, 1),
+                               "organic": (1, 0, 0, 0)})
+        self.assertEqual(len(c), 3)
 
 
 if __name__ == "__main__":
