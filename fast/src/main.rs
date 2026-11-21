@@ -46,7 +46,7 @@ mod csv;
 mod ts;
 
 use csv::{Chunk, chunks_of, for_rows};
-use ts::{parse_ingest, parse_ts};
+use ts::{DayCache, parse_ts, parse_ts_cached};
 
 // ------------------------------------------------------------------ prices
 
@@ -218,6 +218,7 @@ fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
 fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<'a>) -> Vec<Vec<PCl>> {
     let hint = reserve_per_shard(c.data);
     let mut b: Vec<Vec<PCl>> = (0..NS).map(|_| Vec::with_capacity(hint)).collect();
+    let mut days = DayCache::new();
     for_rows(c, |r| {
         // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
         let (cid, uid, camp) = (r[0], r[1], r[2]);
@@ -225,7 +226,7 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<
             return;
         }
         let Some(&ci) = sm.camp_idx.get(camp) else { return };
-        let ts = parse_ts(r[3]);
+        let ts = parse_ts_cached(r[3], &mut days);
         if ts == BAD || ts < lo || ts >= we {
             return;
         }

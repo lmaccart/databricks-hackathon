@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Paired F1 timestamp challenger — 2026-11-20
+
+Added an exact-spelling, direct-mapped day cache to strict F1/F2 timestamp decoding (events and clicks), and a paired event/ingest F1 path. When both F1 dates match and both timestamps validate, parsing proves the event is not more than 24 hours late without subtracting the full epoch values. Invalid dates use a cached sentinel; other timestamp forms and malformed ingests retain the existing parser behavior. This follows rules.md: “`ingest_ts` is always valid F1.”
+
+The locked release Rust suite, 31 Python tests against the binary, 36 official fixtures, ten 20k dirty-data seeds, and both dev-answer comparers pass. No native timing was run here; the parent session will decide whether this challenger clears the speed threshold.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.
