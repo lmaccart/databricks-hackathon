@@ -6,7 +6,12 @@
 set -euo pipefail
 KIT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$(realpath "$1")"; SEEDS="${2:-10}"; EVENTS="${3:-20000}"
-WORK="${SCRATCH_DIR:-${TMPDIR:-/tmp}}/ss-diff"
+BASE=$(mktemp -d "${SCRATCH_DIR:-${TMPDIR:-/tmp}}/ss-diff.XXXXXXXX")
+WORK="$BASE/case"
+cleanup() {
+  if [[ $? == 0 ]]; then rm -rf "$BASE"; else echo "Retained failing case: $WORK" >&2; fi
+}
+trap cleanup EXIT
 fail=0
 for seed in $(seq "${FIRST_SEED:-1}" $(( ${FIRST_SEED:-1} + SEEDS - 1 ))); do
   rm -rf "$WORK"; mkdir -p "$WORK"

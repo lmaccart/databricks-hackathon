@@ -41,7 +41,11 @@ def write(path, header, lines):
 
 def run_case(events=(), clicks=(), links=(), products=("p1,shoes", "p2,hats", "p3,bags"),
              campaigns=("c_1,search", "c_2,social", "c_3,email")):
-    tmp = tempfile.mkdtemp()
+    with tempfile.TemporaryDirectory() as tmp:
+        return _run_case_at(tmp, events, clicks, links, products, campaigns)
+
+
+def _run_case_at(tmp, events, clicks, links, products, campaigns):
     data, out = os.path.join(tmp, "data"), os.path.join(tmp, "out")
     os.makedirs(data)
     with open(os.path.join(data, "manifest.json"), "w") as fh:
