@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+mod affinity;
 mod dims;
 mod events;
 mod links;
@@ -503,23 +504,122 @@ fn process_shard(
     out
 }
 
+fn enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+}
+
+fn pool_configuration(
+    rayon_is_set: bool,
+    rayon_threads: Option<usize>,
+    ncpu_threads: Option<usize>,
+) -> (bool, Option<usize>) {
+    if rayon_is_set {
+        (true, rayon_threads)
+    } else {
+        (ncpu_threads.is_some(), ncpu_threads)
+    }
+}
+
+fn init_rayon() {
+    let rayon_override = std::env::var_os("RAYON_NUM_THREADS");
+    let explicit_rayon = rayon_override.is_some();
+    let rayon_threads = rayon_override
+        .as_deref()
+        .and_then(|v| v.to_str())
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    let ncpu_threads = std::env::var("NCPU")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    let (needs_pool, requested_workers) = pool_configuration(explicit_rayon, rayon_threads, ncpu_threads);
+    let diagnostics = enabled("SS_CPU_TOPOLOGY");
+    #[cfg(target_os = "linux")]
+    let stock = enabled("SS_RAYON_STOCK");
+
+    #[cfg(target_os = "linux")]
+    let topology = if needs_pool || diagnostics {
+        affinity::discover_linux().ok()
+    } else {
+        None
+    };
+
+    #[cfg(target_os = "linux")]
+    let mut workers = requested_workers;
+    #[cfg(target_os = "linux")]
+    if !explicit_rayon
+        && let (Some(n), Some(topology)) = (workers, topology.as_ref())
+        && !topology.allowed.is_empty()
+    {
+        workers = Some(n.min(topology.allowed.len()));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let workers = requested_workers;
+
+    #[cfg(target_os = "linux")]
+    let pin_plan = if !stock {
+        topology.as_ref().and_then(|topology| {
+            let ordered = topology.ordered.as_ref()?;
+            let n = workers?;
+            let first = *ordered.first()?;
+            affinity::workers_to_pin(ordered, n, affinity::can_control_affinity(first))
+        })
+    } else {
+        None
+    };
+
+    if diagnostics {
+        #[cfg(target_os = "linux")]
+        match topology.as_ref() {
+            Some(topology) => eprintln!(
+                "Rayon topology: allowed={:?}, preferred={:?}, workers={:?}, pin_cpus={:?}, status={}",
+                topology.allowed,
+                topology.ordered,
+                workers,
+                pin_plan,
+                if stock {
+                    "stock forced"
+                } else if pin_plan.is_some() {
+                    "affinity enabled"
+                } else {
+                    topology.note
+                }
+            ),
+            None => eprintln!("Rayon topology: unavailable; using stock placement"),
+        }
+        #[cfg(not(target_os = "linux"))]
+        eprintln!("Rayon topology: Linux affinity unavailable; using stock placement");
+    }
+
+    if !needs_pool {
+        return;
+    }
+
+    let mut builder = rayon::ThreadPoolBuilder::new();
+    if let Some(n) = workers {
+        builder = builder.num_threads(n);
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(pinned) = pin_plan {
+        let diagnostics = diagnostics;
+        builder = builder.start_handler(move |index| {
+            let ok = pinned.get(index).is_some_and(|&cpu| affinity::pin_current_thread(cpu));
+            if !ok && diagnostics {
+                eprintln!("Rayon worker {index}: CPU affinity failed; retaining scheduler placement");
+            }
+        });
+    }
+
+    builder.build_global().expect("Rayon pool");
+}
+
 // ------------------------------------------------------------------ output
 
 fn main() {
     let t0 = Instant::now();
-    // Some runtimes expose host CPU count despite the competition's quota.
-    // Respect an explicit Rayon setting for reproducible local comparisons.
-    if std::env::var_os("RAYON_NUM_THREADS").is_none()
-        && let Some(n) = std::env::var("NCPU")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-    {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .expect("Rayon pool");
-    }
+    init_rayon();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let outd = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let log = |m: &str| eprintln!("[{:>7.3}s] {m}", t0.elapsed().as_secs_f64());
@@ -634,4 +734,17 @@ fn main() {
     log("written");
     // Everything is on disk; skip tearing down the shard tables and mmaps.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::pool_configuration;
+
+    #[test]
+    fn rayon_setting_takes_precedence_over_ncpu() {
+        assert_eq!(pool_configuration(true, Some(4), Some(8)), (true, Some(4)));
+        assert_eq!(pool_configuration(true, None, Some(8)), (true, None));
+        assert_eq!(pool_configuration(false, None, Some(8)), (true, Some(8)));
+        assert_eq!(pool_configuration(false, None, None), (false, None));
+    }
 }

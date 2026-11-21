@@ -447,6 +447,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "bytes",
+ "libc",
  "memchr",
  "memmap2",
  "parquet",

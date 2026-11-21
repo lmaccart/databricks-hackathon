@@ -16,7 +16,7 @@ docker run --rm --platform linux/amd64 --network none --read-only --user 1000:10
   -v "$PWD/data:/data:ro" -v "$PWD/out:/output" shopping-sessions
 ```
 
-For a native build, run `make build`. Set `DATA_DIR`, `OUTPUT_DIR` and, for reproducible eight-worker timing, `RAYON_NUM_THREADS=8`. Use a **fresh output directory** each run; row order and part count are immaterial. The binary logs phase times to stderr.
+For a native build, run `make build`. Set `DATA_DIR`, `OUTPUT_DIR` and, for reproducible eight-worker timing, `RAYON_NUM_THREADS=8` (`RAYON_NUM_THREADS` takes precedence over `NCPU`). On Linux the global pool pins workers, when permitted, to the process's allowed CPUs, preferring distinct physical cores. Set `SS_RAYON_STOCK=1` to force stock Rayon placement for A/B checks, or `SS_CPU_TOPOLOGY=1` to log the detected topology and selected CPUs. Use a **fresh output directory** each run; row order and part count are immaterial. The binary logs phase times to stderr.
 
 ## Verify against the organizers’ answers
 

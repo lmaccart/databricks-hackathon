@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Allowed-cpuset Rayon affinity experiment — 2026-11-21
+
+On Linux, `fast/src/affinity.rs` reads the process's effective mask with `sched_getaffinity`, intersects it with online CPUs, and orders sysfs package/core topology so distinct cores precede SMT siblings. The pool is explicitly initialized when either `NCPU` or `RAYON_NUM_THREADS` is set; the latter takes precedence. `SS_RAYON_STOCK=1` provides same-worker-count stock placement for A/B, and `SS_CPU_TOPOLOGY=1` enables topology diagnostics. No phase-specific worker counts or oversubscription were introduced. The native workflow now runs the Linux affinity tests and compares stock versus pinned placement on the same binary and worker count. Local macOS tests, all 36 fixtures, the dev answer, and 10 dirty seeds passed. The Linux placement comparison is pending; no speed claim is made because this scoped run did not execute a 20M benchmark.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.
