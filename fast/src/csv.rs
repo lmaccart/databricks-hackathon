@@ -12,6 +12,10 @@ use memchr::memchr;
 use std::marker::PhantomData;
 use std::path::Path;
 
+#[cfg(target_arch = "x86_64")]
+#[path = "csv_zmm.rs"]
+mod zmm;
+
 /// Output slot for fields no caller reads (the ninth entry of the row buffer).
 const SKIP: u8 = 8;
 
@@ -86,6 +90,21 @@ fn slots(c: &Chunk) -> Vec<u8> {
         slot[c.idx[k]] = k as u8;
     }
     slot
+}
+
+/// Try the packed scanner for the usual event or click header, otherwise use
+/// the general column mapper.
+#[inline]
+pub fn for_rows_fixed<'a, const N: usize>(c: &Chunk<'a>, f: impl FnMut(&[&'a [u8]; 8])) {
+    const { assert!(N == 4 || N == 7) };
+    #[cfg(target_arch = "x86_64")]
+    if c.nfields == N && c.ncols == N && c.idx[..N].iter().copied().eq(0..N) && zmm::enabled() {
+        let mut f = f;
+        // SAFETY: enabled() checked all target features and this is the identity layout.
+        unsafe { zmm::scan::<N, false, _>(c.data, &mut f) };
+        return;
+    }
+    for_rows(c, f);
 }
 
 /// Call f with the selected columns of every well-formed line of a chunk.
@@ -422,10 +441,11 @@ mod tests {
         out
     }
 
-    /// Kernels this CPU can run: dispatching entry, SWAR, native SIMD, AVX2.
+    /// Kernels this CPU can run: dispatching entry, SWAR, native SIMD, AVX2,
+    /// and the production fallback even when the ZMM path is selected.
     fn kernels() -> Vec<usize> {
         #[allow(unused_mut)]
-        let mut k = vec![0, 1, 2];
+        let mut k = vec![0, 1, 2, 4];
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx2") {
             k.push(3);
@@ -439,11 +459,16 @@ mod tests {
             let mut f = |r: &[&[u8]; 8]| out.push(r[..cols.len()].iter().map(|v| v.to_vec()).collect());
             let slot = slots(&c);
             match kernel {
-                0 => for_rows(&c, &mut f),
+                0 => match cols.len() {
+                    4 => for_rows_fixed::<4>(&c, &mut f),
+                    7 => for_rows_fixed::<7>(&c, &mut f),
+                    _ => for_rows(&c, &mut f),
+                },
                 1 => scan::<Swar, _>(c.data, &slot, &mut f),
                 2 => scan::<Native, _>(c.data, &slot, &mut f),
                 #[cfg(target_arch = "x86_64")]
                 3 => unsafe { scan_avx2(c.data, &slot, &mut f) },
+                4 => for_rows(&c, &mut f),
                 _ => unreachable!(),
             }
         }
@@ -601,6 +626,92 @@ mod tests {
             b"price_cents,product_id,event_type,ingest_ts,ts,user_id,event_id\n7,p,view,i,t,u,e\n\"7\",p,view,i,t,u,\"e\"\n",
             &ev,
         );
+    }
+
+    #[test]
+    fn fixed_layout_batches_match_oracle() {
+        let cols = ["a", "b", "c", "d", "e", "f", "g"];
+        for pad in 0..256 {
+            let mut file = b"a,b,c,d,e,f,g\n".to_vec();
+            file.extend(std::iter::repeat_n(b'x', pad));
+            file.extend_from_slice(b",\"a\",\"\",d,e,f,\r\n");
+            file.extend_from_slice(b",,,,\"bad\"quote,,\n");
+            file.extend_from_slice(b"a,b,c\n,a,b,c,d,e,f,g,h,i\n");
+            file.extend_from_slice(b"\n,,\"q\",,one,two,\"three\"\n");
+            file.extend(std::iter::repeat_n(b'z', 700));
+            file.extend_from_slice(b",,,,,,\n");
+            file.extend_from_slice(b"\"\xc3\xa9\",u\x00,v,w,x,y,\"\"\n");
+            file.extend_from_slice(b"\"\",a,b,c,d,e,");
+            check(&file, &cols);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn zmm_executes_fast_rows() {
+        let require = std::env::var_os("SS_REQUIRE_AVX512_CSV").is_some();
+        if !zmm::supported() {
+            assert!(!zmm::enabled());
+            assert!(
+                !require,
+                "this run requires AVX-512 CSV, but the CPU or OS lacks the required features"
+            );
+            eprintln!("AVX-512 CSV: unsupported; dispatcher will use the fallback");
+            return;
+        }
+        assert_eq!(zmm::enabled(), std::env::var_os("SS_DISABLE_AVX512_CSV").is_none());
+        assert!(
+            !require || zmm::enabled(),
+            "this run requires AVX-512 CSV, but dispatch is disabled"
+        );
+
+        fn check_zmm<const N: usize>(header: &[u8], cols: &[&str], body: &[u8], count: usize) {
+            let mut file = header.to_vec();
+            file.extend_from_slice(body);
+            let mut actual: Rows = Vec::new();
+            // SAFETY: the test checked the complete ISA requirement above.
+            let fast = unsafe {
+                zmm::scan::<N, true, _>(body, &mut |r| {
+                    actual.push(r[..N].iter().map(|v| v.to_vec()).collect());
+                })
+            };
+            assert_eq!(fast, count);
+            assert_eq!(actual, py_rows(&file, cols));
+            assert_eq!(kernel_rows(&file, cols, usize::MAX, 4), actual);
+            assert_eq!(kernel_rows(&file, cols, usize::MAX, 0), actual);
+        }
+
+        let four = ["a", "b", "c", "d"];
+        // Below 32 bytes, only the original scanner runs.
+        check_zmm::<4>(
+            b"a,b,c,d\n",
+            &four,
+            b"\"u\x00\",,\xc3\xa9,d\r\n,,x,\"\"\nx,x,x,x\n,,,",
+            0,
+        );
+        // Only the 32-byte VL kernel runs here. EOF is recovered independently.
+        let mut body = b"\"u\x00\",,\xc3\xa9,d\r\n,,x,\"\"\nx,x,x,x\n,,,\"\"\n".to_vec();
+        body.extend_from_slice(b"z,z,z,z");
+        check_zmm::<4>(b"a,b,c,d\n", &four, &body, 3);
+
+        // Exercise an exact 256-byte window, including byte offset 255 and a
+        // fully populated separator buffer. A count mismatch switches to
+        // recovery at the offending row without duplicating earlier output.
+        check_zmm::<4>(b"a,b,c,d\n", &four, &b",,,\n".repeat(64), 64);
+        let mut body = b"a,b,c,d\na,b\n".to_vec();
+        body.extend_from_slice(&b",,,\n".repeat(13));
+        check_zmm::<4>(b"a,b,c,d\n", &four, &body, 1);
+
+        // Closing quotes and the following separator are split across 64-byte
+        // boundaries, and the final quoted field ends at EOF without a newline.
+        let seven = ["a", "b", "c", "d", "e", "f", "g"];
+        let mut body = vec![b'"'];
+        body.extend(std::iter::repeat_n(b'q', 62));
+        body.extend_from_slice(b"\",b,c,d,e,f,g\n\"a\",b,c,d,e,f,\"g\"\n");
+        body.extend(std::iter::repeat_n(b';', 220));
+        body.extend_from_slice(b",b,c,d,e,f,\"g\"");
+        check_zmm::<7>(b"a,b,c,d,e,f,g\n", &seven, &body, 2);
+        eprintln!("AVX-512 CSV: proved fast-row emission on both the ZMM and VL kernels");
     }
 
     #[test]

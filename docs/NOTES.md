@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 2: AVX-512 CSV challenger
+
+The in-order seven-column event and four-column click layouts batch up to 256 bytes, use VBMI2 `vpcompressb` memory stores for ordered separator and newline offsets, and verify quote placement and pairing with bit masks and carry-less multiplication. There is no scalar bit scan per separator. If shape or quotes fail, the existing scanner owns recovery; it also owns partial EOF rows, oversized lines, and other header layouts. Neither implementation changes the CSV rules.
+
+The default x86-64 build enables this only when Rust runtime detection sees AVX2, AVX-512F/BW/VL/VBMI2, PCLMULQDQ, POPCNT, and the OS vector state. `SS_DISABLE_AVX512_CSV=1` gives an identical-binary fallback control. Cross-generated Linux x86-64 machine code contains masked memory-destination `vpcompressb` in both ZMM and YMM widths; that proves code generation, not execution. Local ARM64 fallback matched the Python tests, ten differential seeds, all 36 official fixtures, and both official dev table comparisons. No local 20M run or Docker build.
+
+On a capable native x86 runner, run `SS_REQUIRE_AVX512_CSV=1 cargo test --release --locked --manifest-path fast/Cargo.toml csv::tests -- --nocapture` (or set `require_avx512_csv` on the Native amd64 performance check workflow). The direct test asserts the fast-path row counts for both vector widths; an unsupported runner says so and fails if required. For an A/B benchmark, set `--baseline-env SS_DISABLE_AVX512_CSV=1` on `tools/bench_pair.py` with the same binary on both sides. Speed delta pending native measurement.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.

@@ -65,7 +65,7 @@ fn parse<'a>(
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
-    for_rows(c, |r| {
+    for_rows_fixed::<7>(c, |r| {
         if r[0].is_empty() {
             return;
         }
