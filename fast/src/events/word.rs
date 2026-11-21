@@ -57,6 +57,42 @@ fn id(s: &[u8]) -> Option<(u64, &[u8])> {
 }
 
 #[inline(always)]
+fn prefix(s: &[u8]) -> Option<(u64, u64, &[u8])> {
+    if let Some(head) = s.first_chunk::<32>() {
+        // For the same nine-byte body length, quotes change each encoded
+        // field size by two. Speculate on both addresses first, then prove
+        // every body byte, both separators and every required closing quote.
+        let q = usize::from(head[0] == b'"');
+        let u = 10 + 2 * q;
+        let r = usize::from(head[u] == b'"');
+        let v = u + r;
+        let next = v + 10 + r;
+        let a = u64::from_le_bytes(head[q..q + 8].try_into().unwrap());
+        let b = u64::from_le_bytes(head[v..v + 8].try_into().unwrap());
+        let bad = (a | a.wrapping_sub(FLOOR) | b | b.wrapping_sub(FLOOR)) & HIGH;
+        let x = head[q + 8];
+        let y = head[v + 8];
+        if bad == 0
+            && (b'-'..=127).contains(&x)
+            && (b'-'..=127).contains(&y)
+            && head[u - 1] == b','
+            && head[next - 1] == b','
+            && (q == 0 || head[q + 9] == b'"')
+            && (r == 0 || head[v + 9] == b'"')
+        {
+            return Some((
+                person::pack_inline(a.swap_bytes(), x),
+                person::pack_inline(b.swap_bytes(), y),
+                &s[next..],
+            ));
+        }
+    }
+    let (a, tail) = id(s)?;
+    let (b, rest) = id(tail)?;
+    Some((a, b, rest))
+}
+
+#[inline(always)]
 fn fixed<const N: usize>(s: &[u8], q: bool) -> Option<(&[u8; N], &[u8])> {
     let body = s.first_chunk::<N>()?;
     Some((body, comma(&s[N..], q)?))
@@ -201,8 +237,7 @@ fn suffix<'a>(s: &'a [u8], purchase: bool, sm: &Small) -> Option<(Option<PriceCa
 
 #[inline(always)]
 fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestClock)) -> Option<(Pending, &'a [u8])> {
-    let (eid, s) = id(s)?;
-    let (uid, s) = id(s)?;
+    let (eid, uid, s) = prefix(s)?;
     let (ts, seconds, s) = timestamps(s, clock)?;
     let (purchase, s) = event_type(s)?;
     let (payload, rest) = suffix(s, purchase, sm)?;
@@ -276,6 +311,40 @@ pub(super) fn for_events<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_prefix_proof_matches_scalar_on_both_ids() {
+        let render = |bytes: &[u8], quoted: bool, out: &mut Vec<u8>| {
+            if quoted {
+                out.push(b'"');
+            }
+            out.extend_from_slice(bytes);
+            if quoted {
+                out.push(b'"');
+            }
+            out.push(b',');
+        };
+        for n in 7..=9 {
+            for m in 7..=9 {
+                for quotes in 0..4 {
+                    let mut line = vec![];
+                    render(&vec![b'Z'; n], quotes & 1 != 0, &mut line);
+                    render(&vec![b'x'; m], quotes & 2 != 0, &mut line);
+                    let end = line.len();
+                    line.extend_from_slice(b"2028-02-29T00:00:00Z,more-fields");
+                    for pos in 0..end {
+                        let old = line[pos];
+                        for c in [0, b' ', b'"', b',', b'\n', b'-', b'0', b'Z', 127, 128, 255, old] {
+                            line[pos] = c;
+                            let want = id(&line).and_then(|(a, rest)| id(rest).map(|(b, next)| (a, b, next)));
+                            assert_eq!(prefix(&line), want, "{n},{m} q={quotes} at {pos}:{c}");
+                        }
+                        line[pos] = old;
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn inline_ids_match_codec_for_every_accepted_byte_and_boundary() {
