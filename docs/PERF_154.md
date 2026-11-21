@@ -30,6 +30,16 @@ On a [four-worker Intel Xeon 6975P-C](https://github.com/lmaccart/databricks-hac
 
 On the same runner, counting newlines in 1,661,455,555 event bytes took 0.0352 s; validating the fields took 0.3127 s; adding both IDs and timestamps took 0.4971 s. These warmed component kernels produce no output. Neither the hosted launch measurement nor the [public leaderboard](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions) establishes the organizer's timing floor or explains how the four displayed 0.30 s entries were achieved.
 
+A [separate Intel diagnostic using the production event grammar](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936182346) measured more than scanning field boundaries. The decoded-record count and valid-payload count agreed across all three kernels. Each number is the median of five warmed passes over the same 1.661 GB on four workers; none includes dedup, sessions or Parquet:
+
+| Work performed | Time | Input throughput |
+|---|---:|---:|
+| Decode and validate complete events, including fallback rows, invalid claims, exact clocks, prices and categories | 0.4468 s | 3.72 GB/s |
+| Additionally resolve and prefetch exact identities | 0.5295 s | 3.14 GB/s |
+| Include both real payload and claim scatter streams | 0.6339 s | 2.62 GB/s |
+
+Adding exact owner lookup cost about 83 ms in this comparison; writing the two streams added about 104 ms. The full program's parse/route interval was 0.717 s rather than 0.634 s: it runs in a fresh process with different allocator, cache and scheduling state. Even the isolated complete event decoder takes longer than 0.30 s on this host; a faster sort or writer cannot close the gap alone.
+
 ## Two-seed trials
 
 Each row uses five alternating whole-process pairs per seed. Compare **across the arrow**, not across rows: hosts range from AMD EPYC to different Intel Xeons. A successful challenge also checks the official dev answer, 36 fixtures, both 20M outputs row-for-row and the native Rust tests. `+` savings in the subsequent text means **less elapsed time**.
@@ -62,6 +72,8 @@ Each row uses five alternating whole-process pairs per seed. Compare **across th
 | [Pack small result counts at first write, vs `4ad0e5d`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935845158) | 1.579 → 1.576 | 1.555 → 1.532 |
 | [Size temporal streams using an already parsed prefix, vs `4933dbe`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935956505) | 1.967 → **1.866** | 1.935 → **1.861** |
 | [One bounded campaign/day counter table per worker, vs `4ad0e5d`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936005555) | 1.700 → **1.591** | 1.711 → **1.576** |
+| [Manifest-assisted F2 zones and F3 decimal prefixes, vs `4933dbe`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936134526) | 1.531 → 1.547 | 1.498 → 1.493 |
+| [64-byte stripes separating duplicate-ID evidence from metadata, vs `4933dbe`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936377632) | 1.500 → 1.580 | 1.492 → 1.560 |
 
 The column writer won **10/10** pairs and cut the seed-7 output stage from 0.094 to 0.054 s. It emits each person's spelling once per run, carries typed numeric columns directly from session aggregation, and encodes nullable categories with bounded dictionaries. Singleton ranks won **9/10**; their strongest effect was in sessions (0.456 → 0.427 s on seed 7). A singleton can claim a previously empty slot only by comparing its full exact ID; occupants never move and a collision retains the full-width key.
 
@@ -81,11 +93,14 @@ Each row compares a component with and without the other change on the **same** 
 | [Physical graph slots → physical graph slots + columns](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935485357) | 1.697 → **1.642** | 5.335 → **5.007** |
 | [Scored control → Highway vector sort](https://github.com/lmaccart/databricks-hackathon/actions/runs/44934661503) | 2.026 → 1.975 | 6.208 → 6.274 |
 | [Scored control → slot-based union alone, AMD EPYC 9V74](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935468441) | 2.227 → **2.150** | 6.723 → **6.257** |
+| [Scored control → slot-based union + columns, AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935468450) | 2.258 → **2.096** | 6.870 → **6.332** |
 | [Scored control → slot-based union, direct time ranges and columns (`0558eaa`), AMD EPYC 9V45](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935810599) | 1.792 → **1.617** | 5.451 → **4.618** |
 
 The initial singleton technique by itself added almost nothing to the columns in the two full-Docker comparisons on the Xeon 8370C. Replacing the graph construction as well made a measurable difference on the 6975P-C: every pair favored physical slots, including all three final-scale pairs. Keeping a slot as the union node eliminates endpoint sorting/deduplication and gives the parser a direct rank to write.
 
 For `0558eaa` each claimed slot already identifies the destination worker partition. A histogram gathers events, purchases and clicks into exact per-person ranges. Small ranges sort just `u32` millisecond offsets; large ranges summarize bins narrower than the gap, stitching only if the actual neighboring extrema are at most 1,800,000 ms apart. Sparse graphs, large windows and overflow identities retain exact alternatives. It won all 18 pairs versus `7fd1b76` in the AMD job. The direct-range build also matched all 6,629,430 rows on the second 60M seed with 8.31 GiB peak RSS, and matched the Python oracle on deliberately colliding singletons and four 10,000-node components at one and eight workers under short and centuries-wide windows.
+
+On that holdout, the 6,601,416 user-day rows occupied 283,929,323 bytes in the scored output and 222,761,807 bytes in the direct-range build. The two tables agreed on 9,966,291 sessions and 20,610,334,350 cents of revenue; the campaign table recorded 104,722,509 assists and no organic assists.
 
 ## Reproduce the comparisons
 
