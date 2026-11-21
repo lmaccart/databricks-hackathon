@@ -33,9 +33,9 @@ DATA_DIR=vendor/dev OUTPUT_DIR=out RAYON_NUM_THREADS=8 fast/target/release/shopp
 make check-dev OUT=out
 ```
 
-`make fixtures` checks the Rust binary and the independent Python oracle against the starter's hand-written answers. `make check-dev` uses both the official comparer and a second per-key diff. `tools/official_diff.py` runs differential checks on other official seeds. `python tools/bench_pair.py BASELINE CANDIDATE DATA_DIR` compares five alternating-order pairs, with fresh output directories and one warmup per binary. The competition clock also includes container startup. The optional **Native amd64 performance check** GitHub workflow runs the same comparison against the 5.03 s scored revision on a Linux runner and reports its actual worker count.
+`make fixtures` checks the Rust binary and the independent Python oracle against the starter's hand-written answers. `make check-dev` uses both the official comparer and a second per-key diff. `tools/official_diff.py` runs differential checks on other official seeds. `python tools/bench_pair.py BASELINE CANDIDATE DATA_DIR` compares five alternating-order pairs, with fresh output directories and one warmup per binary. The competition clock also includes container startup.
 
-For manual CI runs, select `containers` for paired full Docker invocations, `scale` for a 60M exact check, or `extended` to reproduce the allocator/CPU-dispatch trials. All inputs are generated on the runner; none are in the repository.
+The **Native amd64 performance check** workflow accepts `revision` and `baseline` commit SHAs. Use `challenge` for all-row comparisons and timing on two 20M seeds, `containers` for five paired practice-size Docker runs, and `scale` for an exact 60M check. `scale_pairs` adds three paired 60M Docker runs, each under a 14 GiB no-swap cap. The default baseline is the 5.03 s entry; use `4f75f526cef27623e406d2ec1008b40eb1935f23` for the 1.78 s rebuild control. All inputs are generated on the runner.
 
 ## Credits
 
