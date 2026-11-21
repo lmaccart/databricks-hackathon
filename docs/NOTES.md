@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Full-container verified event parser — 2026-11-21 06:50 UTC
+
+`7fd1b76` beat the scored `9758471` by **6.3% / 7.1%** on the two 20M seeds and by **5.7%** at each of 20M and 60M in [full Docker](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876665326). All 60 generated Python comparisons, the mixed grammar corpus, 36 official fixtures, dev output, and 6,615,971 final-scale rows matched. Another 60M seed on ARM64 matched all 6,671,518 rows. The local eight-worker **native** medians were 0.570 s and 0.601 s; the latest organizer time remains **1.57 s** for the previous build.
+
 ## Strict typed row parsing on the 1.57 s baseline — 2026-11-21
 
 [`f4ac682` won all ten native pairs](https://github.com/lmaccart/databricks-hackathon/actions/runs/44875889484) relative to `9758471`: 1.744 → 1.628 s (seed 7) and 1.719 → 1.604 s (seed 15). Its event phase fell 0.833 → 0.709 s on seed 7. It validates ID bytes in the load used to encode them and parses the common event layout without first searching for a newline. No header order, date, ID spelling or field width is assumed for correctness. All output rows matched on both inputs. The [round ledger](PERF_157.md) also records alternatives and the measured scanning/decoding budget.
