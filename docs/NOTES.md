@@ -14,6 +14,7 @@ The printed track page times **container start to exit** on eight pinned hyperth
 - The kit comparer converted a numeric Parquet ID to a string and could report a match that the scorer rejected. It now checks string types and keeps null distinct from an empty Parquet string. Local edge tests now detect duplicate keys before indexing outputs by key.
 - Use a fresh output directory for each run. Reusing the same directory with fewer Rayon workers can leave extra `part-*.parquet` from a previous run. The official harness and the new native benchmark use fresh directories.
 - Docker parity: built the final `linux/amd64` source snapshot in 114.90 s (cached layers, release binary recompiled). Image: 29,596,367 bytes. The official runner passed at uid 1000, read-only root, no network, `--cpus 8 --memory 24g --memory-swap 24g`, with zero stdout and an exact dev-answer match. Local run: 1.01 s, emulated on an ARM64 Docker VM with only 7.75 GiB physically allocated; this exercises the container contract, not full-scale Linux memory capacity.
+- Official generator differential matrix: **60/60 matched** for seeds 1–20 at each of 10k, 100k and 1M events, with one click per four events. Seed 15's generated window was `[2028-02-17, 2028-03-02)`, so all three sizes exercised leap day.
 
 ## Native scale evidence
 
@@ -26,6 +27,8 @@ Baseline: original Rust data path on an Apple M2 Pro (32 GiB RAM), release build
 The 60M run overlapped compilation on the host. Its 14.97 s comprised 0.71 s setup/links, **3.43 s event parse, 4.40 s event dedup, 3.82 s sessions**, 1.65 s clicks, 0.40 s writing and ~0.56 s from the last log to process exit. No stdout or scratch usage. `tools/check_scale.py` verified schema, uniqueness and cross-table invariants on the full output; no hand-written expected answer exists for that seed. The 24 GB no-swap scorer limit was not enforced on this native run.
 
 Interpret the phase labels carefully: “sessions” includes copying from the dedup buckets before sorting. “Written” includes the serial campaign-counter merge and Arrow batch construction as well as Parquet I/O. Split those timers before choosing a sort or writer replacement.
+
+**Practice-size Docker cross-check:** the final, emulated amd64 image processed seed 7 (20M events + 5M clicks) in 4.60 s for the complete starter shell invocation, 4.129 s to the binary's `written` log. Empty stdout; 2,242,393 unique user-days and 28,014 unique campaign-days; schema, keys and sums passed. This is a single local measurement, not the native five-run median or a practice submission.
 
 ## Latency experiments to run in order
 

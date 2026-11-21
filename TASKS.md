@@ -30,7 +30,7 @@ Each task is sized for one agent session. Do them in order; T1 to T4 decide whet
 
 ## Phase B: make it bullet-proof
 
-- [ ] **T6. Differential testing on the official generator.** Script: for 20+ seeds × sizes {10k, 100k, 1M}, generate, run reference and binary, compare. Include a seed whose window holds 2028-02-29 (try seeds until `manifest.json` shows a Feb 2028 window). Use the reference for ≤ 1M only (it is slow).
+- [x] **T6. Differential testing on the official generator.** 60/60 matched: seeds 1–20 at each of 10k, 100k and 1M events, clicks at one quarter of events. Seed 15 covered leap day at all three sizes. Rerun `python tools/official_diff.py` (`5563fe7`).
   *Accept:* all match. Every mismatch becomes a minimized test case in `tests/`.
 
 - [x] **T7. Native scale test at 60M.** Seed 13, 60M events and 15M clicks: 14.97 s wall, 9.38 GiB peak RSS, eight Rayon threads, zero spill; schema, keys and sums passed. Native Mac capacity check, not a scorer run; see `docs/NOTES.md`.
