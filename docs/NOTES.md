@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Dimension and click front-end experiment — 2026-11-20
+
+Candidate: input-derived dense decimal-suffix product/campaign index with a full byte-keyed fallback, and 16-row click person-lookup prefetch pipeline. This changes no tie semantics and makes no generator-specific assumptions. Reference and binary tests, 36 official fixtures, the official dev answer, and ten 20k-event kit differential seeds match. The parent session will measure paired 20M timings; performance delta is **not yet measured**, so this is not yet a speed-validated production choice.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.
