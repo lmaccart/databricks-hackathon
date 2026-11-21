@@ -205,10 +205,46 @@ struct CivilDay {
     midnight_seconds: i64,
 }
 
+#[derive(Default)]
+struct CivilMonth {
+    prefix: u64,
+    day_zero: i64,
+    last_day: i64,
+}
+
+struct EpochPrefix {
+    ascii: u64,
+    base: i64,
+}
+
+const EPOCH_TAIL: i64 = 100_000_000;
+const EPOCH_MASK: u64 = (1 << 40) - 1;
+
+impl EpochPrefix {
+    fn from_ms(ms: i64) -> Self {
+        if (0..10_000_000_000_000).contains(&ms) {
+            let base = ms / EPOCH_TAIL;
+            let digits = format!("{base:05}000");
+            Self {
+                ascii: load8(digits.as_bytes(), 0) & EPOCH_MASK,
+                base: base * EPOCH_TAIL,
+            }
+        } else {
+            // No masked input can equal this sentinel.
+            Self {
+                ascii: u64::MAX,
+                base: 0,
+            }
+        }
+    }
+}
+
 /// Immutable exact date lookup derived from the manifest. A miss always
 /// falls back to the complete Gregorian parser, including for ingest claims.
 pub struct ManifestClock {
     days: [Vec<CivilDay>; 32],
+    event_months: [CivilMonth; 2],
+    epoch: [EpochPrefix; 2],
 }
 
 impl ManifestClock {
@@ -225,26 +261,31 @@ impl ManifestClock {
             .saturating_add(2 * DAY)
             .div_euclid(DAY)
             .clamp(first_valid, last_valid);
+        // F2's local date can differ from the event's UTC date by one day.
+        let event_lo = ws.div_euclid(DAY) - 1;
+        let event_hi = we.div_euclid(DAY) + 1;
         let mut clock = Self {
             days: std::array::from_fn(|_| Vec::new()),
+            event_months: std::array::from_fn(|_| CivilMonth::default()),
+            epoch: [EpochPrefix::from_ms(ws), EpochPrefix::from_ms(we.saturating_sub(1))],
         };
         // Very wide windows get both ends, with all other dates using fallback.
         if hi - lo >= LIMIT {
             for day in lo..lo + LIMIT / 2 {
-                clock.add_day(day);
+                clock.add_day(day, (event_lo..=event_hi).contains(&day));
             }
             for day in hi - LIMIT / 2 + 1..=hi {
-                clock.add_day(day);
+                clock.add_day(day, (event_lo..=event_hi).contains(&day));
             }
         } else {
             for day in lo..=hi {
-                clock.add_day(day);
+                clock.add_day(day, (event_lo..=event_hi).contains(&day));
             }
         }
         clock
     }
 
-    fn add_day(&mut self, day: i64) {
+    fn add_day(&mut self, day: i64, event_date: bool) {
         // Inverse proleptic Gregorian conversion, valid for years 0000..9999.
         let z = day + 719_468;
         let era = z.div_euclid(146_097);
@@ -258,11 +299,28 @@ impl ManifestClock {
         let y = y + i64::from(m <= 2);
         let date = format!("{y:04}-{m:02}-{d:02}");
         let bytes = date.as_bytes();
+        let first = load8(bytes, 0);
         self.days[d as usize].push(CivilDay {
-            first: load8(bytes, 0),
+            first,
             last: u16::from_le_bytes([bytes[8], bytes[9]]),
             midnight_seconds: day * 86_400,
         });
+        if event_date
+            && !self.event_months.iter().any(|month| month.prefix == first)
+            && let Some(month) = self.event_months.iter_mut().find(|month| month.last_day == 0)
+        {
+            let next = if m == 12 {
+                days_from_civil(y + 1, 1, 1)
+            } else {
+                days_from_civil(y, m + 1, 1)
+            };
+            let start = day - d + 1;
+            *month = CivilMonth {
+                prefix: first,
+                day_zero: (start - 1) * 86_400,
+                last_day: next - start,
+            };
+        }
     }
 
     /// `s` has the F1 length and a date separator at byte 4.
@@ -304,14 +362,60 @@ impl ManifestClock {
         self.f1_seconds(s)
     }
 
-    #[inline(always)]
-    pub fn event_f2(s: &[u8; 25]) -> i64 {
-        iso::<true, false>(s)
+    #[inline(never)]
+    pub fn event_f2(&self, s: &[u8; 25]) -> i64 {
+        // Match all three suffix bytes at once. Non-integral offsets (including
+        // valid offsets through ±23:59) and uncached months use the full parser.
+        const ZONE: u64 = word(b"00\x0000:00"); // SS, sign (separate), HH:MM
+        let z = load8(s, 17) ^ ZONE;
+        if z >> 40 != 0 {
+            return event_f2_general(s);
+        }
+        let prefix = load8(s, 0);
+        let month = if prefix == self.event_months[0].prefix {
+            &self.event_months[0]
+        } else if prefix == self.event_months[1].prefix {
+            &self.event_months[1]
+        } else {
+            return event_f2_general(s);
+        };
+        let t = load8(s, 8) ^ T_TIME;
+        let sign = b(z, 2) as u8;
+        let z = z & !(0xff << 16);
+        if !(fits(t, A_TIME) & fits(z, word(&[D, D, L, D, D, L, L, L])))
+            || !matches!(sign, b'+' | b'-')
+            || s[16] != b':'
+        {
+            return BAD;
+        }
+        // After validation, adjacent digit pairs combine without byte carry.
+        let t = t.wrapping_mul(10) + (t >> 8);
+        let z = z * 10 + (z >> 8);
+        let (d, h, mi, sec, oh) = (b(t, 0), b(t, 3), b(t, 6), b(z, 0), b(z, 3));
+        if d == 0 || d > month.last_day || h > 23 || mi > 59 || sec > 59 || oh > 23 {
+            return BAD;
+        }
+        // Apply the zone in hour units, before scaling; either signed zero is UTC.
+        let utc_hour = h + if sign == b'-' { oh } else { -oh };
+        (month.day_zero + d * 86_400 + utc_hour * 3600 + mi * 60 + sec) * 1000
     }
 
     #[inline(always)]
-    pub fn event_f3(s: &[u8; 13]) -> i64 {
-        epoch_ms(s)
+    pub fn event_f3(&self, s: &[u8; 13]) -> i64 {
+        // The 5-byte anchor proves leading digits and leaves one complete
+        // 8-digit SWAR load, with no lookup or extra scalar tail parse.
+        let prefix = load8(s, 0) & EPOCH_MASK;
+        let base = if prefix == self.epoch[0].ascii {
+            self.epoch[0].base
+        } else if prefix == self.epoch[1].ascii {
+            self.epoch[1].base
+        } else {
+            return event_f3_general(s);
+        };
+        match eight(load8(s, 5)) {
+            Some(tail) => base + tail as i64,
+            None => BAD,
+        }
     }
 
     #[inline]
@@ -336,6 +440,18 @@ impl ManifestClock {
         }
         (parse_ingest(s), BAD)
     }
+}
+
+#[cold]
+#[inline(never)]
+fn event_f2_general(s: &[u8; 25]) -> i64 {
+    iso::<true, false>(s)
+}
+
+#[cold]
+#[inline(never)]
+fn event_f3_general(s: &[u8; 13]) -> i64 {
+    epoch_ms(s)
 }
 
 #[cfg(test)]
@@ -534,6 +650,49 @@ mod tests {
                 "9223372036854775807",
             ] {
                 check_clock(&clock, s.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn event_grid_matches_oracle_under_every_byte_mutation() {
+        for (ws, we, samples) in [
+            (
+                "2028-02-28T00:00:00Z",
+                "2028-03-01T00:00:00Z",
+                &[
+                    "2028-02-29T00:00:00-00:00",
+                    "2028-03-01T00:00:00+23:59",
+                    "2028-02-29T00:00:00-23:59",
+                    "2028-02-28T01:00:00+02:00",
+                    "2027-02-28T23:00:00-01:00",
+                    "1835395200001",
+                    "1835399999999",
+                    "1835400000000",
+                    "0000000000000",
+                ][..],
+            ),
+            (
+                "0000-02-28T00:00:00Z",
+                "0000-03-02T00:00:00Z",
+                &["0000-02-29T23:00:00-01:00", "0000-03-01T00:00:00+23:59"],
+            ),
+        ] {
+            let clock = ManifestClock::new(parse_ts(ws.as_bytes()), parse_ts(we.as_bytes()));
+            for s in samples {
+                let mut input = s.as_bytes().to_vec();
+                for (i, &original) in s.as_bytes().iter().enumerate() {
+                    for byte in 0..=255 {
+                        input[i] = byte;
+                        let actual = if let Ok(s) = <&[u8; 25]>::try_from(input.as_slice()) {
+                            clock.event_f2(s)
+                        } else {
+                            clock.event_f3(input.as_slice().try_into().unwrap())
+                        };
+                        assert_eq!(actual, want(&input), "{input:?}");
+                    }
+                    input[i] = original;
+                }
             }
         }
     }

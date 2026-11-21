@@ -90,6 +90,25 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_cross_month_offset_grid_keeps_invalid_earliest_claim(self):
+        start = "2028-02-29T23:59:00Z"
+        end = "2028-03-01T01:00:00Z"
+        events = [
+            ev("month001", "person001", "2028-03-01T23:59:00+23:59", pid="item-07", ingest=start),
+            ev("month002", "person001", "2028-02-29T00:00:00-23:59", pid="item-07", ingest=start),
+            ev("month003", "person001", str(ms(start) + 1), pid="item-07", ingest=start),
+            ev("month004", "person001", "2028-03-01T00:00:00-00:00", pid="item-07", ingest=start),
+            ev("month005", "person001", "2028-02-30T00:00:00+00:00", pid="item-07", ingest=start),
+            ev("month005", "person001", "2028-03-01T00:00:00+00:00", pid="item-07", ingest=end),
+        ]
+        clicks = [
+            f"click001,person001,c_1,{ms(start) + 1}",
+            "click002,person001,c_2,2028-03-01T23:58:00+23:59",
+        ]
+        users, campaigns = run_case(events, clicks=clicks, products=("item-07,shoes",), window=(start, end))
+        self.assertEqual(users[("person001", "2028-02-29")]["events"], 4)
+        self.assertEqual(set(campaigns), {("c_2", "2028-02-29")})
+
     def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
         stamp = "2026-10-03T10:00:00Z"
         early = "2026-10-03T09:59:59Z"

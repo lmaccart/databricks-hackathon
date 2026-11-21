@@ -67,7 +67,7 @@ fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [
     let (q, b) = quoted(s);
     let (ts, rest) = if *b.get(4)? != b'-' {
         let (body, rest) = fixed::<13>(b, q)?;
-        (ManifestClock::event_f3(body), rest)
+        (clock.event_f3(body), rest)
     } else if *b.get(19)? == b'Z' {
         let (body, rest) = fixed::<20>(b, q)?;
         let sec = clock.event_f1_seconds(body);
@@ -77,7 +77,7 @@ fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [
         (sec * 1000, rest)
     } else {
         let (body, rest) = fixed::<25>(b, q)?;
-        (ManifestClock::event_f2(body), rest)
+        (clock.event_f2(body), rest)
     };
     if ts == BAD {
         return None;
