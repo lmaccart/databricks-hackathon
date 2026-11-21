@@ -218,7 +218,7 @@ fn prefetch(bloom: &[(u64, u64)], c: Claim, mask: usize) {
     let _ = ptr;
 }
 
-fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location> {
+fn losers_bloom(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location> {
     let n: usize = parts.iter().map(|(_, v)| v.len()).sum();
     // Local blocked Bloom: the second occurrence of any ID necessarily finds
     // both bits already set and marks it suspect. False positives go to an
@@ -282,6 +282,102 @@ fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location>
     remove
 }
 
+fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location> {
+    let n: usize = parts.iter().map(|(_, v)| v.len()).sum();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Ordinal + 1 reserves zero for an empty table slot. Keep the existing
+    // exact algorithm as a bounded fallback for exceptionally large shards.
+    if n >= u32::MAX as usize || n.checked_mul(2).and_then(usize::checked_next_power_of_two).is_none() {
+        return losers_bloom(parts, spills);
+    }
+    let capacity = (n * 2).next_power_of_two();
+    let mask = capacity - 1;
+    let shift = capacity.trailing_zeros();
+    // The bucket consumes the low token bits, and the entry stores the next
+    // 32 bits and a winner ordinal. A matching fingerprint is never proof:
+    // resolve its ordinal back to the original full 56-bit token first.
+    let mut table = vec![0u64; capacity];
+    let mut ends = Vec::with_capacity(parts.len());
+    let mut end = 0usize;
+    for (_, claims) in &parts {
+        end += claims.len();
+        ends.push(end);
+    }
+    let mut remove = Vec::new();
+    let mut ordinal = 0u32;
+    for (batch, claims) in &parts {
+        for &c in claims {
+            let key = c.key();
+            let tag = (key >> shift) as u32;
+            let mut slot = key as usize & mask;
+            loop {
+                let entry = table[slot];
+                if entry == 0 {
+                    table[slot] = (u64::from(tag) << 32) | u64::from(ordinal + 1);
+                    break;
+                }
+                if (entry >> 32) as u32 == tag {
+                    let old_ord = (entry as u32 - 1) as usize;
+                    let part = ends.partition_point(|&end| end <= old_ord);
+                    let start = if part == 0 { 0 } else { ends[part - 1] };
+                    let (old_batch, old_claims) = &parts[part];
+                    let old = old_claims[old_ord - start];
+                    if old.key() == key {
+                        let loc = Location {
+                            batch: *batch,
+                            target: c.target(),
+                        };
+                        let lost = if c.ingest(&spills[*batch]) < old.ingest(&spills[*old_batch]) {
+                            table[slot] = (u64::from(tag) << 32) | u64::from(ordinal + 1);
+                            Location {
+                                batch: *old_batch,
+                                target: old.target(),
+                            }
+                        } else {
+                            loc
+                        };
+                        if lost.target != NONE {
+                            remove.push(lost);
+                        }
+                        break;
+                    }
+                }
+                slot = (slot + 1) & mask;
+            }
+            ordinal += 1;
+        }
+    }
+    remove
+}
+
+fn remove_payloads(payload: &mut [Payload], mut locations: Vec<u32>) {
+    // Each payload vector is independent, and its indices appear descending
+    // under this ordering even when other shards/stream kinds are interleaved.
+    locations.sort_unstable_by(|a, b| b.cmp(a));
+    for target in locations {
+        let x = target as usize;
+        let bucket = &mut payload[x % NS];
+        let slot = x / NS;
+        let index = slot / 4;
+        match slot % 4 {
+            0 => {
+                bucket.packed.times.swap_remove(index);
+            }
+            1 => {
+                bucket.packed.purchases.swap_remove(index);
+            }
+            2 => {
+                bucket.wide.times.swap_remove(index);
+            }
+            _ => {
+                bucket.wide.purchases.swap_remove(index);
+            }
+        }
+    }
+}
+
 pub(super) fn by_person<'a>(
     chunks: &[Chunk<'a>],
     sm: &Small,
@@ -315,27 +411,7 @@ pub(super) fn by_person<'a>(
         }
     }
     payloads.par_iter_mut().zip(by_batch).for_each(|(payload, locations)| {
-        if locations.is_empty() {
-            return;
-        }
-        for target in locations {
-            let x = target as usize;
-            let bucket = &mut payload[x % NS];
-            let slot = x / NS;
-            let index = slot / 4;
-            match slot % 4 {
-                0 => bucket.packed.times[index] = u64::MAX,
-                1 => bucket.packed.purchases[index].price = 0,
-                2 => bucket.wide.times[index].ts = BAD,
-                _ => bucket.wide.purchases[index].price = 0,
-            }
-        }
-        for dest in payload {
-            dest.packed.times.retain(|&key| key != u64::MAX);
-            dest.packed.purchases.retain(|p| p.price != 0);
-            dest.wide.times.retain(|key| key.ts != BAD);
-            dest.wide.purchases.retain(|p| p.price != 0);
-        }
+        remove_payloads(payload, locations);
     });
     payloads
 }
@@ -343,6 +419,7 @@ pub(super) fn by_person<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::{Purchase, Wide};
 
     #[test]
     fn bloom_alias_keeps_distinct_id_and_invalid_winner_kills_valid_loser() {
@@ -357,6 +434,111 @@ mod tests {
         let lost = losers(vec![(0, vec![later, distinct]), (1, vec![invalid])], &[vec![], spill]);
         assert_eq!(lost.len(), 1);
         assert_eq!((lost[0].batch, lost[0].target), (0, 0));
+    }
+
+    #[test]
+    fn colliding_claims_and_cross_batch_winners_are_exact() {
+        // Identical low bucket bits and quotient fingerprint force witness checks.
+        let first = 17;
+        let alias = first | (1u64 << 48);
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let old = Claim::new(first, 4, Claim::order(4001, BAD, &mut a));
+        let other = Claim::new(alias, 12, Claim::order(3000, 3, &mut a));
+        let invalid = Claim::new(first, NONE, Claim::order(1501, BAD, &mut b));
+        let tied = Claim::new(alias, 20, Claim::order(3000, 3, &mut b));
+        let later = Claim::new(first, 28, Claim::order(9000, 9, &mut b));
+        let lost = losers(vec![(0, vec![old, other]), (1, vec![invalid, tied, later])], &[a, b]);
+        let mut locations: Vec<_> = lost.iter().map(|l| (l.batch, l.target)).collect();
+        locations.sort_unstable();
+        assert_eq!(locations, vec![(0, 4), (1, 20), (1, 28)]);
+    }
+
+    #[test]
+    fn adversarial_clusters_match_exact_baseline() {
+        let mut parts = Vec::new();
+        let mut spills = Vec::new();
+        for batch in 0..7 {
+            let mut claims = Vec::new();
+            let mut spill = Vec::new();
+            for i in 0..128u64 {
+                // Every distinct key has the same low 44 bits, including
+                // both the table index and the stored fingerprint.
+                let key = 23 | (i << 44);
+                let ts = ((batch * 97 + i as usize * 31) % 503) as i64 - 250;
+                let target = if (i + batch as u64).is_multiple_of(9) {
+                    NONE
+                } else {
+                    (i * 256) as u32
+                };
+                claims.push(Claim::new(key, target, Claim::order(ts, BAD, &mut spill)));
+            }
+            parts.push((batch, claims));
+            spills.push(spill);
+        }
+        let normalize = |locations: Vec<Location>| {
+            let mut x: Vec<_> = locations.iter().map(|loc| (loc.batch, loc.target)).collect();
+            x.sort_unstable();
+            x
+        };
+        assert_eq!(
+            normalize(losers(parts.clone(), &spills)),
+            normalize(losers_bloom(parts, &spills))
+        );
+    }
+
+    #[test]
+    fn sparse_removal_preserves_nonlosers_across_streams() {
+        let mut payload: Vec<Payload> = (0..NS).map(|_| Payload::default()).collect();
+        payload[7].packed.times = (0..8).collect();
+        payload[7].wide.times = (0..6)
+            .map(|n| Wide {
+                person: n,
+                ts: n as i64,
+            })
+            .collect();
+        payload[7].packed.purchases = (0..5)
+            .map(|n| Purchase {
+                key: n,
+                price: n as u32 + 1,
+                cat: 0,
+            })
+            .collect();
+        payload[7].wide.purchases = (0..5)
+            .map(|n| Purchase {
+                key: Wide {
+                    person: n,
+                    ts: n as i64,
+                },
+                price: n as u32 + 1,
+                cat: 0,
+            })
+            .collect();
+        let target = |index: usize, kind: usize| ((index * 4 + kind) * NS + 7) as u32;
+        let targets = vec![
+            target(1, 0),
+            target(6, 0),
+            target(2, 2),
+            target(4, 2),
+            target(1, 1),
+            target(3, 1),
+            target(0, 3),
+            target(4, 3),
+        ];
+        remove_payloads(&mut payload, targets);
+        payload[7].packed.times.sort_unstable();
+        payload[7].wide.times.sort_unstable();
+        assert_eq!(payload[7].packed.times, vec![0, 2, 3, 4, 5, 7]);
+        assert_eq!(
+            payload[7].wide.times.iter().map(|v| v.ts).collect::<Vec<_>>(),
+            vec![0, 1, 3, 5]
+        );
+        let mut packed_prices: Vec<_> = payload[7].packed.purchases.iter().map(|p| p.price).collect();
+        packed_prices.sort_unstable();
+        assert_eq!(packed_prices, vec![1, 3, 5]);
+        let mut wide_prices: Vec<_> = payload[7].wide.purchases.iter().map(|p| p.price).collect();
+        wide_prices.sort_unstable();
+        assert_eq!(wide_prices, vec![2, 3, 4]);
     }
 
     #[test]

@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## One-pass witness table experiment — 2026-11-21 UTC
+
+Experimental only; **not a recommended replacement** without an idle-machine, full-size comparison. An open-addressed table holds a 32-bit token fingerprint and 32-bit claim ordinal; every fingerprint match checks the original full token. It falls back to the existing exact Bloom path if the ordinal cannot fit. Losing payloads are swap-removed in descending index order rather than scanning all temporal arrays.
+
+On native M2, official seed 7 with 5M events / 1.25M clicks, five alternating warm pairs gave whole-process medians **0.209 → 0.206 s** and internal dedup medians **0.016 → 0.012 s**. A second nine-pair trial was heavily contended (whole-process values varied from 0.401 to 0.625 s) and gave **0.516 → 0.443 s**; this is not reliable evidence of a speedup. The first 1M dev trial was **0.053 → 0.055 s**. No 20M, Docker, or final-scale test was run. A single 5M run reported 968 MB maximum RSS versus 954 MB for baseline; this does not establish final-scale memory safety. The table uses at most 32 bytes per claim in a shard, plus claim storage, and only actively processed shards allocate tables.
+
+The candidate matched both dev checkers, all 36 official binary fixtures, 38 binary edge cases, ten kit dirty seeds and ten official dirty seeds (20k each); 22 Rust tests passed, including adversarial same-fingerprint clusters, cross-chunk earlier invalid winners, millisecond spill order, ties, and sparse removals. The 5M output matched baseline and passed the schema/self-check. Further full-scale testing is needed before adoption.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.
