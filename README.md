@@ -2,7 +2,7 @@
 
 A native Rust entry for the [Databricks Shopping Sessions buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). It reads the mounted CSVs, resolves linked identities, deduplicates events, sessionizes, attributes clicks and assists, and writes `user_daily/` and `campaign_daily/` as Parquet. [Official rules](docs/rules.md) · [architecture](ARCHITECTURE.md) · [review, measurements and open checks](docs/NOTES.md).
 
-**Official practice: 1.54 s** reported for the build with production code from [`7fd1b76`](https://github.com/lmaccart/databricks-hackathon/commit/7fd1b7602280cfce05ac97b6afb703fa42c0b6ba), down from 5.03 → 1.78 → 1.57 s. The reported leaderboard best is **0.30 s**. The [next verified candidate](docs/PERF_154.md#verified-release-checkpoint) cut full Docker time by 9.7% at 20M and 15.3% at 60M against that build on hosted Linux. [All current trials](docs/PERF_154.md) · [previous release benchmarks](docs/PERF_157.md).
+**Official practice: 1.54 s** reported for the build with production code from [`7fd1b76`](https://github.com/lmaccart/databricks-hackathon/commit/7fd1b7602280cfce05ac97b6afb703fa42c0b6ba), down from 5.03 → 1.78 → 1.57 s. The reported leaderboard best is **0.30 s**. The [next verified candidate](docs/PERF_154.md#verified-release-checkpoint) cut full Docker time by 17.3% at 20M and 19.3% at 60M against that build on hosted Linux. [All current trials](docs/PERF_154.md) · [previous release benchmarks](docs/PERF_157.md).
 
 ## Build and run
 

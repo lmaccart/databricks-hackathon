@@ -62,13 +62,13 @@ unsafe fn initialized<V>(mut v: Vec<MaybeUninit<V>>) -> Vec<V> {
     unsafe { Vec::from_raw_parts(ptr.cast(), len, cap) }
 }
 
-pub(super) fn process(
+pub(super) fn process<S: CampaignSink>(
     owner: usize,
     events: Vec<Stream<u64>>,
     clicks: Vec<Vec<RankedClick>>,
     people: &People,
     pack: Packing,
-    reduce: &mut Reduce,
+    reduce: &mut Reduce<'_, '_, '_, S>,
 ) {
     let ne: usize = events.iter().map(|p| p.times.len() + p.purchases.len()).sum();
     if ne == 0 {
@@ -91,14 +91,14 @@ pub(super) fn process(
     }
 }
 
-fn scatter(
+fn scatter<S: CampaignSink>(
     mut dir: impl Directory,
     owner: usize,
     events: Vec<Stream<u64>>,
     clicks: Vec<Vec<RankedClick>>,
     people: &People,
     pack: Packing,
-    reduce: &mut Reduce,
+    reduce: &mut Reduce<'_, '_, '_, S>,
 ) {
     let mut occupied = Vec::new();
     for part in &events {

@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Practice candidate: merge campaign counters once per worker — 2026-11-21
+
+[`d754296`](https://github.com/lmaccart/databricks-hackathon/commit/d75429665a35366dfef26096d63cd71c778b19f0) reduced full Docker medians to **1.471 s** from 1.779 s at 20M and **4.448 s** from 5.512 s at 60M. It also beat `0558eaa` directly (7.5% / 5.4% less Docker time). Both comparisons favored the candidate in 18/18 pairs. All 60 native Linux Python cases and the two final-scale row comparisons passed. [Evidence](PERF_154.md#verified-release-checkpoint).
+
 ## Practice candidate: physical-slot identity graph and direct person ranges — 2026-11-21
 
 [`0558eaa`](https://github.com/lmaccart/databricks-hackathon/commit/0558eaa7acd59463d21a888e1d418d676301e07f) beat the scored build in 18/18 pairs including full Docker **1.792 → 1.617 s** at 20M and **5.451 → 4.618 s** at 60M. Against the physical-slot graph and column writer alone on a different CPU it also won 18/18, including 3.6% / 3.1% in Docker. All rows on two 60M inputs, the Linux Python matrix and new graph-contention checks matched. [Results](PERF_154.md#verified-release-checkpoint).

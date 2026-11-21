@@ -6,6 +6,8 @@ Seed 7 has 1.921 GB of event, click and link CSVs before the dimension files and
 
 ## Verified release checkpoint
 
+[`d754296`](https://github.com/lmaccart/databricks-hackathon/commit/d75429665a35366dfef26096d63cd71c778b19f0) added bounded, per-worker campaign/day counters to the graph and range changes below. Against the scored build it won 18/18 pairs and reduced full Docker by **17.3% / 19.3%** at 20M / 60M. [In a direct comparison to `0558eaa`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936619619), it also won every pair including **1.573 → 1.455 s** at 20M and **4.731 → 4.474 s** at 60M in Docker.
+
 [`0558eaa`](https://github.com/lmaccart/databricks-hackathon/commit/0558eaa7acd59463d21a888e1d418d676301e07f) superseded the first checkpoint below. Its physical-slot identity graph and direct temporal ranges won **18/18 pairs** [against the scored control](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935810599) and **18/18** [against the otherwise identical build without direct ranges](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935810612). The latter comparison gained 3.6% / 3.1% in restricted Docker at 20M / 60M on another model of AMD CPU and passed the 60-case Python oracle. Details below.
 
 [`4ad0e5d`](https://github.com/lmaccart/databricks-hackathon/commit/4ad0e5d) combines the singleton slots and column writer. It won all **18/18** alternating pairs on a four-worker Xeon 6975P-C in the [packaged comparison against `7fd1b76`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44934668743).
@@ -104,12 +106,23 @@ Each row compares a component with and without the other change on the **same** 
 | [Size event buffers from live data on top of `4933dbe`, Intel repeat](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936299795) | 1.585 → 1.563 | 4.719 → 4.663 |
 | [Add the same buffer sizing to direct ranges](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936375552) | 1.602 → 1.593 | 4.779 → 4.719 |
 | [First-slot ranks + columns → add worker-local campaign/day counts, Xeon 8370C](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936299807) | 2.281 → **2.090** | 6.923 → **6.480** |
+| [Direct ranges → link Linux mimalloc 3.3.2, same application source](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936526432) | 1.614 → **1.404** | 4.801 → **4.174** |
+| [Scored control → direct ranges + worker-local counts (`d754296`)](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936619511) | 1.779 → **1.471** | 5.512 → **4.448** |
+| [Add worker-local campaign/day counts to the right-sized direct ranges](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936631125) | 2.072 → **1.928** | 6.378 → **6.181** |
+| [Add allocation hints to direct ranges + worker-local counters (`7619fa6` vs `d754296`)](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936631348) | 2.044 → 1.990 | 5.968 → 5.932 |
+| [Direct ranges vs global temporal sort, identical graph, hints and campaign reduction](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936740314) | 1.517 → 1.488 | 4.642 → 4.598 |
 
 The initial singleton technique by itself added almost nothing to the columns in the two full-Docker comparisons on the Xeon 8370C. Replacing the graph construction as well made a measurable difference on the 6975P-C: every pair favored physical slots, including all three final-scale pairs. Keeping a slot as the union node eliminates endpoint sorting/deduplication and gives the parser a direct rank to write.
 
 For `0558eaa` each claimed slot already identifies the destination worker partition. A histogram gathers events, purchases and clicks into exact per-person ranges. Small ranges sort just `u32` millisecond offsets; large ranges summarize bins narrower than the gap, stitching only if the actual neighboring extrema are at most 1,800,000 ms apart. Sparse graphs, large windows and overflow identities retain exact alternatives. It won all 18 pairs versus `7fd1b76` in the AMD job. The direct-range build also matched all 6,629,430 rows on the second 60M seed with 8.31 GiB peak RSS, and matched the Python oracle on deliberately colliding singletons and four 10,000-node components at one and eight workers under short and centuries-wide windows.
 
 On that holdout, the 6,601,416 user-day rows occupied 283,929,323 bytes in the scored output and 222,761,807 bytes in the direct-range build. The two tables agreed on 9,966,291 sessions and 20,610,334,350 cents of revenue; the campaign table recorded 104,722,509 assists and no organic assists.
+
+The linked Linux allocator won more than a library microbenchmark: every practice and final-scale pair favored it over the same direct-range application using the system allocator. In the seed-7 process comparison the event parse interval fell from 0.704 to 0.610 s, sessions from 0.366 to 0.310 s, and time outside the program's own timer from 0.041 to 0.020 s. This is a **different version and workload** from the earlier Debian mimalloc v2 preload experiment.
+
+`14ccc10` also passed a third, differently shaped input in a clean tracked-source Linux/amd64 image: **21M events, 3.7M clicks, seed 2468113**, under **6 GiB, no swap**. All 2,350,590 user-days and 28,014 campaign-days matched the scored control; stdout was empty. The eight-worker process peaked at **2.82 GiB RSS** and the cgroup at **3.05 GiB** including charged cache. This ran through Docker Desktop's amd64 emulation: useful for packaging and output verification, not scorer timing.
+
+For `7619fa6` on the M2 Pro, eight-worker native medians vs `7fd1b76` were **0.622 → 0.502 s**, **0.599 → 0.479 s**, and **1.753 → 1.409 s** on the independent 60M seed (all 15 pairs won). A separate same-executable comparison of four versus eight workers went **0.708 → 0.476 s** on seed 7 and **2.322 → 1.471 s** on the 60M holdout: 1.49× and 1.58× throughput, not 2×. This host has eight performance cores and four efficiency cores; these measured ratios do not predict the speed of eight pinned x86 hyperthreads.
 
 ## Reproduce the comparisons
 
@@ -118,7 +131,7 @@ On that holdout, the 6,601,416 user-day rows occupied 283,929,323 bytes in the s
 control=7fd1b7602280cfce05ac97b6afb703fa42c0b6ba
 gh workflow run native-bench.yml --ref perf/practice-154 \
   -f revision="$CANDIDATE" -f baseline="$control" -f challenge=true \
-  -f oracle=true -f containers=true -f scale_pairs=true
+  -f oracle=true -f containers=true -f scale=true -f scale_pairs=true
 
 # Locally: exact output through both the ranked and wide-window paths.
 make build
@@ -127,4 +140,4 @@ make build
 .venv/bin/python tools/opaque_diff.py vendor/dev fast/target/release/shopping_sessions
 ```
 
-The timed inputs are the public generator’s seed 7 and leap-day seed 15 (20M events / 5M clicks) and seed 13 (60M / 15M). The independent second 60M input uses seed 948307. The native and Docker timers use fresh output directories; none of the pipelines read earlier results. Each input is warmed once per executable for the paired measurements. The inside-container self-reported timer alone is not used for promotion.
+The timed inputs are the public generator’s seed 7 and leap-day seed 15 (20M events / 5M clicks) and seed 13 (60M / 15M). Setting both `scale` and `scale_pairs` also runs the packaged application on independent 60M seed 948307 and compares every row. After timing, a separate `wait4` wrapper records Linux application peak RSS and the cgroup's peak charge, which can include file cache. The native and Docker timers use fresh output directories; none of the pipelines read earlier results. Each input is warmed once per executable for the paired measurements. The inside-container self-reported timer alone is not used for promotion.
