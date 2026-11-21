@@ -1,6 +1,10 @@
 //! Most events carry only a temporal key. Purchases carry their own full
 //! payload until dedup, then contribute a key to the temporal stream as well.
 use super::{Identity, People};
+use crate::radix::Radix;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct Compact(pub u64);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Wide {
@@ -43,7 +47,7 @@ pub(super) trait Temporal: Copy + Ord {
     fn ts(self, layout: Self::Layout) -> i64;
     // Only compared within one person's ordered keys.
     fn gap(self, prev: Self) -> u64;
-    fn name(person: u64, people: &People) -> u64;
+    fn name(person: u64, layout: Self::Layout, people: &People) -> u64;
 }
 
 impl Temporal for Wide {
@@ -65,7 +69,7 @@ impl Temporal for Wide {
     }
 
     #[inline]
-    fn name(person: u64, _: &People) -> u64 {
+    fn name(person: u64, _: (), _: &People) -> u64 {
         person
     }
 }
@@ -89,8 +93,28 @@ impl Temporal for u64 {
     }
 
     #[inline]
-    fn name(rank: u64, people: &People) -> u64 {
+    fn name(rank: u64, _: Packing, people: &People) -> u64 {
         people.original(rank as u32)
+    }
+}
+
+impl Temporal for Compact {
+    type Layout = Radix;
+    #[inline]
+    fn person(self, r: Radix) -> u64 {
+        r.div(self.0)
+    }
+    #[inline]
+    fn ts(self, r: Radix) -> i64 {
+        (self.0 - r.div(self.0) * r.span).wrapping_add(r.origin as u64) as i64
+    }
+    #[inline]
+    fn gap(self, prev: Self) -> u64 {
+        self.0 - prev.0
+    }
+    #[inline]
+    fn name(person: u64, r: Radix, _: &People) -> u64 {
+        r.name(person)
     }
 }
 
@@ -134,6 +158,7 @@ impl<T: Copy> Stream<T> {
 pub(super) struct Payload {
     pub packed: Stream<u64>,
     pub wide: Stream<Wide>,
+    pub compact: Stream<Compact>,
 }
 
 impl Payload {
@@ -149,16 +174,20 @@ impl Payload {
     ) -> usize {
         let purchase = usize::from(price != 0);
         let person = match identity {
+            Identity::Compact(token) => {
+                let r = people.radix.expect("compact identity needs layout");
+                return self.compact.push(Compact(r.key(token, ts)), price, cat) * 6 + 4 + purchase;
+            }
             Identity::Linked(routed) => {
                 let rank = routed as u32;
                 if let Some(p) = packing {
-                    return self.packed.push(p.encode(rank, ts), price, cat) * 4 + purchase;
+                    return self.packed.push(p.encode(rank, ts), price, cat) * 6 + purchase;
                 }
                 people.original(rank)
             }
             Identity::Standalone(person) => person,
         };
-        self.wide.push(Wide { person, ts }, price, cat) * 4 + 2 + purchase
+        self.wide.push(Wide { person, ts }, price, cat) * 6 + 2 + purchase
     }
 }
 

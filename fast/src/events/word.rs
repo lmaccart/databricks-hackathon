@@ -23,7 +23,7 @@ fn comma(s: &[u8], q: bool) -> Option<&[u8]> {
 /// inline token. `'-'..=127` excludes all three CSV structural bytes and NUL;
 /// IDs with any other spelling are still handled by the ordinary codec.
 #[inline(always)]
-fn id(s: &[u8]) -> Option<(u64, &[u8])> {
+fn id(s: &[u8]) -> Option<(u64, &[u8], u64, u8, usize)> {
     let (q, b) = quoted(s);
     let b11 = b.first_chunk::<11>()?;
     let w = u64::from_le_bytes(b11[..8].try_into().unwrap());
@@ -33,7 +33,13 @@ fn id(s: &[u8]) -> Option<(u64, &[u8])> {
         if ((w.wrapping_sub(FLOOR) | w) & HIGH) != 0 || (q && b11[10] != b',') {
             return None;
         }
-        return Some((person::pack_inline(w.swap_bytes(), tail), &b[10 + usize::from(q)..]));
+        return Some((
+            person::pack_inline(w.swap_bytes(), tail),
+            &b[10 + usize::from(q)..],
+            w,
+            tail,
+            9,
+        ));
     }
     // Search the two shorter boundary positions. The subtract-based
     // zero mask can have borrow artifacts after a match, never before it.
@@ -53,7 +59,13 @@ fn id(s: &[u8]) -> Option<(u64, &[u8])> {
     if ((w.wrapping_sub(FLOOR) | w) & HIGH & active) != 0 {
         return None;
     }
-    Some((person::pack_inline((w & active).swap_bytes(), 0), &b[more..]))
+    Some((
+        person::pack_inline((w & active).swap_bytes(), 0),
+        &b[more..],
+        w & active,
+        0,
+        n,
+    ))
 }
 
 #[inline(always)]
@@ -200,9 +212,14 @@ fn suffix<'a>(s: &'a [u8], purchase: bool, sm: &Small) -> Option<(Option<PriceCa
 }
 
 #[inline(always)]
-fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestClock)) -> Option<(Pending, &'a [u8])> {
-    let (eid, s) = id(s)?;
-    let (uid, s) = id(s)?;
+fn decode<'a>(
+    s: &'a [u8],
+    sm: &Small,
+    (ws, we, clock): (i64, i64, &ManifestClock),
+    radix: Option<radix::Radix>,
+) -> Option<(Pending, &'a [u8])> {
+    let (eid, s, _, _, _) = id(s)?;
+    let (uid, s, word, tail, len) = id(s)?;
     let (ts, seconds, s) = timestamps(s, clock)?;
     let (purchase, s) = event_type(s)?;
     let (payload, rest) = suffix(s, purchase, sm)?;
@@ -220,6 +237,7 @@ fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestCloc
     {
         e.uid = uid;
         e.hash = links::mix(uid);
+        e.compact = radix.map_or(0, |r| r.word(word, tail, len));
         e.price = price;
         e.cat = cat;
     }
@@ -234,11 +252,12 @@ fn fallback<'a>(
     codec: &Codec<'a>,
     window: (i64, i64, &ManifestClock),
     spill: &mut Vec<i64>,
+    radix: Option<radix::Radix>,
 ) -> (Option<Pending>, &'a [u8]) {
     let end = memchr::memchr(b'\n', s).map_or(s.len(), |i| i + 1);
     let (line, rest) = s.split_at(end);
     let mut row = None;
-    csv::identity_row::<7>(line, &mut |r| row = decode_fields(r, sm, codec, window, spill));
+    csv::identity_row::<7>(line, &mut |r| row = decode_fields(r, sm, codec, window, spill, radix));
     (row, rest)
 }
 
@@ -249,22 +268,23 @@ pub(super) fn for_events<'a>(
     codec: &Codec<'a>,
     window: (i64, i64, &ManifestClock),
     spill: &mut Vec<i64>,
+    radix: Option<radix::Radix>,
     mut emit: impl FnMut(Pending),
 ) {
     if !c.identity_order(7) {
         return for_rows(c, |r| {
-            if let Some(e) = decode_fields(r, sm, codec, window, spill) {
+            if let Some(e) = decode_fields(r, sm, codec, window, spill, radix) {
                 emit(e);
             }
         });
     }
     let mut rest = c.data;
     while !rest.is_empty() {
-        if let Some((e, tail)) = decode(rest, sm, window) {
+        if let Some((e, tail)) = decode(rest, sm, window, radix) {
             emit(e);
             rest = tail;
         } else {
-            let (e, tail) = fallback(rest, sm, codec, window, spill);
+            let (e, tail) = fallback(rest, sm, codec, window, spill, radix);
             if let Some(e) = e {
                 emit(e);
             }
@@ -294,7 +314,7 @@ mod tests {
                             input.push(b'"');
                         }
                         input.extend_from_slice(b",following-field");
-                        let (key, rest) = id(&input).expect("ASCII ID must use the fast path");
+                        let (key, rest, _, _, _) = id(&input).expect("ASCII ID must use the fast path");
                         assert_eq!(Some(key), person::inline(&value), "{value:?}");
                         assert_eq!(rest, b"following-field");
                     }
@@ -316,6 +336,7 @@ mod tests {
         let we = parse_ts(b"2026-10-15T00:00:00Z");
         let clock = ManifestClock::new(ws, we);
         let window = (ws, we, &clock);
+        let radix = radix::Radix::new(b'u', ws, we);
         let cols = [
             "event_id",
             "user_id",
@@ -334,9 +355,9 @@ mod tests {
                 let (mut want, mut got) = (vec![], vec![]);
                 let (mut want_spill, mut got_spill) = (vec![], vec![]);
                 for_rows(&c, |r| {
-                    want.extend(decode_fields(r, &sm, &codec, window, &mut want_spill))
+                    want.extend(decode_fields(r, &sm, &codec, window, &mut want_spill, radix))
                 });
-                for_events(&c, &sm, &codec, window, &mut got_spill, |e| got.push(e));
+                for_events(&c, &sm, &codec, window, &mut got_spill, radix, |e| got.push(e));
                 assert_eq!(got, want, "{row:?}, {after:?}");
                 assert_eq!(got_spill, want_spill);
             }
@@ -348,7 +369,7 @@ mod tests {
             b"opaque009,\"USER_07\",\"2026-10-03T10:30:00+00:30\",\"2026-10-03T10:00:00Z\",\"purchase\",\"item-7\",\"0123\"",
         ] {
             let file = [row, &followed].concat();
-            let (event, rest) = decode(&file, &sm, window).unwrap_or_else(|| panic!("must exercise the word path: {row:?}"));
+            let (event, rest) = decode(&file, &sm, window, radix).unwrap_or_else(|| panic!("must exercise the word path: {row:?}"));
             assert_ne!(event.uid, 0);
             assert_eq!(rest, following);
             check(row, b"");

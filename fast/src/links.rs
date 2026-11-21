@@ -1,6 +1,6 @@
 //! Build the canonical-name lookup in parallel, including transitive paths
 //! that span input files. Canonical node indexes also serve as exact sort ranks.
-use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows};
+use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows, radix::Radix};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -60,26 +60,33 @@ pub(super) struct People<'a> {
     lanes: Vec<Lane>,
     roots: Vec<u64>,
     pub(super) count: usize,
+    pub(super) radix: Option<Radix>,
 }
 
 // This bit is disjoint from the packed routing shard and the canonical node
 // index. It is internal to the link table, not reserved in arbitrary person keys.
 const LINKED: u64 = 1 << 63;
-const _: () = assert!(SHARD_SHIFT >= 32 && ((NS as u64 - 1) << SHARD_SHIFT) & LINKED == 0);
+const COMPACT: u64 = 1 << 62;
+const _: () = assert!(SHARD_SHIFT >= 32 && ((NS as u64 - 1) << SHARD_SHIFT) & (LINKED | COMPACT) == 0);
 
 #[derive(Clone, Copy)]
 pub(super) enum Identity {
     Linked(u64), // shard bits at their normal position, root node index in low bits
     Standalone(u64),
+    Compact(u64),
 }
 
 impl<'a> People<'a> {
     #[inline]
-    pub(super) fn lookup(&self, key: u64, h: u64) -> Identity {
+    pub(super) fn lookup(&self, key: u64, h: u64, compact: u64) -> Identity {
         let lane = &self.lanes[h as usize & (LANES - 1)];
         let s = lane.slots[lane.find(key, h)];
-        if s.value & LINKED != 0 {
+        if s.value & COMPACT != 0 {
+            Identity::Compact(s.value ^ COMPACT)
+        } else if s.value & LINKED != 0 {
             Identity::Linked(s.value ^ LINKED)
+        } else if compact != 0 {
+            Identity::Compact(compact)
         } else {
             Identity::Standalone(h)
         }
@@ -129,7 +136,7 @@ fn root(parent: &[AtomicU32], mut x: u32) -> u32 {
     }
 }
 
-pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
+pub(super) fn person_names<'a>(chunks: &[Chunk<'a>], radix: Option<Radix>) -> People<'a> {
     let codec = Codec::new();
     let parsed: Vec<_> = chunks
         .par_iter()
@@ -227,14 +234,23 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
                 }
             }
         });
+    let compact_roots: Vec<u64> = keys
+        .par_iter()
+        .map(|&k| radix.map_or(0, |r| r.bytes(codec.bytes(k, &mut [0; 9]))))
+        .collect();
     let mut roots = keys;
     roots.par_iter_mut().for_each(|k| *k = mix(*k));
     lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
         for slot in &mut lane.slots {
             if slot.key != 0 {
                 let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
-                let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
-                slot.value = LINKED | routing | u64::from(rank);
+                let compact = compact_roots[rank as usize];
+                if compact != 0 {
+                    slot.value = COMPACT | compact;
+                } else {
+                    let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
+                    slot.value = LINKED | routing | u64::from(rank);
+                }
             }
         }
     });
@@ -243,5 +259,6 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         lanes,
         roots,
         count,
+        radix,
     }
 }

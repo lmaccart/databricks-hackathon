@@ -23,6 +23,7 @@ mod events;
 mod links;
 mod output;
 mod person;
+mod radix;
 mod stream;
 use links::{Identity, People, person_names};
 use person::Codec;
@@ -106,6 +107,33 @@ fn chunks_for<'a>(files: &'a [(PathBuf, Mmap)], cols: &[&str]) -> Vec<Chunk<'a>>
     let mut v: Vec<Chunk> = files.iter().flat_map(|(p, m)| chunks_of(&m[..], cols, p)).collect();
     v.sort_by_key(|c| std::cmp::Reverse(c.data.len())); // big tasks first
     v
+}
+
+// Sampling only chooses a fast path; each actual ID is independently checked.
+fn sample_radix(links: &[Chunk], events: &[Chunk], ws: i64, we: i64) -> Option<radix::Radix> {
+    let mut counts = [0usize; 256];
+    for (chunks, field) in [(links, 0), (events, 1)] {
+        for c in chunks.iter().take(8) {
+            let mut sample = *c;
+            let n = sample.data.len().min(16 * 1024);
+            sample.data = &sample.data[..n];
+            for_rows(&sample, |r| {
+                let b = r[field];
+                if (7..=9).contains(&b.len())
+                    && let Some(layout) = radix::Radix::new(b[0], ws, we)
+                    && layout.bytes(b) != 0
+                {
+                    counts[b[0] as usize] += 1;
+                }
+            });
+        }
+    }
+    let (prefix, n) = counts.iter().enumerate().max_by_key(|&(_, n)| n)?;
+    if *n == 0 {
+        None
+    } else {
+        radix::Radix::new(prefix as u8, ws, we)
+    }
 }
 
 struct Small<'a> {
@@ -219,6 +247,7 @@ fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
 struct Clicks {
     packed: Vec<PCl>,
     wide: Vec<PCl>,
+    compact: Vec<PCl>,
 }
 
 fn parse_clicks<'a>(
@@ -234,18 +263,21 @@ fn parse_clicks<'a>(
         .map(|_| Clicks {
             wide: Vec::with_capacity(if packed { hint / 2 } else { hint }),
             packed: Vec::with_capacity(if packed { hint / 2 } else { 0 }),
+            compact: Vec::with_capacity(if names.radix.is_some() { hint } else { 0 }),
         })
         .collect();
     #[derive(Clone, Copy, Default)]
     struct PendingClick {
         uid: u64,
         hash: u64,
+        compact: u64,
         cid: u64,
         ts: i64,
         camp: u32,
     }
     let mut emit = |row: PendingClick| {
-        let (dest, person) = match names.lookup(row.uid, row.hash) {
+        let (dest, person) = match names.lookup(row.uid, row.hash, row.compact) {
+            Identity::Compact(token) => (&mut b[token as u8 as usize].compact, token >> 8),
             Identity::Linked(p) if packed => (&mut b[shard(p)].packed, u64::from(p as u32)),
             Identity::Linked(p) => (&mut b[shard(p)].wide, names.original(p as u32)),
             Identity::Standalone(p) => (&mut b[shard(p)].wide, p),
@@ -280,6 +312,7 @@ fn parse_clicks<'a>(
         ring[i] = PendingClick {
             uid: key,
             hash,
+            compact: names.radix.map_or(0, |r| r.bytes(uid)),
             ts,
             cid: names.codec.key(cid),
             camp: ci,
@@ -362,7 +395,7 @@ fn process_stream<T: Temporal>(
     let mut pi = 0usize;
     while i < evs.len() {
         let rank = evs[i].person(layout);
-        let person = T::name(rank, people);
+        let person = T::name(rank, layout, people);
         let mut j = i;
         while j < evs.len() && evs[j].person(layout) == rank {
             j += 1;
@@ -484,20 +517,36 @@ fn process_stream<T: Temporal>(
 }
 
 fn process_shard(
+    shard: usize,
     evs: Vec<Payload>,
     cls: Vec<Clicks>,
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
 ) -> ShardOut {
-    let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
-    let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
+    let (packed, rest): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, (e.wide, e.compact))).unzip();
+    let (wide, compact): (Vec<_>, Vec<_>) = rest.into_iter().unzip();
+    let (pc, rest): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, (c.wide, c.compact))).unzip();
+    let (wc, cc): (Vec<_>, Vec<_>) = rest.into_iter().unzip();
     let mut out = ShardOut {
         users: Vec::new(),
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
         process_stream(packed, gather(pc), sm, people, pack, &mut out);
+    }
+    if let Some(r) = people.radix {
+        process_stream(
+            compact,
+            gather(cc),
+            sm,
+            people,
+            radix::Radix {
+                shard: shard as u8,
+                ..r
+            },
+            &mut out,
+        );
     }
     process_stream(wide, gather(wc), sm, people, (), &mut out);
     out
@@ -554,7 +603,8 @@ fn main() {
         ],
     );
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
-    let names = person_names(&link_chunks);
+    let radix = sample_radix(&link_chunks, &ev_chunks, ws, we);
+    let names = person_names(&link_chunks, radix);
     let packing = Packing::new(ws, we, names.count);
     log(&format!("links: {} linked ids", names.count));
 
@@ -567,22 +617,32 @@ fn main() {
         .collect();
     log("clicks routed");
 
-    let len =
-        |e: &Payload| e.packed.times.len() + e.packed.purchases.len() + e.wide.times.len() + e.wide.purchases.len();
+    let len = |e: &Payload| {
+        e.packed.times.len()
+            + e.packed.purchases.len()
+            + e.wide.times.len()
+            + e.wide.purchases.len()
+            + e.compact.times.len()
+            + e.compact.purchases.len()
+    };
     let mut jobs: Vec<_> = by_destination(ev_by_person, |e| len(e) > 0)
         .into_iter()
         .zip(by_destination(cl_by_person, |c| {
-            !c.packed.is_empty() || !c.wide.is_empty()
+            !c.packed.is_empty() || !c.wide.is_empty() || !c.compact.is_empty()
         }))
+        .enumerate()
         .collect();
-    jobs.sort_unstable_by_key(|(e, c)| {
+    jobs.sort_unstable_by_key(|(_, (e, c))| {
         std::cmp::Reverse(
-            e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
+            e.iter().map(len).sum::<usize>()
+                + c.iter()
+                    .map(|x| x.packed.len() + x.wide.len() + x.compact.len())
+                    .sum::<usize>(),
         )
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(s, (e, c))| process_shard(s, e, c, &sm, &names, packing))
         .collect();
     log("sessions done");
 

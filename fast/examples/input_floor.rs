@@ -24,6 +24,9 @@ mod links;
 #[path = "../src/person.rs"]
 mod person;
 #[allow(dead_code)]
+#[path = "../src/radix.rs"]
+mod radix;
+#[allow(dead_code)]
 #[path = "../src/ts.rs"]
 mod ts;
 use csv::{Chunk, for_rows};

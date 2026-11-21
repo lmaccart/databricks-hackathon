@@ -1,5 +1,31 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Exact sampled-prefix person tokens — 2026-11-21
+
+Experimental candidate based on `dfbd330`: choose a prefix from bounded live
+link/event samples, and validate each suffix as zero to eight lowercase
+base-36 bytes. Length-offset token ranges retain every leading zero. The
+canonical token is stored in each alias slot; the typed event load computes
+the singleton token with SWAR. Its low byte routes both cases to one shard;
+the remaining token times the actual event-window span plus the millisecond
+offset is checked to fit below the tombstone (at most 1,627,440,896 ms,
+about 18.84 days, with this full suffix domain). Reciprocal multiplication avoids
+division in the sorted scan. Unmatched names, spill IDs and manifests that do
+not fit retain exact original paths. Token-low-byte sharding can be skewed on
+adversarial input and sampling may choose an unproductive prefix.
+
+Native dev-set five-pair median against `dfbd330`: 0.086 → 0.082 s (4.6%
+less), candidate won 3/5; individual pairs ranged from 7.9% faster to 68.4%
+slower. The preceding division-based version was 0.109 → 0.131 s. These
+small, noisy measurements are **not** evidence of a scale speedup. No 20M,
+60M, Linux/amd64 or container timing was run under the task restriction.
+Do not select this candidate without the required paired scale benchmarks.
+
+Validation: 40 Python cases against both implementations, 24 Rust tests,
+36/36 official fixtures, 10 kit dirty seeds at 20k events, five official
+generator seeds at 10k including leap day, and both public dev-answer
+comparers matched. No production behavior change is intended.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).

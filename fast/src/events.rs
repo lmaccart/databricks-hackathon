@@ -14,7 +14,7 @@ struct Claim {
 
 // An emitted event has at least six commas. At most one row extends past
 // CHUNK, so the stream kind, per-stream ordinal and shard fit in the claim.
-const _: () = assert!(NS == 256 && (CHUNK / 6 + 1) * 4 * NS < u32::MAX as usize);
+const _: () = assert!(NS == 256 && (CHUNK / 6 + 1) * 6 * NS < u32::MAX as usize);
 const NONE: u32 = u32::MAX;
 const KEY_BITS: u32 = u64::BITS - NS.trailing_zeros();
 const KEY_MASK: u64 = (1 << KEY_BITS) - 1;
@@ -101,6 +101,7 @@ struct Pending {
     claim_key: u64,
     uid: u64, // zero is never the key of a nonempty ID
     hash: u64,
+    compact: u64,
     ts: i64,
     claim_order: u64,
     price: u32,
@@ -114,6 +115,7 @@ fn decode_fields<'a>(
     codec: &Codec<'a>,
     (ws, we, clock): (i64, i64, &ManifestClock),
     spill: &mut Vec<i64>,
+    radix: Option<radix::Radix>,
 ) -> Option<Pending> {
     if r[0].is_empty() {
         return None;
@@ -136,6 +138,7 @@ fn decode_fields<'a>(
         if let Some(price) = purchase {
             next.uid = codec.key(r[1]);
             next.hash = links::mix(next.uid);
+            next.compact = radix.map_or(0, |layout| layout.bytes(r[1]));
             next.price = price;
             next.cat = if price == 0 {
                 0
@@ -164,6 +167,9 @@ fn parse<'a>(
             if packing.is_some() {
                 p.packed.times.reserve(reserve / 2);
             }
+            if people.radix.is_some() {
+                p.compact.times.reserve(reserve);
+            }
             p
         })
         .collect();
@@ -172,10 +178,11 @@ fn parse<'a>(
     let mut emit = |e: Pending| {
         let mut target = NONE;
         if e.uid != 0 {
-            let person = people.lookup(e.uid, e.hash);
-            let p = shard(match person {
-                Identity::Linked(routed) | Identity::Standalone(routed) => routed,
-            });
+            let person = people.lookup(e.uid, e.hash, e.compact);
+            let p = match person {
+                Identity::Linked(routed) | Identity::Standalone(routed) => shard(routed),
+                Identity::Compact(token) => token as u8 as usize,
+            };
             let slot = payload[p].push(person, e.ts, e.price, e.cat, packing, people);
             target = (slot * NS + p) as u32;
         }
@@ -185,7 +192,7 @@ fn parse<'a>(
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
-    word::for_events(c, sm, &people.codec, window, &mut spill, |next| {
+    word::for_events(c, sm, &people.codec, window, &mut spill, people.radix, |next| {
         if next.uid != 0 {
             people.prefetch(next.hash);
         }
@@ -336,12 +343,14 @@ pub(super) fn by_person<'a>(
             let x = target as usize;
             let bucket = &mut payload[x % NS];
             let slot = x / NS;
-            let index = slot / 4;
-            match slot % 4 {
+            let index = slot / 6;
+            match slot % 6 {
                 0 => bucket.packed.times[index] = u64::MAX,
                 1 => bucket.packed.purchases[index].price = 0,
                 2 => bucket.wide.times[index].ts = BAD,
-                _ => bucket.wide.purchases[index].price = 0,
+                3 => bucket.wide.purchases[index].price = 0,
+                4 => bucket.compact.times[index].0 = u64::MAX,
+                _ => bucket.compact.purchases[index].price = 0,
             }
         }
         for dest in payload {
@@ -349,6 +358,8 @@ pub(super) fn by_person<'a>(
             dest.packed.purchases.retain(|p| p.price != 0);
             dest.wide.times.retain(|key| key.ts != BAD);
             dest.wide.purchases.retain(|p| p.price != 0);
+            dest.compact.times.retain(|key| key.0 != u64::MAX);
+            dest.compact.purchases.retain(|p| p.price != 0);
         }
     });
     payloads
