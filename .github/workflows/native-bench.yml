@@ -84,3 +84,26 @@ jobs:
               --threads "$t" --tmpdir "$RUNNER_TEMP" --candidate-env "LD_PRELOAD=$RUNNER_TEMP/libmimalloc.so"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Compare a guarded x86 feature build with the portable binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SS_EXEC_DIR="$RUNNER_TEMP/multiversion" CARGO_TARGET_DIR="$RUNNER_TEMP/target"
+          mkdir -p "$SS_EXEC_DIR"
+          cp "$RUNNER_TEMP/candidate" "$SS_EXEC_DIR/base"
+          RUSTFLAGS='-Ctarget-feature=+sse4.2,+popcnt,+avx2,+bmi1,+bmi2,+aes' \
+            cargo +1.100.0 build --target x86_64-unknown-linux-gnu --release --locked --manifest-path fast/Cargo.toml
+          cp "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/shopping_sessions" "$SS_EXEC_DIR/isa"
+          rustc +1.100.0 --edition 2024 -Copt-level=s -Cpanic=abort -Ctarget-feature=+crt-static \
+            tools/isa/dispatch.rs -o "$SS_EXEC_DIR/dispatch"
+          t=$(nproc); if (( t > 8 )); then t=8; fi
+          export RAYON_NUM_THREADS=$t
+          DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$RUNNER_TEMP/isa-dev" "$SS_EXEC_DIR/dispatch"
+          "$RUNNER_TEMP/venv/bin/python" tools/compare_outputs.py "$RUNNER_TEMP/dev-answer" "$RUNNER_TEMP/isa-dev"
+          {
+            echo '### CPU dispatch (launch overhead included)'
+            echo '```'
+            python3 tools/bench_pair.py "$SS_EXEC_DIR/base" "$SS_EXEC_DIR/dispatch" "$RUNNER_TEMP/practice" \
+              --threads "$t" --tmpdir "$RUNNER_TEMP"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
