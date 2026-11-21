@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Fixed-order row-shape challenger — 2026-11-21
+
+- Events try a 32-byte prefix through the second comma and a separate 64-bit suffix; clicks try a 64-bit mask for the full row. Windows are anchored to each row. BMI instructions prove the exact comma count and compress the closing and opening quote boundaries to compare field by field. The timestamp and downstream validators are unchanged.
+- Short buffers, long rows, or a failed mask proof use the exact single-line decoder. Reordered headers and CPUs without AVX2/BMI1/BMI2 use the general scanner. Added oracle cases across all quote combinations, vector boundaries, malformed syntax, and unterminated tails, plus an amd64 test that explicitly asserts SIMD hits.
+- Local ARM checks: Rust and Python suites, 10 synthetic seeds, 36 official fixtures, and the exact official dev answer. The SIMD tests also ran under local amd64 emulation with the required features detected. Native five-pair 20M timing is delegated to the parent; no speedup claimed here.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.

@@ -12,6 +12,10 @@ use memchr::memchr;
 use std::marker::PhantomData;
 use std::path::Path;
 
+#[cfg(target_arch = "x86_64")]
+#[path = "row_shape.rs"]
+mod row_shape;
+
 /// Output slot for fields no caller reads (the ninth entry of the row buffer).
 const SKIP: u8 = 8;
 
@@ -100,6 +104,18 @@ pub fn for_rows<'a>(c: &Chunk<'a>, mut f: impl FnMut(&[&'a [u8]; 8])) {
         }
     }
     scan::<Native, _>(c.data, &slot, &mut f);
+}
+
+/// Events and clicks can try the fixed-order decoder only if their header map is the identity.
+#[inline]
+pub fn for_fixed_rows<'a, const N: usize, F: FnMut(&[&'a [u8]; 8])>(c: &Chunk<'a>, mut f: F) {
+    const { assert!(N == 4 || N == 7) };
+    #[cfg(target_arch = "x86_64")]
+    if c.nfields == N && c.ncols == N && c.idx[..N].iter().copied().eq(0..N) && row_shape::supported() {
+        // SAFETY: runtime feature checks passed.
+        return unsafe { row_shape::scan::<N, F>(c.data, &mut f) };
+    }
+    scan::<Swar, _>(c.data, &slots(c), &mut f);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -439,7 +455,11 @@ mod tests {
             let mut f = |r: &[&[u8]; 8]| out.push(r[..cols.len()].iter().map(|v| v.to_vec()).collect());
             let slot = slots(&c);
             match kernel {
-                0 => for_rows(&c, &mut f),
+                0 => match cols.len() {
+                    4 => for_fixed_rows::<4, _>(&c, &mut f),
+                    7 => for_fixed_rows::<7, _>(&c, &mut f),
+                    _ => for_rows(&c, &mut f),
+                },
                 1 => scan::<Swar, _>(c.data, &slot, &mut f),
                 2 => scan::<Native, _>(c.data, &slot, &mut f),
                 #[cfg(target_arch = "x86_64")]
@@ -601,6 +621,84 @@ mod tests {
             b"price_cents,product_id,event_type,ingest_ts,ts,user_id,event_id\n7,p,view,i,t,u,e\n\"7\",p,view,i,t,u,\"e\"\n",
             &ev,
         );
+    }
+
+    #[test]
+    fn fixed_rows_match_oracle() {
+        let ev = [
+            "event_id",
+            "user_id",
+            "ts",
+            "ingest_ts",
+            "event_type",
+            "product_id",
+            "price_cents",
+        ];
+        let cl = ["click_id", "user_id", "campaign_id", "ts"];
+        for cols in [&ev[..], &cl[..]] {
+            let header = cols.join(",");
+            let mut rng = Rng(0xA076_1D64_78BD_642F);
+            for width in 0..=129 {
+                let fields = if cols.len() == 7 {
+                    vec![
+                        "e".repeat(width),
+                        "ü\r\0".into(),
+                        "1791071890000".into(),
+                        "2026-10-03T23:58:10Z".into(),
+                        "cart".into(),
+                        " p\t".into(),
+                        "".into(),
+                    ]
+                } else {
+                    vec![
+                        "e".repeat(width),
+                        "ü\r\0".into(),
+                        "".into(),
+                        "2026-10-03T19:58:10-04:00\r".into(),
+                    ]
+                };
+                let rows: Vec<_> = (0..1 << cols.len())
+                    .map(|mask| {
+                        fields
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| {
+                                if mask & (1 << i) != 0 {
+                                    format!("\"{v}\"")
+                                } else {
+                                    v.clone()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .collect();
+                let mut file = format!("{header}\n\n").into_bytes();
+                for row in &rows {
+                    file.extend_from_slice(row.as_bytes());
+                    file.push(b'\n');
+                    // Replace or inject one byte, often malformed but not necessarily.
+                    let mut dirty = row.as_bytes().to_vec();
+                    let offset = rng.below(dirty.len());
+                    if rng.below(2) == 0 {
+                        dirty[offset] = b"\"a,\n"[rng.below(4)];
+                    } else {
+                        dirty.insert(offset, b"\"a,\n"[rng.below(4)]);
+                    }
+                    file.extend_from_slice(&dirty);
+                    file.push(b'\n');
+                }
+                for tail in [b"" as &[u8], b"\n\"\",,,,", b"e,u,c,\"\"", b"e,u,c,\"", b"\n,,,,,,\r"] {
+                    let mut file = file.clone();
+                    file.extend_from_slice(tail);
+                    let want = py_rows(&file, cols);
+                    for chunk in [usize::MAX, 32, 96] {
+                        let got = kernel_rows(&file, cols, chunk, 0);
+                        assert_eq!(got, want, "cols={cols:?}, width={width}, tail={tail:?}, chunk={chunk}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
