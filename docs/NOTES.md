@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Strict typed row parsing on the 1.57 s baseline — 2026-11-21
+
+[`f4ac682` won all ten native pairs](https://github.com/lmaccart/databricks-hackathon/actions/runs/44875889484) relative to `9758471`: 1.744 → 1.628 s (seed 7) and 1.719 → 1.604 s (seed 15). Its event phase fell 0.833 → 0.709 s on seed 7. It validates ID bytes in the load used to encode them and parses the common event layout without first searching for a newline. No header order, date, ID spelling or field width is assumed for correctness. All output rows matched on both inputs. The [round ledger](PERF_157.md) also records alternatives and the measured scanning/decoding budget.
+
 ## Official practice: 1.57 s; new target 0.63 s — 2026-11-21
 
 Leif reports **1.57 s** on the most recent entry, down from **1.78 s** (11.8% less time), and a **0.63 s** record. The current main build and the recommended `9758471` have identical production sources. Use `9758471` as the fixed control. Matching 0.63 s requires **2.49×** the current throughput, or **0.94 s / 59.9%** less wall time.

@@ -2,6 +2,8 @@
 
 The scored v1 (`cc9f33e`, 5.03 s) sent every parsed event through an event-ID hash table and **then** copied the winner to a person partition. The rebuilt pipeline sends a valid event's payload directly to the person partition. A much smaller, independent stream of claims tells it which payloads to throw away.
 
+`events/word.rs` handles common rows whose header order, field boundaries, quoting, and typed values it can prove from bounded byte loads. Its ID load both validates the spelling and produces the exact inline token. A failed guard retries from the start of that physical line with the strict CSV scanner; noncanonical headers use the normal mapped-column path for the whole chunk. Both paths emit the same claim and tentative payload.
+
 ```text
 manifest, products, campaigns ────────────────► windows and dimension lookups
 links ─► exact ID keys ─► parallel union-find ─► immutable ID → canonical person
