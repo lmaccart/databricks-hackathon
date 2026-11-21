@@ -1,5 +1,26 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Columnar microbatch challenger — 2026-11-20
+
+Experimental branch only, not recommended for production without a contrary native result.
+The unchanged CSV scanner gathers 32 rows of borrowed field slices, then decodes
+ingest/IDs and F1/F2/F3 in separate passes, validates and prefetches owners,
+and emits claims and payloads in input order. Invalid copies still emit claims.
+
+On the M2 Pro, 8 workers, official seed-7 20M/5M input, five alternating warm
+process pairs, baseline `bcdc149` vs this candidate: **0.683 → 0.753 s**
+(10.3% slower). Event-parse phase medians 0.246 → 0.278 s; raw baseline
+0.743, 0.670, 0.673, 0.683, 0.687 s and candidate 0.753, 0.762, 0.703,
+0.703, 0.753 s. An earlier comparison was 0.750 → 0.885 s under noisier
+load. A separate five-pair 32-vs-16 batch trial was 0.748 → 0.795 s.
+These are Mac measurements, not scorer or native Linux timings.
+
+Both checkers matched the dev answer exactly; reference and binary passed
+36/36 official fixtures, 32 local tests, and 10 dirty-data differential seeds.
+The Rust parser suite passed 13/13. Added a cross-batch regression covering
+invalid earliest duplicate claims, F1/F2/F3, long and malformed numbers, and
+canonical owner lookup.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.

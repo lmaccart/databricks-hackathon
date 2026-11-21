@@ -158,6 +158,22 @@ fn epoch_ms(s: &[u8]) -> i64 {
     }
 }
 
+// The batch caller has already classified the exact length and ISO marker.
+#[inline]
+pub fn batch_f1(s: &[u8]) -> i64 {
+    iso::<false>(s)
+}
+
+#[inline]
+pub fn batch_f2(s: &[u8]) -> i64 {
+    iso::<true>(s)
+}
+
+#[inline]
+pub fn batch_f3(s: &[u8]) -> i64 {
+    epoch_ms(s)
+}
+
 /// Epoch ms, or BAD. Mirrors reference/pipeline.py::parse_ts.
 #[inline]
 pub fn parse_ts(s: &[u8]) -> i64 {

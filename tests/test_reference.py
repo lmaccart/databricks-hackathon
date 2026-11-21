@@ -189,6 +189,23 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_cross_batch_claims_and_timestamp_forms(self):
+        t = "2026-10-02T10:00:00Z"
+        ingest = "2026-10-02T10:01:00Z"
+        stamps = [t, "2026-10-02T06:00:00-04:00", str(ms(t)), "000" + str(ms(t))]
+        events = [ev(f"e{i}", f"user{i}", stamps[i % 4], ingest=ingest) for i in range(67)]
+        # The earliest invalid copy must claim its ID across any batching boundary.
+        events[15] = ev("dupe", "user15", t, ingest=ingest)
+        events[48] = ev("dupe", "user48", "2026-02-29T10:00:00Z", ingest=t)
+        events[31] = ev("bad", "user31", "9" * 50, ingest=t)
+        events[32] = ev("bad2", "user32", "000" + str(ms(t)) + "x", ingest=t)
+        events[63] = ev("empty", "", t, ingest=t)
+        u, _ = run_case(events=events, links=["user0,aaa"])
+        self.assertEqual(len(u), 62)
+        self.assertIn(("aaa", "2026-10-02"), u)
+        for i in [15, 31, 32, 48, 63]:
+            self.assertNotIn((f"user{i}", "2026-10-02"), u)
+
     def test_no_survivors_still_writes_both_empty_tables(self):
         u, c = run_case(events=[ev("e", "", WS)], clicks=[f"k,u,c_1,{WS}"])
         self.assertEqual((u, c), ({}, {}))

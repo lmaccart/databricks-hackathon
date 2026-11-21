@@ -33,6 +33,100 @@ struct Pending {
     cat: u32,
 }
 
+const BATCH: usize = 32;
+
+// Slices are borrowed directly from the chunk: no field values are copied,
+// and malformed rows have already been rejected by the shared CSV scanner.
+struct Columns<'a> {
+    fields: [[&'a [u8]; BATCH]; 7],
+    len: usize,
+}
+
+impl<'a> Columns<'a> {
+    fn new() -> Self {
+        Self {
+            fields: [[&[]; BATCH]; 7],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, row: &[&'a [u8]; 8]) {
+        for (col, value) in self.fields.iter_mut().zip(row) {
+            col[self.len] = value;
+        }
+        self.len += 1;
+    }
+}
+
+#[inline(never)]
+fn process_batch<'a>(
+    cols: &mut Columns<'a>,
+    sm: &Small,
+    people: &People<'a>,
+    ws: i64,
+    we: i64,
+    emit: &mut impl FnMut(Pending),
+) {
+    let n = cols.len;
+    let f = &cols.fields;
+    let mut rows = [Pending::default(); BATCH];
+    let mut group = [[0usize; BATCH]; 3];
+    let mut counts = [0usize; 3];
+
+    // Every identified, structurally valid event gets a claim regardless of
+    // its payload validity. Preserve scan order for equal-ingest copies.
+    for i in 0..n {
+        rows[i].id = people.codec.key(f[0][i]);
+        rows[i].ingest = parse_ingest(f[3][i]);
+    }
+    for (i, &t) in f[2][..n].iter().enumerate() {
+        let kind = match t.len() {
+            20 if t[4] == b'-' => 0,
+            25 if t[4] == b'-' => 1,
+            _ => 2,
+        };
+        group[kind][counts[kind]] = i;
+        counts[kind] += 1;
+    }
+    for &i in &group[0][..counts[0]] {
+        rows[i].ts = ts::batch_f1(f[2][i]);
+    }
+    for &i in &group[1][..counts[1]] {
+        rows[i].ts = ts::batch_f2(f[2][i]);
+    }
+    for &i in &group[2][..counts[2]] {
+        rows[i].ts = ts::batch_f3(f[2][i]);
+    }
+    for i in 0..n {
+        let e = &mut rows[i];
+        if f[1][i].is_empty() || f[5][i].is_empty() || !(ws..we).contains(&e.ts) || e.ingest.saturating_sub(e.ts) > DAY
+        {
+            continue;
+        }
+        let purchase = match f[4][i] {
+            b"purchase" => parse_price(f[6][i]),
+            b"view" | b"cart" => Some(0),
+            _ => None,
+        };
+        if let Some(price) = purchase {
+            e.cat = if price == 0 {
+                0
+            } else {
+                *sm.product_cat.get(f[5][i]).unwrap_or(&sm.unknown_cat)
+            };
+            e.uid = people.codec.key(f[1][i]);
+            e.hash = links::mix(e.uid);
+            people.prefetch(e.hash);
+            e.price = price;
+        }
+    }
+    for &row in &rows[..n] {
+        emit(row);
+    }
+    cols.len = 0;
+}
+
 fn parse<'a>(
     c: &Chunk<'a>,
     sm: &Small,
@@ -63,49 +157,18 @@ fn parse<'a>(
             target,
         });
     };
-    let mut ring = [Pending::default(); 16];
-    let mut n = 0usize;
+    let mut cols = Columns::new();
     for_rows(c, |r| {
         if r[0].is_empty() {
             return;
         }
-        let id = people.codec.key(r[0]);
-        let ingest = parse_ingest(r[3]);
-        let ts = parse_ts(r[2]);
-        let mut next = Pending {
-            id,
-            ts,
-            ingest,
-            ..Default::default()
-        };
-        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
-            let purchase = match r[4] {
-                b"purchase" => parse_price(r[6]),
-                b"view" | b"cart" => Some(0),
-                _ => None,
-            };
-            if let Some(price) = purchase {
-                let cat = if price == 0 {
-                    0
-                } else {
-                    *sm.product_cat.get(r[5]).unwrap_or(&sm.unknown_cat)
-                };
-                next.uid = people.codec.key(r[1]);
-                next.hash = links::mix(next.uid);
-                people.prefetch(next.hash);
-                next.price = price;
-                next.cat = cat;
-            }
+        cols.push(r);
+        if cols.len == BATCH {
+            process_batch(&mut cols, sm, people, ws, we, &mut emit);
         }
-        let i = n % ring.len();
-        if n >= ring.len() {
-            emit(ring[i]);
-        }
-        ring[i] = next;
-        n += 1;
     });
-    for i in n.saturating_sub(ring.len())..n {
-        emit(ring[i % ring.len()]);
+    if cols.len != 0 {
+        process_batch(&mut cols, sm, people, ws, we, &mut emit);
     }
     (payload, claims)
 }
