@@ -29,6 +29,7 @@ fn header_name(h: &[u8]) -> &[u8] {
 #[derive(Clone, Copy)]
 pub struct Chunk<'a> {
     pub data: &'a [u8],
+    pub source: usize,
     nfields: usize,
     ncols: usize,
     idx: [usize; 8],
@@ -83,6 +84,7 @@ fn chunks_sized<'a>(file: &'a [u8], cols: &[&str], path: &Path, size: usize) -> 
         }
         out.push(Chunk {
             data: &body[start..end],
+            source: file.as_ptr() as usize,
             nfields: header.len(),
             ncols: cols.len(),
             idx,

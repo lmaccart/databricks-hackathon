@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 mod dims;
 mod events;
+mod hot;
 mod links;
 mod output;
 mod person;
@@ -221,7 +222,13 @@ struct Clicks {
     wide: Vec<PCl>,
 }
 
-fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, window: (i64, i64, &ManifestClock), names: &People<'a>) -> Vec<Clicks> {
+fn parse_clicks<'a>(
+    c: &Chunk<'a>,
+    sm: &Small,
+    window: (i64, i64, &ManifestClock),
+    names: &People<'a>,
+    hot: &hot::Hot,
+) -> Vec<Clicks> {
     let (lo, we, clock) = window;
     let hint = reserve_per_shard(c.data);
     let mut b: Vec<_> = (0..NS)
@@ -243,12 +250,20 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, window: (i64, i64, &ManifestClock
         }
         let key = names.codec.key(uid);
         let hash = links::mix(key);
-        b[shard(hash)].wide.push(PCl {
-            person: hash,
+        let routed = hot.lookup(hash);
+        let person = routed.map_or(hash, |p| u64::from(p as u32));
+        let dest = shard(routed.unwrap_or(hash));
+        let row = PCl {
+            person,
             ts,
             cid: names.codec.key(cid),
             camp: ci,
-        });
+        };
+        if routed.is_some() {
+            b[dest].packed.push(row);
+        } else {
+            b[dest].wide.push(row);
+        }
     });
     b
 }
@@ -289,8 +304,13 @@ fn join_raw(
     people: &People,
     packing: Option<Packing>,
 ) -> JoinJobs {
-    let raw_events = by_destination(events, |p| !p.wide.times.is_empty() || !p.wide.purchases.is_empty());
-    let raw_clicks = by_destination(clicks, |p| !p.wide.is_empty());
+    let raw_events = by_destination(events, |p| {
+        !p.wide.times.is_empty()
+            || !p.wide.purchases.is_empty()
+            || !p.packed.times.is_empty()
+            || !p.packed.purchases.is_empty()
+    });
+    let raw_clicks = by_destination(clicks, |p| !p.wide.is_empty() || !p.packed.is_empty());
     let joined: Vec<_> = raw_events
         .into_par_iter()
         .zip(raw_clicks.into_par_iter())
@@ -352,6 +372,29 @@ fn join_raw(
         }
     }
     jobs
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn join_keeps_pre_routed_only_partitions() {
+        let people = person_names(&[]);
+        let mut events: Vec<_> = (0..NS).map(|_| Payload::default()).collect();
+        let mut clicks: Vec<_> = (0..NS).map(|_| Clicks::default()).collect();
+        events[17].packed.times.push(123);
+        clicks[17].packed.push(PCl {
+            person: 0,
+            ts: 0,
+            cid: 1,
+            camp: 0,
+        });
+        let jobs = join_raw(vec![events], vec![clicks], &people, None);
+        assert_eq!(jobs[17].0.len(), 1);
+        assert_eq!(jobs[17].1.len(), 1);
+        assert_eq!(jobs[17].0[0].packed.times, vec![123]);
+    }
 }
 
 // ------------------------------------------------------------------ sessions
@@ -620,12 +663,13 @@ fn main() {
     let packing = Packing::new(ws, we, names.count);
     log(&format!("links: {} linked ids", names.count));
 
-    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), &log);
+    let hot = hot::Hot::sample(&ev_chunks, &cl_chunks, &names, packing.is_some());
+    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, &hot, &log);
     log("events deduped");
 
     let cl_by_person = cl_chunks
         .par_iter()
-        .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names))
+        .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names, &hot))
         .collect();
     log("clicks parsed");
 

@@ -90,6 +90,41 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_sampled_aliases_cross_route_dedup_and_click_ties(self):
+        stamp = "2026-10-03T10:00:00Z"
+        early = "2026-10-03T09:59:59Z"
+        hot = "é-long-opaque-user"
+        cold = "cold alias "
+        cold_click = "other alias "
+        cold_late = "delta one"
+        cold_early = "delta two"
+        events = [
+            ev("warm1", hot, stamp),
+            ev("warm2", f'"{hot}"', stamp, "purchase", price="120"),
+            ev("drop-hot", hot, stamp),
+            ev("drop-cold", cold, stamp, "purchase", price="300"),
+            ev("win-hot", hot, stamp, ingest=early),
+            ev("win-cold", cold_early, stamp, "purchase", price="50", ingest=early),
+            ev("malformed", hot, stamp, price='"broken'),
+        ]
+        extra = {"events/part-1.csv": [
+            ev("drop-hot", "", "bad", ingest=early),
+            ev("drop-cold", hot, "bad", ingest=early),
+            ev("win-hot", cold_late, stamp),
+            ev("win-cold", hot, stamp, "purchase", price="50"),
+        ]}
+        clicks = [
+            f"z,{hot},c_1,{stamp}",
+            f"a,{cold_click},c_2,{stamp}",
+            f"b,{hot},c_1,{stamp}",
+        ]
+        links = (f"{hot},{cold}", f"{hot},{cold_click}", f"{hot},{cold_late}", f"{hot},{cold_early}")
+        users, camps = run_case(events, clicks, links=links, extra=extra)
+        user = users[(cold, "2026-10-03")]
+        self.assertEqual((user["events"], user["revenue_cents"]), (4, 170))
+        self.assertEqual(camps[("c_2", "2026-10-03")]["sessions"], 1)
+        self.assertEqual(camps[("c_1", "2026-10-03")]["assisted_sessions"], 1)
+
     def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
         stamp = "2026-10-03T10:00:00Z"
         early = "2026-10-03T09:59:59Z"

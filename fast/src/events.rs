@@ -151,6 +151,8 @@ fn parse<'a>(
     sm: &Small,
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
+    packing: Option<Packing>,
+    hot: &hot::Hot,
 ) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Payload> = (0..NS)
@@ -165,8 +167,10 @@ fn parse<'a>(
     let emit = |e: Pending| {
         let mut target = NONE;
         if e.uid != 0 {
-            let p = shard(e.hash);
-            let slot = payload[p].push(Identity::Standalone(e.hash), e.ts, e.price, e.cat, None, people);
+            let routed = hot.lookup(e.hash);
+            let p = shard(routed.unwrap_or(e.hash));
+            let identity = routed.map_or(Identity::Standalone(e.hash), Identity::Linked);
+            let slot = payload[p].push(identity, e.ts, e.price, e.cat, packing, people);
             target = (slot * NS + p) as u32;
         }
         // This shard supplies the omitted high bits; within it equality of
@@ -276,9 +280,14 @@ pub(super) fn by_person<'a>(
     sm: &Small,
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
+    packing: Option<Packing>,
+    hot: &hot::Hot,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Payload>> {
-    let parsed: Vec<_> = chunks.par_iter().map(|c| parse(c, sm, people, window)).collect();
+    let parsed: Vec<_> = chunks
+        .par_iter()
+        .map(|c| parse(c, sm, people, window, packing, hot))
+        .collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
     let mut spills = Vec::with_capacity(parsed.len());
@@ -328,6 +337,53 @@ pub(super) fn by_person<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_and_cold_claim_targets_survive_or_die_before_identity_join() {
+        let links = b"user_id_a,user_id_b\nhot,cold\n";
+        let link_chunks = chunks_of(links, &["user_id_a", "user_id_b"], Path::new("links"));
+        let people = person_names(&link_chunks);
+        let data = concat!(
+            "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n",
+            "h1,hot,2026-10-03T10:00:00Z,2026-10-03T10:00:00Z,view,p,\n",
+            "h2,hot,2026-10-03T10:00:00Z,2026-10-03T10:00:00Z,purchase,p,5\n",
+            "losehot,hot,2026-10-03T10:00:00Z,2026-10-03T10:00:00Z,view,p,\n",
+            "losecold,cold,2026-10-03T10:00:00Z,2026-10-03T10:00:00Z,purchase,p,7\n",
+            "losehot,,bad,2026-10-03T09:59:59Z,view,p,\n",
+            "losecold,hot,bad,2026-10-03T09:59:59Z,view,p,\n",
+        );
+        let cols = [
+            "event_id",
+            "user_id",
+            "ts",
+            "ingest_ts",
+            "event_type",
+            "product_id",
+            "price_cents",
+        ];
+        let chunks = chunks_of(data.as_bytes(), &cols, Path::new("events"));
+        let hot = hot::Hot::sample(&chunks, &[], &people, true);
+        assert!(hot.lookup(links::mix(people.codec.key(b"hot"))).is_some());
+        assert!(hot.lookup(links::mix(people.codec.key(b"cold"))).is_none());
+        let products = b"product_id,category\np,c\n";
+        let campaigns = b"campaign_id,channel\nc,ch\n";
+        let sm = read_small(products, campaigns, Path::new("products"), Path::new("campaigns"));
+        let ws = parse_ts(b"2026-10-01T00:00:00Z");
+        let we = parse_ts(b"2026-10-15T00:00:00Z");
+        let clock = ManifestClock::new(ws, we);
+        let packing = Packing::new(ws, we, people.count);
+        let out = by_person(&chunks, &sm, &people, (ws, we, &clock), packing, &hot, &|_| {});
+        let parts = &out[0];
+        assert_eq!(parts.iter().map(|p| p.packed.times.len()).sum::<usize>(), 1);
+        assert_eq!(parts.iter().map(|p| p.packed.purchases.len()).sum::<usize>(), 1);
+        assert_eq!(
+            parts
+                .iter()
+                .map(|p| p.wide.times.len() + p.wide.purchases.len())
+                .sum::<usize>(),
+            0
+        );
+    }
 
     #[test]
     fn bloom_alias_keeps_distinct_id_and_invalid_winner_kills_valid_loser() {

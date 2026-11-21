@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Hybrid sampled hot/cold routing — 2026-11-21
+
+- Candidate based on `7444732`: bounded per-file chunk prefixes select repeated exact alias tokens; direct-mapped hits enter final packed owner streams and cold rows retain the partition-local join. Packed-only partitions are preserved. Wide windows disable the shortcut.
+- Correctness: 24 Rust tests, 42 Python cases against both implementations, 36/36 official fixtures for each, ten 20k dirty seeds, and the official dev answer all match. `cargo fmt` and clippy clean.
+- No 20M run was performed per task restriction. Baseline/candidate five-pair timing and delta are pending; do not treat this as a measured speedup.
+
 ## Raw-user partitioned identity join experiment — 2026-11-21
 
 Parse typed event and click payloads by raw-user shard, dedup events against those raw slot locations, and join each shard against its own exact link-table lane. A direct-mapped exact-token cache avoids repeated probes for hot IDs. Standalone events/clicks stay in their original buffers; linked rows move to canonical-owner shards. Link graph construction remains complete and precedes parsing. This increases interim event width and linked-row copying, so performance and 60M peak RSS need parent-side measurement; no 20M/60M benchmark was run here.
