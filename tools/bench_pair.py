@@ -9,13 +9,13 @@ import tempfile
 from time import perf_counter_ns
 
 
-def measure(binary, data, threads, tmpdir):
+def measure(binary, data, threads, tmpdir, overrides):
     with tempfile.TemporaryDirectory(dir=tmpdir) as temp:
         root = Path(temp)
         out, scratch = root / "out", root / "scratch"
         out.mkdir()
         scratch.mkdir()
-        env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(out),
+        env = dict(os.environ | overrides, DATA_DIR=str(data), OUTPUT_DIR=str(out),
                    SCRATCH_DIR=str(scratch), NCPU=str(threads), RAYON_NUM_THREADS=str(threads))
         start = perf_counter_ns()
         result = subprocess.run([binary], env=env, capture_output=True)
@@ -35,18 +35,26 @@ def main():
     p.add_argument("--no-warmup", action="store_true")
     p.add_argument("--json", type=Path)
     p.add_argument("--tmpdir", type=Path)
+    for side in ("baseline", "candidate"):
+        p.add_argument(f"--{side}-env", metavar="NAME=VALUE", action="append", default=[],
+                       help=f"Override an environment variable for the {side} process only")
     args = p.parse_args()
     if min(args.threads, args.runs) < 1:
         p.error("runs and threads must be positive")
     bins = [args.baseline, args.candidate]
+    try:
+        envs = [dict(item.split("=", 1) for item in values)
+                for values in (args.baseline_env, args.candidate_env)]
+    except ValueError:
+        p.error("environment overrides must use NAME=VALUE")
     if not args.no_warmup:
-        for b in bins:
-            measure(b, args.data, args.threads, args.tmpdir)
+        for b, env in zip(bins, envs):
+            measure(b, args.data, args.threads, args.tmpdir, env)
     pairs = []
     for i in range(args.runs):
         pair = [None, None]
         for j in ([0, 1] if i % 2 == 0 else [1, 0]):
-            pair[j] = measure(bins[j], args.data, args.threads, args.tmpdir)
+            pair[j] = measure(bins[j], args.data, args.threads, args.tmpdir, envs[j])
         pairs.append(pair)
         print(f"pair {i+1}: baseline {pair[0]['seconds']:.3f} s, candidate {pair[1]['seconds']:.3f} s",
               flush=True)
@@ -55,7 +63,7 @@ def main():
     if args.json:
         args.json.write_text(json.dumps(dict(baseline=str(bins[0]), candidate=str(bins[1]),
                                              data=str(args.data), threads=args.threads, pairs=pairs,
-                                             medians=[base, test]), indent=2) + "\n")
+                                             medians=[base, test], environments=envs), indent=2) + "\n")
 
 
 if __name__ == "__main__":

@@ -66,3 +66,21 @@ jobs:
               --threads "$t" --tmpdir "$RUNNER_TEMP"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Compare default allocator and mimalloc on the identical binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Use the scorer image's distribution and shared library. No system install.
+          docker run --rm -v "$RUNNER_TEMP:/result" debian:bookworm-slim sh -ec '
+            apt-get -qq update
+            apt-get -qq install -y --no-install-recommends libmimalloc2.0
+            cp -L /usr/lib/x86_64-linux-gnu/libmimalloc.so.2 /result/libmimalloc.so
+          '
+          t=$(nproc); if (( t > 8 )); then t=8; fi
+          {
+            echo '### Allocator only, identical candidate executable'
+            echo '```'
+            python3 tools/bench_pair.py "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/practice" \
+              --threads "$t" --tmpdir "$RUNNER_TEMP" --candidate-env "LD_PRELOAD=$RUNNER_TEMP/libmimalloc.so"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
