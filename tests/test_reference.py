@@ -446,6 +446,23 @@ class LinkedIds(unittest.TestCase):
         self.assertEqual(u[("a0", "2026-10-02")]["sessions"], 1)
         self.assertEqual(u[("a0", "2026-10-02")]["events"], 2)
 
+    def test_unused_canonical_alias_routes_clicks_in_both_window_modes(self):
+        start = ms("2026-10-02T10:00:00Z")
+        events = [ev("e1", "phone", str(start)),
+                  ev("e2", "tablet", str(start + MIN), "purchase", "p1", "25"),
+                  ev("e3", "unlinked", str(start))]
+        clicks = [f"c1,laptop,c_1,{start - MIN}",
+                  f"c2,unlinked,c_2,{start - MIN}"]
+        links = ["phone,tablet", "tablet,laptop", "laptop,A_unused"]
+        for window in ((WS, WE), ("0001-01-01T00:00:00Z", "9999-01-01T00:00:00Z")):
+            with self.subTest(window=window):
+                users, campaigns = run_case(events=events, clicks=clicks, links=links, window=window)
+                self.assertEqual(set(users), {("A_unused", "2026-10-02"),
+                                              ("unlinked", "2026-10-02")})
+                self.assertEqual(users[("A_unused", "2026-10-02")]["events"], 2)
+                self.assertEqual(campaigns[("c_1", "2026-10-02")]["revenue_cents"], 25)
+                self.assertEqual(campaigns[("c_2", "2026-10-02")]["sessions"], 1)
+
     def test_uppercase_sorts_first(self):
         u, _ = run_case(events=[ev("e1", "u5", "2026-10-02T10:00:00Z")], links=["u5,U5"])
         self.assertEqual(set(u), {("U5", "2026-10-02")})

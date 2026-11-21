@@ -1,5 +1,30 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Experimental exact compact link lookup — 2026-11-21 UTC
+
+Against `f4ac682`, replace the final 16-byte linear-probe link slots with
+one 8-byte natural slot per bucket and exact collision overflow maps. Six lane
+bits and the per-lane bucket bits supply the omitted mixed-key bits; the
+stored quotient remains exact. A checked capacity reserves a rank bit as an
+overflow flag, and retains the original table as a fallback if it cannot.
+The routing shard derives from the canonical rank, while output spelling
+still uses the original array. The old build tables are dropped per lane
+before creating the final table.
+
+Native ARM64, 1M dev, nine alternating pairs vs `f4ac682`: eight-worker
+medians **0.081 → 0.079 s** (2.5% less), one-worker **0.280 → 0.283 s**
+(1.0% more). Timings drifted substantially across the run and do not
+establish a speedup. An earlier variant mixing rank for routing was flat at
+eight workers and 3.7% slower at one. No 20M, 60M, Docker or amd64 timing
+was performed; this is not a promotion recommendation.
+
+Validation: 25 Rust tests including 10,000 deliberately colliding hashes,
+empty/zero quotients, unknown hashes and capacity at 60M; 40 Python cases
+against each implementation; 36/36 official fixtures against each; ten
+20k dirty seeds; both 1M dev comparers exact with empty stdout; and a
+10k seed-15 opaque-ID/reordered-header oracle check at one and eight
+workers. Official 10k seeds 1 and 15 also matched.
+
 ## Experimental word-offset event parser — 2026-11-21 UTC
 
 For the seven-column canonical header, validate and pack 7–9 byte ASCII IDs

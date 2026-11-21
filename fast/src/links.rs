@@ -1,6 +1,6 @@
 //! Build the canonical-name lookup in parallel, including transitive paths
 //! that span input files. Canonical node indexes also serve as exact sort ranks.
-use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows};
+use super::{Chunk, Codec, Map, NS, SHARD_SHIFT, for_rows, rs};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -55,9 +55,84 @@ impl Lane {
     }
 }
 
+// The lane and natural slot supply all low `bits` of the mixed key. The
+// remaining bits are stored verbatim, never as an approximate fingerprint.
+struct CompactLane {
+    slots: Vec<u64>,
+    mask: usize,
+    quotient_mask: u64,
+    rank_mask: u64,
+    overflow_flag: u64,
+    overflow: Map<u64, u32>,
+}
+
+fn compact_capacity(count: usize) -> Option<(usize, u32)> {
+    let total = count.checked_add(1)?.checked_mul(2)?.max(LANES);
+    let total = total.checked_next_power_of_two()?;
+    let bits = total.trailing_zeros();
+    if bits >= 64 || (count as u64) >= (1u64 << (bits - 1)) {
+        return None;
+    }
+    Some((total / LANES, bits))
+}
+
+impl CompactLane {
+    fn new(cap: usize, bits: u32) -> Self {
+        let flag = 1u64 << (bits - 1);
+        Self {
+            slots: vec![0; cap],
+            mask: cap - 1,
+            quotient_mask: !((1u64 << bits) - 1),
+            rank_mask: flag - 1,
+            overflow_flag: flag,
+            overflow: Map::with_hasher(rs()),
+        }
+    }
+
+    #[inline]
+    fn index(&self, h: u64) -> usize {
+        (h >> LANES.trailing_zeros()) as usize & self.mask
+    }
+
+    fn insert(&mut self, h: u64, rank: u32) {
+        let rank = u64::from(rank) + 1;
+        assert!(rank <= self.rank_mask);
+        let i = self.index(h);
+        if self.slots[i] & self.rank_mask == 0 {
+            self.slots[i] = (h & self.quotient_mask) | rank;
+        } else {
+            // Different mixed keys with this index must have different full
+            // quotients; only colliders go in the exact secondary table.
+            assert_ne!(self.slots[i] & self.quotient_mask, h & self.quotient_mask);
+            self.slots[i] |= self.overflow_flag;
+            assert!(self.overflow.insert(h, (rank - 1) as u32).is_none());
+        }
+    }
+
+    #[inline]
+    fn get(&self, h: u64) -> Option<u32> {
+        let slot = self.slots[self.index(h)];
+        let rank = slot & self.rank_mask;
+        if rank == 0 {
+            None
+        } else if (slot ^ h) & self.quotient_mask == 0 {
+            Some((rank - 1) as u32)
+        } else if slot & self.overflow_flag != 0 {
+            self.overflow.get(&h).copied()
+        } else {
+            None
+        }
+    }
+}
+
+enum Lookup {
+    Compact(Vec<CompactLane>),
+    Full(Vec<Lane>),
+}
+
 pub(super) struct People<'a> {
     pub(super) codec: Codec<'a>,
-    lanes: Vec<Lane>,
+    lookup: Lookup,
     roots: Vec<u64>,
     pub(super) count: usize,
 }
@@ -66,6 +141,11 @@ pub(super) struct People<'a> {
 // index. It is internal to the link table, not reserved in arbitrary person keys.
 const LINKED: u64 = 1 << 63;
 const _: () = assert!(SHARD_SHIFT >= 32 && ((NS as u64 - 1) << SHARD_SHIFT) & LINKED == 0);
+
+#[inline]
+fn linked_route(rank: u32) -> u64 {
+    ((u64::from(rank) & (NS as u64 - 1)) << SHARD_SHIFT) | u64::from(rank)
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum Identity {
@@ -76,12 +156,21 @@ pub(super) enum Identity {
 impl<'a> People<'a> {
     #[inline]
     pub(super) fn lookup(&self, key: u64, h: u64) -> Identity {
-        let lane = &self.lanes[h as usize & (LANES - 1)];
-        let s = lane.slots[lane.find(key, h)];
-        if s.value & LINKED != 0 {
-            Identity::Linked(s.value ^ LINKED)
-        } else {
-            Identity::Standalone(h)
+        let lane = h as usize & (LANES - 1);
+        match &self.lookup {
+            Lookup::Compact(lanes) => match lanes[lane].get(h) {
+                Some(rank) => Identity::Linked(linked_route(rank)),
+                None => Identity::Standalone(h),
+            },
+            Lookup::Full(lanes) => {
+                let lane = &lanes[lane];
+                let s = lane.slots[lane.find(key, h)];
+                if s.value & LINKED != 0 {
+                    Identity::Linked(s.value ^ LINKED)
+                } else {
+                    Identity::Standalone(h)
+                }
+            }
         }
     }
 
@@ -92,9 +181,18 @@ impl<'a> People<'a> {
 
     #[inline]
     pub(super) fn prefetch(&self, h: u64) {
-        let lane = &self.lanes[h as usize & (LANES - 1)];
-        let i = (h >> LANES.trailing_zeros()) as usize & lane.mask;
-        let addr = &lane.slots[i] as *const Slot;
+        let lane = h as usize & (LANES - 1);
+        let addr = match &self.lookup {
+            Lookup::Compact(lanes) => {
+                let lane = &lanes[lane];
+                (&lane.slots[lane.index(h)] as *const u64).cast::<u8>()
+            }
+            Lookup::Full(lanes) => {
+                let lane = &lanes[lane];
+                let i = (h >> LANES.trailing_zeros()) as usize & lane.mask;
+                (&lane.slots[i] as *const Slot).cast::<u8>()
+            }
+        };
         // Only an in-bounds address in an immutable, live table; prefetch is
         // a hint, never an actual read used for a decision.
         #[cfg(target_arch = "x86_64")]
@@ -229,19 +327,117 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         });
     let mut roots = keys;
     roots.par_iter_mut().for_each(|k| *k = mix(*k));
-    lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
-        for slot in &mut lane.slots {
-            if slot.key != 0 {
-                let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
-                let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
-                slot.value = LINKED | routing | u64::from(rank);
+    let lookup = if let Some((cap, bits)) = compact_capacity(count) {
+        let compact = lanes
+            .into_par_iter()
+            .enumerate()
+            .map(|(s, old)| {
+                drop(old);
+                let mut lane = CompactLane::new(cap, bits);
+                let end = if s + 1 == LANES { count } else { offsets[s + 1] };
+                for i in offsets[s]..end {
+                    lane.insert(roots[i], root(&parent, i as u32));
+                }
+                lane
+            })
+            .collect();
+        Lookup::Compact(compact)
+    } else {
+        lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
+            for slot in &mut lane.slots {
+                if slot.key != 0 {
+                    let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
+                    slot.value = LINKED | linked_route(rank);
+                }
             }
-        }
-    });
+        });
+        Lookup::Full(lanes)
+    };
     People {
         codec,
-        lanes,
+        lookup,
         roots,
         count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_exact_collision_and_zero_quotient() {
+        let mut lane = CompactLane::new(4, 8);
+        // Low six lane bits and the next two bucket bits are implicit.
+        let entries = [(0, 0), (256, 2), (512, 7), (1 << 63, 4), (64, 3), (320, 1)];
+        for (hash, rank) in entries {
+            lane.insert(hash, rank);
+        }
+        for (hash, rank) in entries {
+            assert_eq!(lane.get(hash), Some(rank));
+        }
+        for hash in [768, 1024, (1 << 63) + 256, 128, 384] {
+            assert_eq!(lane.get(hash), None);
+        }
+        assert_eq!(lane.get(0), Some(0)); // primary remains intact
+    }
+
+    #[test]
+    fn compact_people_routes_aliases_and_unknowns_exactly() {
+        let mut lanes: Vec<_> = (0..LANES).map(|_| CompactLane::new(4, 8)).collect();
+        for (h, rank) in [(0, 3), (256, 3), (512, 7), (64, 1)] {
+            lanes[0].insert(h, rank);
+        }
+        let people = People {
+            codec: Codec::new(),
+            lookup: Lookup::Compact(lanes),
+            roots: (0..8).map(|rank| mix(rank + 123)).collect(),
+            count: 8,
+        };
+        for (h, rank) in [(0, 3), (256, 3), (512, 7), (64, 1)] {
+            match people.lookup(unmix(h), h) {
+                Identity::Linked(route) => assert_eq!(route, linked_route(rank)),
+                Identity::Standalone(_) => panic!("linked hash {h} not found"),
+            }
+        }
+        for h in [768, 320, 128, 1 << 63] {
+            match people.lookup(unmix(h), h) {
+                Identity::Standalone(actual) => assert_eq!(actual, h),
+                Identity::Linked(_) => panic!("unknown hash {h} was linked"),
+            }
+        }
+        assert_eq!(people.original(3), mix(126));
+    }
+
+    #[test]
+    fn compact_capacity_reserves_overflow_flag_for_every_rank() {
+        for count in [0, 1, 30, 31, 32, 63, 64, 127, 128, 1000, 60_000_000] {
+            let (cap, bits) = compact_capacity(count).unwrap();
+            assert!(cap.is_power_of_two());
+            assert!(cap * LANES >= 2 * (count + 1));
+            assert!((count as u64) < (1u64 << (bits - 1)));
+        }
+        assert!(compact_capacity(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn compact_extreme_lane_skew_and_exact_misses() {
+        let count = 10_000;
+        let (cap, bits) = compact_capacity(count).unwrap();
+        let mut lane = CompactLane::new(cap, bits);
+        // All hashes land on just four natural slots, including zero and a
+        // quotient with its high bit set. Every lookup must remain exact.
+        for i in 0..count {
+            let h = ((i as u64) << bits) | (((i % 4) as u64) << 6);
+            lane.insert(h, i as u32);
+        }
+        lane.insert(1 << 63, 0);
+        for i in 0..count {
+            let h = ((i as u64) << bits) | (((i % 4) as u64) << 6);
+            assert_eq!(lane.get(h), Some(i as u32));
+            assert_eq!(lane.get(h | (1 << 62)), None);
+        }
+        assert_eq!(lane.get(1 << 63), Some(0));
+        assert_eq!(lane.get((1 << 63) | (4 << 6)), None);
     }
 }
