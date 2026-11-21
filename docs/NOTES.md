@@ -1,5 +1,19 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Identity-mapped CSV unrolling experiment — 2026-11-20
+
+In an isolated candidate, retain the existing 64-byte structural classifier and
+cursor, but dispatch identity-mapped 2-, 4- and 7-column chunks to unrolled
+single-field parsing. Other headers keep the generic scanner. Recovery is shared
+and cold. This is an alternative to the prior row-local PEXT (-6%) and block-mask
+(~2%) trials, not a combination with them. No 20M timing here: parent will
+benchmark; performance delta and acceptance are pending.
+
+ARM native: all 14 Rust tests (including exhaustive short-body and boundary
+recovery), 31 reference and binary tests, 10 dirty-data seeds, 36/36 official
+fixtures for both implementations, and both official dev comparers passed.
+AVX2 code is not exercised on this ARM host; x86 validation remains for parent.
+
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 
 [CI run 44868041222](https://github.com/lmaccart/databricks-hackathon/actions/runs/44868041222) tested `57a1734` on native Linux/amd64 with four workers on an Intel Xeon 6975P-C. The recommended practice commit `4f75f52` differs only in documentation.

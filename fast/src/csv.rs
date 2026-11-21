@@ -91,21 +91,97 @@ fn slots(c: &Chunk) -> Vec<u8> {
 /// Call f with the selected columns of every well-formed line of a chunk.
 #[inline]
 pub fn for_rows<'a>(c: &Chunk<'a>, mut f: impl FnMut(&[&'a [u8]; 8])) {
-    let slot = slots(c);
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: the CPU supports AVX2.
-            return unsafe { scan_avx2(c.data, &slot, &mut f) };
+            return unsafe { scan_avx2(c, &mut f) };
         }
     }
-    scan::<Native, _>(c.data, &slot, &mut f);
+    scan_chunk::<Native, _>(c, &mut f);
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn scan_avx2<'a, F: FnMut(&[&'a [u8]; 8])>(data: &'a [u8], slot: &[u8], f: &mut F) {
-    scan::<Avx2, F>(data, slot, f);
+unsafe fn scan_avx2<'a, F: FnMut(&[&'a [u8]; 8])>(c: &Chunk<'a>, f: &mut F) {
+    scan_chunk::<Avx2, F>(c, f);
+}
+
+#[inline(always)]
+fn scan_chunk<'a, C: Classify, F: FnMut(&[&'a [u8]; 8])>(c: &Chunk<'a>, f: &mut F) {
+    if c.nfields == c.ncols && (0..c.ncols).all(|i| c.idx[i] == i) {
+        match c.nfields {
+            2 => return scan_identity::<C, F, 2>(c.data, f),
+            4 => return scan_identity::<C, F, 4>(c.data, f),
+            7 => return scan_identity::<C, F, 7>(c.data, f),
+            _ => {}
+        }
+    }
+    scan::<C, F>(c.data, &slots(c), f);
+}
+
+/// Identical grammar to `scan`, but known field positions need no slot lookup.
+#[inline(always)]
+fn scan_identity<'a, C: Classify, F: FnMut(&[&'a [u8]; 8]), const N: usize>(data: &'a [u8], f: &mut F) {
+    let len = data.len();
+    let mut cur = Cursor::<C>::new(data);
+    let mut row: [&'a [u8]; 8] = [&[]; 8];
+    let at = |p: usize| if p < len { data[p] } else { b'\n' };
+    let mut ls = 0;
+    while ls < len {
+        let mut fs = ls;
+        let (end, ok) = 'parse: {
+            macro_rules! field {
+                ($i:expr, $delimiter:expr) => {{
+                    let mut p = cur.next();
+                    let mut c = at(p);
+                    let (vs, ve);
+                    if c == b'"' {
+                        if p != fs {
+                            break 'parse (cur.skip_line(p, c), false);
+                        }
+                        let q = cur.next();
+                        let cq = at(q);
+                        if cq != b'"' {
+                            break 'parse (cur.skip_line(q, cq), false);
+                        }
+                        let r = cur.next();
+                        let cr = at(r);
+                        if r != q + 1 || cr == b'"' {
+                            break 'parse (cur.skip_line(r, cr), false);
+                        }
+                        (vs, ve, p, c) = (p + 1, q, r, cr);
+                    } else {
+                        (vs, ve) = (fs, p);
+                    }
+                    if c != $delimiter {
+                        break 'parse (cur.skip_line(p, c), false);
+                    }
+                    // SAFETY: the cursor only yields ordered positions up to len.
+                    row[$i] = unsafe { data.get_unchecked(vs..ve) };
+                    fs = p + 1;
+                    p
+                }};
+            }
+            field!(0, b',');
+            let mut end = field!(1, if N == 2 { b'\n' } else { b',' });
+            if N >= 4 {
+                field!(2, b',');
+                end = field!(3, if N == 4 { b'\n' } else { b',' });
+            }
+            if N == 7 {
+                field!(4, b',');
+                field!(5, b',');
+                end = field!(6, b'\n');
+            }
+            let _ = fs;
+            (end, true)
+        };
+        if ok {
+            f(&row);
+        }
+        ls = end + 1;
+    }
 }
 
 /// The row state machine. Every structural byte is consumed exactly once, so a
@@ -220,7 +296,8 @@ impl<'a, C: Classify> Cursor<'a, C> {
     }
 
     /// Consume the rest of a malformed line; returns its end (`\n` or len).
-    #[inline(always)]
+    #[cold]
+    #[inline(never)]
     fn skip_line(&mut self, mut p: usize, mut c: u8) -> usize {
         while c != b'\n' && p < self.data.len() {
             p = self.next();
@@ -437,13 +514,12 @@ mod tests {
         let mut out: Rows = vec![];
         for c in chunks_sized(data, cols, Path::new("test.csv"), size) {
             let mut f = |r: &[&[u8]; 8]| out.push(r[..cols.len()].iter().map(|v| v.to_vec()).collect());
-            let slot = slots(&c);
             match kernel {
                 0 => for_rows(&c, &mut f),
-                1 => scan::<Swar, _>(c.data, &slot, &mut f),
-                2 => scan::<Native, _>(c.data, &slot, &mut f),
+                1 => scan_chunk::<Swar, _>(&c, &mut f),
+                2 => scan_chunk::<Native, _>(&c, &mut f),
                 #[cfg(target_arch = "x86_64")]
-                3 => unsafe { scan_avx2(c.data, &slot, &mut f) },
+                3 => unsafe { scan_avx2(&c, &mut f) },
                 _ => unreachable!(),
             }
         }
@@ -570,6 +646,77 @@ mod tests {
                         String::from_utf8_lossy(&file)
                     );
                     assert_eq!(fast_rows(&file, cols, 1), want, "{:?}", String::from_utf8_lossy(&file));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn identity_adversarial_bodies_and_recovery() {
+        let headers: [(&[u8], &[&str], &[u8]); 3] = [
+            (b"a,b", &["a", "b"], b"ok,next"),
+            (b"a,b,c,d", &["a", "b", "c", "d"], b"ok,next,valid,row"),
+            (
+                b"a,b,c,d,e,f,g",
+                &["a", "b", "c", "d", "e", "f", "g"],
+                b"ok,next,valid,row,with,seven,fields",
+            ),
+        ];
+        const ALPHA: &[u8] = b"a,\"\n\r";
+        for (header, cols, valid) in headers {
+            for len in 0..=6u32 {
+                for mut code in 0..ALPHA.len().pow(len) {
+                    let mut file = header.to_vec();
+                    file.push(b'\n');
+                    for _ in 0..len {
+                        file.push(ALPHA[code % ALPHA.len()]);
+                        code /= ALPHA.len();
+                    }
+                    file.push(b'\n');
+                    file.extend_from_slice(valid);
+                    let want = py_rows(&file, cols);
+                    for size in [1, 64, usize::MAX] {
+                        assert_eq!(fast_rows(&file, cols, size), want, "{file:?} chunk {size}");
+                    }
+                }
+            }
+            // Structural bytes and long fields cross each block boundary; include CR
+            // inside and after a quoted field, excess/missing fields, and EOF.
+            for pad in 0..130 {
+                let mut file = header.to_vec();
+                file.push(b'\n');
+                file.extend(std::iter::repeat_n(b'x', pad));
+                file.extend_from_slice(b"\"oops\n");
+                file.extend_from_slice(valid);
+                file.extend_from_slice(b"\n\"unterminated\n");
+                file.extend_from_slice(valid);
+                file.extend_from_slice(b"\r\n");
+                file.extend_from_slice(valid);
+                check(&file, cols);
+            }
+            for field in 0..cols.len() {
+                for value in [
+                    &b"\"\""[..],
+                    b"\"x\"",
+                    b"\"x\r\"",
+                    b"\"x\"\r",
+                    b"x\"",
+                    b"\"x",
+                    b"\"x\"\"",
+                    b"\"x\"tail",
+                    b"\r",
+                ] {
+                    let mut file = header.to_vec();
+                    file.push(b'\n');
+                    for i in 0..cols.len() {
+                        if i > 0 {
+                            file.push(b',');
+                        }
+                        file.extend_from_slice(if i == field { value } else { b"v" });
+                    }
+                    file.push(b'\n');
+                    file.extend_from_slice(valid);
+                    check(&file, cols);
                 }
             }
         }
