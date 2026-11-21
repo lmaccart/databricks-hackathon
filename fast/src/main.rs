@@ -212,6 +212,38 @@ fn reserve_per_shard(data: &[u8]) -> usize {
     lines.saturating_mul(data.len()) / n / NS
 }
 
+/// A representative prefix has already been parsed. Predict capacities by
+/// actual shard and stream kind, rather than reserving the wide and ranked
+/// streams equally. No prediction is a limit, even on adversarial skew.
+fn route_sizes<const K: usize>(counts: &[[usize; K]], sample: usize, total: usize) -> Vec<[usize; K]> {
+    let ratio = total.saturating_mul(256).checked_div(sample).unwrap_or(0);
+    counts
+        .iter()
+        .map(|row| {
+            row.map(|n| {
+                let value = n.saturating_mul(ratio) >> 8;
+                value.saturating_add(value >> 3)
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod sizing_test {
+    use super::*;
+    #[test]
+    fn sizing_follows_observed_route_and_keeps_empty_classes_lazy() {
+        let counts = [[24, 0, 8], [0, 0, 0], [4, 4, 0]];
+        let sizes = route_sizes::<3>(&counts, 40, 1200);
+        assert_eq!(sizes[1], [0; 3]);
+        assert_eq!(sizes[0][1], 0);
+        assert!(sizes[0][0] > sizes[0][2] && sizes[0][2] > sizes[2][0]);
+        let guessed: usize = sizes.iter().flatten().sum();
+        assert!(guessed <= 1200 + 1200 / 4);
+        assert_eq!(route_sizes::<3>(&counts, 0, 100), [[0; 3]; 3]);
+    }
+}
+
 fn by_destination<T>(batches: Vec<Vec<T>>, nonempty: impl Fn(&T) -> bool) -> Vec<Vec<T>> {
     let mut jobs: Vec<Vec<_>> = (0..NS).map(|_| Vec::with_capacity(batches.len())).collect();
     for batch in batches {
