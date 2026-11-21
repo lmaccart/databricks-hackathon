@@ -14,7 +14,6 @@
 use ahash::RandomState;
 use memmap2::Mmap;
 use rayon::prelude::*;
-use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -23,6 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 mod allocator;
 mod campaign;
+mod clickrecord;
 mod dims;
 mod events;
 mod links;
@@ -31,6 +31,7 @@ mod person;
 mod ranges;
 mod stream;
 use campaign::{CampaignSink, DenseCampaigns, MapCampaigns};
+use clickrecord::{ClickData, ClickLayout, SmallClick};
 use links::{Identity, People, person_names};
 use person::Codec;
 use stream::{Packing, Payload, Purchase, Stream, Temporal, Wide};
@@ -196,12 +197,6 @@ struct RankedClick {
     camp: u32,
 }
 
-impl Borrow<Click> for PCl {
-    fn borrow(&self) -> &Click {
-        &self.click
-    }
-}
-
 // A small live sample is only an allocation hint. Vectors still grow normally
 // for skewed shards, short records, long records, or a non-representative prefix.
 fn reserve_per_shard(data: &[u8]) -> usize {
@@ -240,6 +235,7 @@ fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
 #[derive(Default)]
 struct Clicks {
     packed: Vec<RankedClick>,
+    small: Vec<SmallClick>,
     wide: Vec<PCl>,
 }
 
@@ -249,13 +245,15 @@ fn parse_clicks<'a>(
     window: (i64, i64, &ManifestClock),
     names: &People<'a>,
     packed: bool,
+    click_layout: Option<ClickLayout>,
 ) -> Vec<Clicks> {
     let (lo, we, clock) = window;
     let hint = reserve_per_shard(c.data);
     let mut b: Vec<_> = (0..NS)
         .map(|_| Clicks {
             wide: Vec::with_capacity(if packed { hint / 2 } else { hint }),
-            packed: Vec::with_capacity(if packed { hint / 2 } else { 0 }),
+            packed: Vec::with_capacity(if packed && click_layout.is_none() { hint / 2 } else { 0 }),
+            small: Vec::with_capacity(if click_layout.is_some() { hint / 2 } else { 0 }),
         })
         .collect();
     #[derive(Clone, Copy, Default)]
@@ -271,12 +269,25 @@ fn parse_clicks<'a>(
         let bucket = &mut b[identity.owner()];
         let person = match identity {
             Identity::Ranked(p) if packed => {
-                bucket.packed.push(RankedClick {
-                    rank: p >> NS.trailing_zeros(),
-                    ts: row.ts,
-                    cid: row.cid,
-                    camp: row.camp,
-                });
+                let rank = p >> NS.trailing_zeros();
+                if let Some(layout) = click_layout {
+                    bucket.small.push(SmallClick::encode(
+                        layout,
+                        rank,
+                        Click {
+                            ts: row.ts,
+                            cid: row.cid,
+                            camp: row.camp,
+                        },
+                    ));
+                } else {
+                    bucket.packed.push(RankedClick {
+                        rank,
+                        ts: row.ts,
+                        cid: row.cid,
+                        camp: row.camp,
+                    });
+                }
                 return;
             }
             Identity::Ranked(p) => names.original(p),
@@ -407,13 +418,14 @@ impl<'a, 'b, 'c, S: CampaignSink> Reduce<'a, 'b, 'c, S> {
         }
     }
 
-    fn person<T: Temporal>(
+    fn person<T: Temporal, C: ClickData>(
         &mut self,
         person: u64,
         sessions: impl Iterator<Item = (T, T, usize)>,
         purchases: &[Purchase<T>],
-        clicks: &[impl Borrow<Click>],
+        clicks: &[C],
         layout: T::Layout,
+        click_layout: C::Layout,
     ) {
         let Self {
             sm,
@@ -459,13 +471,16 @@ impl<'a, 'b, 'c, S: CampaignSink> Reduce<'a, 'b, 'c, S> {
             d_rev += rev;
 
             // slide the click window to [start - 7d, start]
-            while hi < clicks.len() && clicks[hi].borrow().ts <= start {
-                let click = clicks[hi].borrow();
-                let previous = clicks[latest].borrow();
-                if hi == 0 || click.ts != previous.ts || codec.less(click.cid, previous.cid) {
+            while hi < clicks.len() && clicks[hi].ts(click_layout) <= start {
+                let click = clicks[hi];
+                let previous = clicks[latest];
+                if hi == 0
+                    || click.ts(click_layout) != previous.ts(click_layout)
+                    || codec.less(click.cid(), previous.cid())
+                {
                     latest = hi;
                 }
-                let c = click.camp as usize;
+                let c = click.camp(click_layout) as usize;
                 if cnt[c] == 0 {
                     pos[c] = active.len() as u32;
                     active.push(c as u32);
@@ -473,8 +488,8 @@ impl<'a, 'b, 'c, S: CampaignSink> Reduce<'a, 'b, 'c, S> {
                 cnt[c] += 1;
                 hi += 1;
             }
-            while lo < hi && clicks[lo].borrow().ts < start.saturating_sub(WEEK) {
-                let c = clicks[lo].borrow().camp as usize;
+            while lo < hi && clicks[lo].ts(click_layout) < start.saturating_sub(WEEK) {
+                let c = clicks[lo].camp(click_layout) as usize;
                 cnt[c] -= 1;
                 if cnt[c] == 0 {
                     let p = pos[c] as usize;
@@ -488,7 +503,11 @@ impl<'a, 'b, 'c, S: CampaignSink> Reduce<'a, 'b, 'c, S> {
             }
             // The entire latest timestamp run expires together. Identical
             // copies change neither the tie winner nor campaign membership.
-            let credit = if lo < hi { clicks[latest].borrow().camp } else { ORGANIC };
+            let credit = if lo < hi {
+                clicks[latest].camp(click_layout)
+            } else {
+                ORGANIC
+            };
             campaigns.credit(credit, day, pi != p0, rev);
             for &a in active.iter() {
                 campaigns.assist(a, day);
@@ -549,6 +568,7 @@ fn process_wide<S: CampaignSink>(
             &purchases[p0..pi],
             &cls[c0..ci],
             (),
+            (),
         );
         i = j;
     }
@@ -561,7 +581,7 @@ fn process_shard<S: CampaignSink>(
     cls: Vec<Clicks>,
     sm: &Small,
     people: &People,
-    packing: Option<Packing>,
+    layouts: (Option<Packing>, Option<ClickLayout>),
     campaigns: &mut S,
 ) -> ShardOut {
     let mut out = ShardOut {
@@ -571,10 +591,16 @@ fn process_shard<S: CampaignSink>(
         return out;
     }
     let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
-    let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
+    let (packed_clicks, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| ((c.small, c.packed), c.wide)).unzip();
     let mut reduce = Reduce::new(sm, &people.codec, &mut out.users, campaigns);
-    if let Some(pack) = packing {
-        ranges::process(owner, packed, pc, people, pack, &mut reduce);
+    if let Some(pack) = layouts.0 {
+        if let Some(compact) = layouts.1 {
+            let pc = packed_clicks.into_iter().map(|(small, _)| small).collect();
+            ranges::process(owner, packed, pc, people, (pack, compact), &mut reduce);
+        } else {
+            let pc = packed_clicks.into_iter().map(|(_, full)| full).collect();
+            ranges::process(owner, packed, pc, people, (pack, ()), &mut reduce);
+        }
     }
     process_wide(wide, wc, &mut reduce);
     out
@@ -633,6 +659,8 @@ fn main() {
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
     let names = person_names(&link_chunks);
     let packing = Packing::new(ws, we);
+    let click_lo = ws.saturating_sub(WEEK);
+    let click_layout = packing.and_then(|_| ClickLayout::new(click_lo, we, names.local_slots, sm.camp_names.len()));
     log(&format!("links: {} linked ids", names.count));
 
     let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, &log);
@@ -640,7 +668,7 @@ fn main() {
 
     let cl_by_person = cl_chunks
         .par_iter()
-        .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names, packing.is_some()))
+        .map(|c| parse_clicks(c, &sm, (click_lo, we, &clock), &names, packing.is_some(), click_layout))
         .collect();
     log("clicks routed");
 
@@ -649,13 +677,16 @@ fn main() {
     let mut jobs: Vec<_> = by_destination(ev_by_person, |e| len(e) > 0)
         .into_iter()
         .zip(by_destination(cl_by_person, |c| {
-            !c.packed.is_empty() || !c.wide.is_empty()
+            !c.packed.is_empty() || !c.small.is_empty() || !c.wide.is_empty()
         }))
         .enumerate()
         .collect();
     jobs.sort_unstable_by_key(|(_, (e, c))| {
         std::cmp::Reverse(
-            e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
+            e.iter().map(len).sum::<usize>()
+                + c.iter()
+                    .map(|x| x.packed.len() + x.small.len() + x.wide.len())
+                    .sum::<usize>(),
         )
     });
     let dense_span = campaign::dense_span(sm.camp_names.len(), ws, we, rayon::current_num_threads());
@@ -674,7 +705,7 @@ fn main() {
                 let index = next.fetch_add(1, Ordering::Relaxed);
                 let Some(job) = jobs.get(index) else { break };
                 let (owner, (evs, cls)) = job.lock().expect("shard claim").take().expect("unique shard claim");
-                users.push(process_shard(owner, evs, cls, &sm, &names, packing, &mut campaigns).users);
+                users.push(process_shard(owner, evs, cls, &sm, &names, (packing, click_layout), &mut campaigns).users);
             }
             (users, campaigns)
         });
@@ -692,7 +723,7 @@ fn main() {
             .into_par_iter()
             .map(|(owner, (evs, cls))| {
                 let mut campaigns = MapCampaigns::new();
-                let users = process_shard(owner, evs, cls, &sm, &names, packing, &mut campaigns).users;
+                let users = process_shard(owner, evs, cls, &sm, &names, (packing, click_layout), &mut campaigns).users;
                 (users, campaigns)
             })
             .collect();

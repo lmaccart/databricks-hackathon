@@ -90,6 +90,29 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_seven_day_lookback_with_packed_events_and_wider_click_span(self):
+        def utc(t):
+            return dt.datetime.fromtimestamp(t // 1000, dt.timezone.utc)
+
+        for days in (42, 43, 50):
+            with self.subTest(days=days):
+                end = WS_MS + days * DAY
+                last = utc(end - 1).date().isoformat()
+                events = [ev("early", "acct", WS), ev("late", "phone", str(end - 1), "purchase", "p1", "200")]
+                clicks = [
+                    f"early,phone,c_1,{WS_MS - 7 * DAY}",
+                    f"too_early,acct,c_2,{WS_MS - 7 * DAY - 1}",
+                    f"tie,phone,c_3,{end - 1}",
+                    f"tie\0,acct,c_2,{end - 1}",
+                    f"late_ignored,acct,c_1,{end}",
+                ]
+                window = WS, utc(end).strftime("%Y-%m-%dT%H:%M:%SZ")
+                users, camps = run_case(events, clicks, ["phone,acct"], window=window)
+                self.assertEqual(set(users), {("acct", "2026-10-01"), ("acct", last)})
+                totals = {k: (r["sessions"], r["assisted_sessions"], r["revenue_cents"]) for k, r in camps.items()}
+                self.assertEqual(totals, {("c_1", "2026-10-01"): (1, 1, 0),
+                                          ("c_2", last): (0, 1, 0), ("c_3", last): (1, 1, 200)})
+
     def test_sparse_rank_directory_ignores_click_only_people(self):
         links = [f"guest_{i},guest_{i}" for i in range(4096)]
         links += ["guest_100,active_客"]

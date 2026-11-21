@@ -1,5 +1,6 @@
 //! The low rank byte is already known from routing. Histogram the remaining
 //! address, then scatter into person-local ranges instead of sorting rank keys.
+use super::clickrecord::RangedClick;
 use super::*;
 use std::mem::MaybeUninit;
 
@@ -62,12 +63,12 @@ unsafe fn initialized<V>(mut v: Vec<MaybeUninit<V>>) -> Vec<V> {
     unsafe { Vec::from_raw_parts(ptr.cast(), len, cap) }
 }
 
-pub(super) fn process<S: CampaignSink>(
+pub(super) fn process<S: CampaignSink, R: RangedClick>(
     owner: usize,
     events: Vec<Stream<u64>>,
-    clicks: Vec<Vec<RankedClick>>,
+    clicks: Vec<Vec<R>>,
     people: &People,
-    pack: Packing,
+    layouts: (Packing, R::Layout),
     reduce: &mut Reduce<'_, '_, '_, S>,
 ) {
     let ne: usize = events.iter().map(|p| p.times.len() + p.purchases.len()).sum();
@@ -83,23 +84,24 @@ pub(super) fn process<S: CampaignSink>(
             events,
             clicks,
             people,
-            pack,
+            layouts,
             reduce,
         );
     } else {
-        scatter(Map::with_hasher(rs()), owner, events, clicks, people, pack, reduce);
+        scatter(Map::with_hasher(rs()), owner, events, clicks, people, layouts, reduce);
     }
 }
 
-fn scatter<S: CampaignSink>(
+fn scatter<S: CampaignSink, R: RangedClick>(
     mut dir: impl Directory,
     owner: usize,
     events: Vec<Stream<u64>>,
-    clicks: Vec<Vec<RankedClick>>,
+    clicks: Vec<Vec<R>>,
     people: &People,
-    pack: Packing,
+    layouts: (Packing, R::Layout),
     reduce: &mut Reduce<'_, '_, '_, S>,
 ) {
+    let (pack, click_layout) = layouts;
     let mut occupied = Vec::new();
     for part in &events {
         for &key in &part.times {
@@ -111,7 +113,7 @@ fn scatter<S: CampaignSink>(
     }
     for part in &clicks {
         for c in part {
-            if let Some(cursor) = dir.existing(c.rank).filter(|c| c[T] != 0) {
+            if let Some(cursor) = dir.existing(c.rank(click_layout)).filter(|c| c[T] != 0) {
                 cursor[C] += 1;
             }
         }
@@ -150,12 +152,8 @@ fn scatter<S: CampaignSink>(
         for c in part {
             // All occupied ranks now have a nonzero event *end*. A rank
             // with no event was never prefixed and retains its zero count.
-            if let Some(cursor) = dir.existing(c.rank).filter(|c| c[T] != 0) {
-                selected_clicks[cursor[C]].write(Click {
-                    ts: c.ts,
-                    cid: c.cid,
-                    camp: c.camp,
-                });
+            if let Some(cursor) = dir.existing(c.rank(click_layout)).filter(|c| c[T] != 0) {
+                selected_clicks[cursor[C]].write(c.local());
                 cursor[C] += 1;
             }
         }
@@ -172,13 +170,13 @@ fn scatter<S: CampaignSink>(
         let ps = &mut purchases[start[P]..end[P]];
         let cs = &mut clicks[start[C]..end[C]];
         ps.sort_unstable_by_key(|p| p.key);
-        cs.sort_unstable_by_key(|c| c.ts);
+        cs.sort_unstable_by_key(|c| c.ts(click_layout));
         let person = people.original((rank << NS.trailing_zeros()) | owner as u32);
         if ts.len() >= 4096 {
-            reduce.person(person, bin_sessions(ts, &mut bins), ps, cs, pack);
+            reduce.person(person, bin_sessions(ts, &mut bins), ps, cs, pack, click_layout);
         } else {
             ts.sort_unstable();
-            reduce.person(person, ordered_sessions(ts), ps, cs, pack);
+            reduce.person(person, ordered_sessions(ts), ps, cs, pack, click_layout);
         }
         start = end;
     }
