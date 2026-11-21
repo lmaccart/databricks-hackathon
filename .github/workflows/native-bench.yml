@@ -260,6 +260,17 @@ jobs:
               --candidate-env SS_BENCH_IMAGE=ss-bench:current --phases
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Distinguish container launch from pipeline work
+        if: ${{ inputs.containers && inputs.floor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          t=$(nproc); if (( t > 8 )); then t=8; fi
+          git show "$GITHUB_SHA:tools/container_clock.py" >"$RUNNER_TEMP/clock.py"
+          git show "$GITHUB_SHA:tools/bench_container.sh" >"$RUNNER_TEMP/clock-adapter"
+          chmod +x "$RUNNER_TEMP/clock-adapter"
+          sudo python3 "$RUNNER_TEMP/clock.py" "$RUNNER_TEMP/clock-adapter" "$RUNNER_TEMP/candidate" \
+            "$RUNNER_TEMP/practice" "$RUNNER_TEMP" ss-bench:current "$t" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Validate final-scale output under a no-swap container limit
         if: ${{ inputs.scale || inputs.scale_pairs || github.ref_name == 'bench/scale' }}
         shell: bash

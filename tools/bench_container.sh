@@ -5,7 +5,9 @@ set -eu
 : "${SS_BENCH_IMAGE:?}" "${DATA_DIR:?}" "${OUTPUT_DIR:?}" "${SCRATCH_DIR:?}" "${NCPU:?}"
 mem=${SS_BENCH_MEMORY_GB:-24}
 chmod 777 "$OUTPUT_DIR" "$SCRATCH_DIR"
-exec docker run --rm --platform linux/amd64 --network none --read-only \
+# Clock diagnostics retain the container just long enough to read Engine timestamps.
+if [ -n "${SS_BENCH_CIDFILE:-}" ]; then set -- --cidfile "$SS_BENCH_CIDFILE"; else set -- --rm; fi
+exec docker run "$@" --platform linux/amd64 --network none --read-only \
     --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges \
     --tmpfs /tmp:rw,size=64m,mode=1777 --pids-limit 4096 \
     --cpus "$NCPU" --memory "${mem}g" --memory-swap "${mem}g" \
