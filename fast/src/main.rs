@@ -26,7 +26,7 @@ mod person;
 mod stream;
 use links::{Identity, People, person_names};
 use person::Codec;
-use stream::{Packing, Payload, Stream, Temporal};
+use stream::{Packing, Payload, Stream, Temporal, Wide};
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
@@ -168,9 +168,8 @@ fn read_small<'a>(prod: &'a [u8], camp: &'a [u8], pp: &Path, cp: &Path) -> Small
 // ------------------------------------------------------------------ events & clicks
 
 #[derive(Clone, Copy)]
-struct PCl {
-    person: u64,
-    ts: i64,
+struct Click<T> {
+    key: T,
     cid: u64,
     camp: u32,
 }
@@ -217,8 +216,101 @@ fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
 
 #[derive(Default)]
 struct Clicks {
-    packed: Vec<PCl>,
-    wide: Vec<PCl>,
+    packed: Vec<Click<u64>>,
+    wide: Vec<Click<Wide>>,
+}
+
+#[derive(Clone, Copy)]
+struct ClickGroup<T> {
+    key: T,
+    // start/end offsets in the dense campaign vector; overflow ranges live in
+    // a sparse side table so ordinary click groups remain two words.
+    range: u64,
+}
+
+struct ClickTimeline<T> {
+    groups: Vec<ClickGroup<T>>,
+    campaigns: Vec<u32>,
+    wide_ranges: Vec<(usize, usize, usize)>, // (group index, start, end)
+}
+
+impl<T: Copy + Ord> ClickTimeline<T> {
+    fn compress(mut clicks: Vec<Click<T>>, ncamp: usize, less: impl Fn(u64, u64) -> bool) -> Self {
+        clicks.sort_unstable_by_key(|c| c.key);
+        let mut groups = Vec::with_capacity(clicks.len());
+        let mut campaigns = Vec::with_capacity(clicks.len());
+        let mut wide_ranges = Vec::new();
+        let mut seen = vec![0usize; ncamp];
+        let mut generation = 0usize;
+        let mut i = 0;
+        while i < clicks.len() {
+            let mut j = i + 1;
+            while j < clicks.len() && clicks[j].key == clicks[i].key {
+                j += 1;
+            }
+            generation = generation.wrapping_add(1);
+            if generation == 0 {
+                seen.fill(0);
+                generation = 1;
+            }
+            let start = campaigns.len();
+            let first = clicks[i];
+            let mut winner_id = first.cid;
+            let mut winner_camp = first.camp;
+            seen[first.camp as usize] = generation;
+            campaigns.push(first.camp);
+            for click in &clicks[i + 1..j] {
+                if less(click.cid, winner_id) {
+                    winner_id = click.cid;
+                    winner_camp = click.camp;
+                }
+                let slot = &mut seen[click.camp as usize];
+                if *slot != generation {
+                    *slot = generation;
+                    campaigns.push(click.camp);
+                }
+            }
+            // Credit uses the minimum byte-wise click ID, while assists retain
+            // every distinct campaign in the equal-person/time cluster.
+            if let Some(pos) = campaigns[start..].iter().position(|&c| c == winner_camp) {
+                campaigns.swap(start, start + pos);
+            }
+            let end = campaigns.len();
+            let index = groups.len();
+            let range = if start < end && end <= u32::MAX as usize {
+                ((start as u64) << 32) | end as u64
+            } else {
+                wide_ranges.push((index, start, end));
+                u64::MAX
+            };
+            groups.push(ClickGroup {
+                key: clicks[i].key,
+                range,
+            });
+            i = j;
+        }
+        Self {
+            groups,
+            campaigns,
+            wide_ranges,
+        }
+    }
+
+    #[inline]
+    fn campaign_range(&self, group: usize) -> (usize, usize) {
+        let range = self.groups[group].range;
+        if range >> 32 != u32::MAX as u64 {
+            ((range >> 32) as usize, range as u32 as usize)
+        } else {
+            let wide_index = self
+                .wide_ranges
+                .binary_search_by_key(&group, |&(index, _, _)| index)
+                .expect("overflow click range");
+            let (index, start, end) = self.wide_ranges[wide_index];
+            debug_assert_eq!(index, group);
+            (start, end)
+        }
+    }
 }
 
 fn parse_clicks<'a>(
@@ -226,14 +318,14 @@ fn parse_clicks<'a>(
     sm: &Small,
     window: (i64, i64, &ManifestClock),
     names: &People<'a>,
-    packed: bool,
+    packing: Option<Packing>,
 ) -> Vec<Clicks> {
     let (lo, we, clock) = window;
     let hint = reserve_per_shard(c.data);
     let mut b: Vec<_> = (0..NS)
         .map(|_| Clicks {
-            wide: Vec::with_capacity(if packed { hint / 2 } else { hint }),
-            packed: Vec::with_capacity(if packed { hint / 2 } else { 0 }),
+            wide: Vec::with_capacity(if packing.is_some() { hint / 2 } else { hint }),
+            packed: Vec::with_capacity(if packing.is_some() { hint / 2 } else { 0 }),
         })
         .collect();
     #[derive(Clone, Copy, Default)]
@@ -244,18 +336,31 @@ fn parse_clicks<'a>(
         ts: i64,
         camp: u32,
     }
-    let mut emit = |row: PendingClick| {
-        let (dest, person) = match names.lookup(row.uid, row.hash) {
-            Identity::Linked(p) if packed => (&mut b[shard(p)].packed, u64::from(p as u32)),
-            Identity::Linked(p) => (&mut b[shard(p)].wide, names.original(p as u32)),
-            Identity::Standalone(p) => (&mut b[shard(p)].wide, p),
-        };
-        dest.push(PCl {
-            person,
-            ts: row.ts,
-            cid: row.cid,
-            camp: row.camp,
-        });
+    let mut emit = |row: PendingClick| match names.lookup(row.uid, row.hash) {
+        Identity::Linked(p) if let Some(pack) = packing => {
+            b[shard(p)].packed.push(Click {
+                key: pack.encode(p as u32, row.ts),
+                cid: row.cid,
+                camp: row.camp,
+            });
+        }
+        Identity::Linked(p) => {
+            b[shard(p)].wide.push(Click {
+                key: Wide {
+                    person: names.original(p as u32),
+                    ts: row.ts,
+                },
+                cid: row.cid,
+                camp: row.camp,
+            });
+        }
+        Identity::Standalone(p) => {
+            b[shard(p)].wide.push(Click {
+                key: Wide { person: p, ts: row.ts },
+                cid: row.cid,
+                camp: row.camp,
+            });
+        }
     };
     let mut ring = [PendingClick::default(); 16];
     let mut n = 0usize;
@@ -290,6 +395,17 @@ fn parse_clicks<'a>(
         emit(ring[i % ring.len()]);
     }
     b
+}
+
+fn packings(ws: i64, we: i64, ranks: usize) -> (Option<Packing>, Option<Packing>) {
+    let events = Packing::new(ws, we, ranks);
+    let clicks = events.and_then(|_| Packing::new(ws.saturating_sub(WEEK), we, ranks));
+    if clicks.is_some() {
+        (events, clicks)
+    } else {
+        // Event and click ranks must use the same linked-person stream.
+        (None, None)
+    }
 }
 
 // ------------------------------------------------------------------ sessions
@@ -330,10 +446,11 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
 
 fn process_stream<T: Temporal>(
     pieces: Vec<Stream<T>>,
-    mut cls: Vec<PCl>,
+    cls: Vec<Click<T>>,
     sm: &Small,
     people: &People,
     layout: T::Layout,
+    click_layout: T::Layout,
     ShardOut { users, camps }: &mut ShardOut,
 ) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
@@ -350,8 +467,8 @@ fn process_stream<T: Temporal>(
     }
     evs.sort_unstable();
     purchases.sort_unstable_by_key(|p| p.key);
-    cls.sort_unstable_by_key(|c| (c.person, c.ts));
     let ncamp = sm.camp_names.len();
+    let cls = ClickTimeline::compress(cls, ncamp, |a, b| people.codec.less(a, b));
     let mut cnt = vec![0usize; ncamp]; // copies enter and leave the window together
     let mut active: Vec<u32> = Vec::new(); // campaigns with cnt > 0
     let mut pos = vec![0u32; ncamp]; // index of a campaign inside `active`
@@ -367,14 +484,14 @@ fn process_stream<T: Temporal>(
         while j < evs.len() && evs[j].person(layout) == rank {
             j += 1;
         }
-        while ci < cls.len() && cls[ci].person < rank {
+        while ci < cls.groups.len() && cls.groups[ci].key.person(click_layout) < rank {
             ci += 1;
         }
         let c0 = ci;
-        while ci < cls.len() && cls[ci].person == rank {
+        while ci < cls.groups.len() && cls.groups[ci].key.person(click_layout) == rank {
             ci += 1;
         }
-        let clicks = &cls[c0..ci];
+        let clicks = &cls.groups[c0..ci];
         let (mut lo, mut hi) = (0usize, 0usize);
         let mut latest = 0;
 
@@ -424,37 +541,41 @@ fn process_stream<T: Temporal>(
             d_rev += rev;
 
             // slide the click window to [start - 7d, start]
-            while hi < clicks.len() && clicks[hi].ts <= start {
-                if hi == 0
-                    || clicks[hi].ts != clicks[latest].ts
-                    || people.codec.less(clicks[hi].cid, clicks[latest].cid)
-                {
-                    latest = hi;
+            while hi < clicks.len() && clicks[hi].key.ts(click_layout) <= start {
+                latest = hi;
+                let (a, b) = cls.campaign_range(c0 + hi);
+                for &campaign in &cls.campaigns[a..b] {
+                    let c = campaign as usize;
+                    if cnt[c] == 0 {
+                        pos[c] = active.len() as u32;
+                        active.push(campaign);
+                    }
+                    cnt[c] += 1;
                 }
-                let c = clicks[hi].camp as usize;
-                if cnt[c] == 0 {
-                    pos[c] = active.len() as u32;
-                    active.push(c as u32);
-                }
-                cnt[c] += 1;
                 hi += 1;
             }
-            while lo < hi && clicks[lo].ts < start.saturating_sub(WEEK) {
-                let c = clicks[lo].camp as usize;
-                cnt[c] -= 1;
-                if cnt[c] == 0 {
-                    let p = pos[c] as usize;
-                    let last = active.pop().unwrap();
-                    if last as usize != c {
-                        active[p] = last;
-                        pos[last as usize] = p as u32;
+            while lo < hi && clicks[lo].key.ts(click_layout) < start.saturating_sub(WEEK) {
+                let (a, b) = cls.campaign_range(c0 + lo);
+                for &campaign in &cls.campaigns[a..b] {
+                    let c = campaign as usize;
+                    cnt[c] -= 1;
+                    if cnt[c] == 0 {
+                        let p = pos[c] as usize;
+                        let last = active.pop().unwrap();
+                        if last as usize != c {
+                            active[p] = last;
+                            pos[last as usize] = p as u32;
+                        }
                     }
                 }
                 lo += 1;
             }
-            // The entire latest timestamp run expires together. Identical
-            // copies change neither the tie winner nor campaign membership.
-            let credit = if lo < hi { clicks[latest].camp } else { ORGANIC };
+            let credit = if lo < hi {
+                let (a, _) = cls.campaign_range(c0 + latest);
+                cls.campaigns[a]
+            } else {
+                ORGANIC
+            };
             let e = camps.entry(ckey(credit, day)).or_insert([0; 4]);
             e[0] += 1;
             e[1] += (pi != p0) as i64;
@@ -489,6 +610,7 @@ fn process_shard(
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
+    click_packing: Option<Packing>,
 ) -> ShardOut {
     let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
     let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
@@ -497,9 +619,17 @@ fn process_shard(
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        process_stream(
+            packed,
+            gather(pc),
+            sm,
+            people,
+            pack,
+            click_packing.unwrap_or(pack),
+            &mut out,
+        );
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
+    process_stream(wide, gather(wc), sm, people, (), (), &mut out);
     out
 }
 
@@ -555,7 +685,7 @@ fn main() {
     );
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
     let names = person_names(&link_chunks);
-    let packing = Packing::new(ws, we, names.rank_limit);
+    let (packing, click_packing) = packings(ws, we, names.rank_limit);
     log(&format!("links: {} linked ids", names.count));
 
     let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, &log);
@@ -563,7 +693,7 @@ fn main() {
 
     let cl_by_person = cl_chunks
         .par_iter()
-        .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names, packing.is_some()))
+        .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names, click_packing))
         .collect();
     log("clicks routed");
 
@@ -582,7 +712,7 @@ fn main() {
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(e, c)| process_shard(e, c, &sm, &names, packing, click_packing))
         .collect();
     log("sessions done");
 
@@ -634,4 +764,53 @@ fn main() {
     log("written");
     // Everything is on disk; skip tearing down the shard tables and mmaps.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod click_tests {
+    use super::*;
+
+    #[test]
+    fn click_groups_keep_distinct_campaigns_and_bytewise_winner_first() {
+        let timeline = ClickTimeline::compress(
+            vec![
+                Click {
+                    key: 5u64,
+                    cid: 20,
+                    camp: 0,
+                },
+                Click {
+                    key: 5u64,
+                    cid: 10,
+                    camp: 1,
+                },
+                Click {
+                    key: 5u64,
+                    cid: 5,
+                    camp: 1,
+                },
+                Click {
+                    key: 6u64,
+                    cid: 99,
+                    camp: 2,
+                },
+            ],
+            3,
+            |a, b| a < b,
+        );
+        assert_eq!(timeline.groups.len(), 2);
+        let (a, b) = timeline.campaign_range(0);
+        assert_eq!(&timeline.campaigns[a..b], &[1, 0]);
+        let (a, b) = timeline.campaign_range(1);
+        assert_eq!(&timeline.campaigns[a..b], &[2]);
+    }
+
+    #[test]
+    fn clicks_that_do_not_pack_force_the_matching_event_stream_wide() {
+        let (events, clicks) = packings(0, 1i64 << 40, 1 << 23);
+        assert!(Packing::new(0, 1i64 << 40, 1 << 23).is_some());
+        assert!(Packing::new(-(WEEK), 1i64 << 40, 1 << 23).is_none());
+        assert!(events.is_none());
+        assert!(clicks.is_none());
+    }
 }
