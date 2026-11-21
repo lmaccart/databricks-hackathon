@@ -17,7 +17,6 @@ rules.md requires (no decoding, no trimming, no case folding).
 from __future__ import annotations
 
 import datetime as _dt
-import glob
 import json
 import os
 import sys
@@ -90,8 +89,11 @@ def read_csv_rows(path: str, columns: list):
 
 
 def read_folder(data_dir: str, sub: str, columns: list):
-    for path in sorted(glob.glob(os.path.join(data_dir, sub, "*.csv"))):
-        yield from read_csv_rows(path, columns)
+    path = os.path.join(data_dir, sub)
+    with os.scandir(path) as entries:
+        files = sorted(e.path for e in entries if e.name.endswith(".csv") and e.is_file())
+    for file in files:
+        yield from read_csv_rows(file, columns)
 
 
 # --------------------------------------------------------------------------
@@ -123,7 +125,10 @@ def parse_ts(s: bytes):
     if not s:
         return BAD
     if _digits(s):  # F3: digits only, leading zeros fine, any length
-        return int(s)
+        significant = s.lstrip(b"0")
+        # No manifest F1 instant reaches 10**19 ms. Avoid Python's decimal
+        # conversion limit without treating an out-of-window number as syntax.
+        return int(significant or b"0") if len(significant) <= 19 else 10**19
     # F1 "YYYY-MM-DDTHH:MM:SSZ" (20) or F2 "YYYY-MM-DDTHH:MM:SS+HH:MM" (25)
     if len(s) not in (20, 25):
         return BAD
@@ -243,7 +248,10 @@ def run(data_dir: str, out_dir: str) -> dict:
         if etype == b"purchase":
             if not _digits(price_raw):
                 continue
-            price = int(price_raw)
+            significant = price_raw.lstrip(b"0")
+            if len(significant) > 8:
+                continue
+            price = int(significant or b"0")
             if not (1 <= price <= MAX_PRICE):
                 continue
         if ing - ts > LATE_MS:

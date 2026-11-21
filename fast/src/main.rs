@@ -264,14 +264,15 @@ fn parse_price(p: &[u8]) -> Option<u32> {
 
 fn mmap_files(dir: &Path) -> Vec<(PathBuf, Mmap)> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return out };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.extension().map(|x| x == "csv").unwrap_or(false) && p.is_file() {
-            let f = File::open(&p).expect("open");
-            if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+    let rd = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    for e in rd {
+        let p = e.expect("read directory entry").path();
+        if p.extension().is_some_and(|x| x == "csv") {
+            let meta = p.metadata().unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            if !meta.is_file() || meta.len() == 0 {
                 continue;
             }
+            let f = File::open(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
             let m = unsafe { Mmap::map(&f).expect("mmap") };
             out.push((p, m));
         }

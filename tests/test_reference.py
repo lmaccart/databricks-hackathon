@@ -63,8 +63,12 @@ def run_case(events=(), clicks=(), links=(), products=("p1,shoes", "p2,hats", "p
     import pyarrow.parquet as pq
     u = pq.read_table(os.path.join(out, "user_daily")).to_pylist()
     c = pq.read_table(os.path.join(out, "campaign_daily")).to_pylist()
-    return ({(r["user_id"], r["day"].isoformat()): r for r in u},
-            {(r["campaign_id"], r["day"].isoformat()): r for r in c})
+    def unique(rows, id_col):
+        result = {(r[id_col], r["day"].isoformat()): r for r in rows}
+        if len(result) != len(rows):
+            raise AssertionError(f"duplicate ({id_col}, day) key")
+        return result
+    return unique(u, "user_id"), unique(c, "campaign_id")
 
 
 def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
@@ -86,7 +90,7 @@ class Timestamps(unittest.TestCase):
         self.assertEqual(P.parse_ts(b"2026-10-03T23:58:10-00:00"), f1)
         self.assertEqual(P.parse_ts(b"86400000"), 86400000)
         self.assertEqual(P.parse_ts(b"2028-02-29T00:00:00Z"), ms("2028-02-28T00:00:00Z") + DAY)
-        self.assertEqual(P.parse_ts(b"99999999999999999999999"), 99999999999999999999999)
+        self.assertGreater(P.parse_ts(b"99999999999999999999999"), 2**63 - 1)
 
     def test_bad(self):
         for bad in [b"", b"2026-10-03T23:58:10.000Z", b"2026-10-03T23:58:10z", b"2026-10-03t23:58:10Z",
@@ -100,6 +104,24 @@ class Timestamps(unittest.TestCase):
 
 
 class CsvDialect(unittest.TestCase):
+    def test_unreadable_part_listing_fails(self):
+        # ENOTDIR is deterministic even under root; a glob used to swallow it.
+        with tempfile.TemporaryDirectory() as tmp:
+            from pathlib import Path
+            import subprocess
+            data = Path(tmp)
+            (data / "manifest.json").write_text(json.dumps({"window_start": WS, "window_end": WE}))
+            (data / "products.csv").write_text("product_id,category\n")
+            (data / "campaigns.csv").write_text("campaign_id,channel\n")
+            (data / "events").touch()
+            for name in ("links", "clicks"):
+                (data / name).mkdir()
+            cmd = ([os.environ["SS_BIN"]] if os.environ.get("SS_BIN")
+                   else [sys.executable, P.__file__])
+            run = subprocess.run(cmd, cwd=tmp, env={**os.environ, "DATA_DIR": tmp,
+                                 "OUTPUT_DIR": str(data / "out")}, capture_output=True)
+            self.assertNotEqual(run.returncode, 0)
+
     def test_lines(self):
         self.assertEqual(P.parse_line(b'"u1",,""', 3), [b"u1", b"", b""])
         self.assertIsNone(P.parse_line(b'u"1,a,b', 3))
@@ -136,6 +158,17 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_long_digit_fields(self):
+        zeros = "0" * 5000
+        huge = "9" * 5000
+        u, _ = run_case(events=[
+            ev("ok", "u", zeros + str(WS_MS), "purchase", price=zeros + "7", ingest=WS),
+            ev("bad-ts", "u", huge, ingest=WS),
+            ev("bad-price", "u", WS, "purchase", price=huge, ingest=WS),
+        ])
+        row = u[("u", "2026-10-01")]
+        self.assertEqual((row["events"], row["revenue_cents"]), (1, 7))
+
     def test_dedup_before_validation(self):
         t = "2026-10-02T10:00:00Z"
         u, _ = run_case(events=[
