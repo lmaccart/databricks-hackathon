@@ -18,12 +18,12 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-mod person;
 mod events;
 mod links;
 mod output;
-use person::Codec;
+mod person;
 use links::{People, person_names};
+use person::Codec;
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
@@ -66,15 +66,16 @@ fn parse_price(p: &[u8]) -> Option<u32> {
     if !digits(p) {
         return None;
     }
-    let t = match p.iter().position(|&c| c != b'0') {
-        Some(i) => &p[i..],
-        None => return None, // all zeros
-    };
+    let t = &p[p.iter().position(|&c| c != b'0')?..];
     if t.len() > 8 {
         return None;
     }
     let v = num(t);
-    if (1..=MAX_PRICE).contains(&v) { Some(v as u32) } else { None }
+    if (1..=MAX_PRICE).contains(&v) {
+        Some(v as u32)
+    } else {
+        None
+    }
 }
 
 // ------------------------------------------------------------------ inputs
@@ -145,7 +146,15 @@ fn read_small<'a>(prod: &'a [u8], camp: &'a [u8], pp: &Path, cp: &Path) -> Small
             camp_channel.push(r[1]);
         });
     }
-    Small { product_cat, cat_names, cat_rank, unknown_cat, camp_idx, camp_names, camp_channel }
+    Small {
+        product_cat,
+        cat_names,
+        cat_rank,
+        unknown_cat,
+        camp_idx,
+        camp_names,
+        camp_channel,
+    }
 }
 
 // ------------------------------------------------------------------ events & clicks
@@ -175,7 +184,9 @@ fn shard(h: u64) -> usize {
 // for skewed shards, short records, long records, or a non-representative prefix.
 fn reserve_per_shard(data: &[u8]) -> usize {
     let n = data.len().min(16 * 1024);
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     let lines = memchr::memchr_iter(b'\n', &data[..n]).count();
     lines.saturating_mul(data.len()) / n / NS
 }
@@ -184,17 +195,23 @@ fn by_destination<T>(batches: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
     let mut jobs: Vec<Vec<_>> = (0..NS).map(|_| Vec::with_capacity(batches.len())).collect();
     for batch in batches {
         for (dest, rows) in jobs.iter_mut().zip(batch) {
-            if !rows.is_empty() { dest.push(rows); }
+            if !rows.is_empty() {
+                dest.push(rows);
+            }
         }
     }
     jobs
 }
 
 fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
-    if pieces.len() <= 1 { return pieces.pop().unwrap_or_default(); }
+    if pieces.len() <= 1 {
+        return pieces.pop().unwrap_or_default();
+    }
     let size: usize = pieces.iter().map(Vec::len).sum();
     let mut rows = Vec::with_capacity(size);
-    for piece in pieces { rows.extend_from_slice(&piece); }
+    for piece in pieces {
+        rows.extend_from_slice(&piece);
+    }
     rows
 }
 
@@ -213,7 +230,12 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<
             return;
         }
         let person = names.resolve(uid);
-        b[shard(person)].push(PCl { person, ts, cid: names.codec.key(cid), camp: ci });
+        b[shard(person)].push(PCl {
+            person,
+            ts,
+            cid: names.codec.key(cid),
+            camp: ci,
+        });
     });
     b
 }
@@ -299,7 +321,14 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
             if day != cur_day {
                 if cur_day != i32::MIN {
                     let top = top_category(&catsum, &sm.cat_rank);
-                    users.push(UserRow { person, day: cur_day, sessions: d_sess, events: d_ev, revenue: d_rev, top });
+                    users.push(UserRow {
+                        person,
+                        day: cur_day,
+                        sessions: d_sess,
+                        events: d_ev,
+                        revenue: d_rev,
+                        top,
+                    });
                     catsum.iter_mut().for_each(|x| *x = 0);
                 }
                 cur_day = day;
@@ -320,8 +349,7 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
 
             // slide the click window to [start - 7d, start]
             while hi < clicks.len() && clicks[hi].ts <= start {
-                if hi == 0 || clicks[hi].ts != clicks[latest].ts
-                    || codec.less(clicks[hi].cid, clicks[latest].cid) {
+                if hi == 0 || clicks[hi].ts != clicks[latest].ts || codec.less(clicks[hi].cid, clicks[latest].cid) {
                     latest = hi;
                 }
                 let c = clicks[hi].camp as usize;
@@ -358,7 +386,14 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec
             k = m;
         }
         let top = top_category(&catsum, &sm.cat_rank);
-        users.push(UserRow { person, day: cur_day, sessions: d_sess, events: d_ev, revenue: d_rev, top });
+        users.push(UserRow {
+            person,
+            day: cur_day,
+            sessions: d_sess,
+            events: d_ev,
+            revenue: d_rev,
+            top,
+        });
         catsum.iter_mut().for_each(|x| *x = 0);
         for &a in &active {
             cnt[a as usize] = 0;
@@ -375,10 +410,16 @@ fn main() {
     let t0 = Instant::now();
     // Some runtimes expose host CPU count despite the competition's quota.
     // Respect an explicit Rayon setting for reproducible local comparisons.
-    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
-        if let Some(n) = std::env::var("NCPU").ok().and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 0) {
-            rayon::ThreadPoolBuilder::new().num_threads(n).build_global().expect("Rayon pool");
-        }
+    if std::env::var_os("RAYON_NUM_THREADS").is_none()
+        && let Some(n) = std::env::var("NCPU")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .expect("Rayon pool");
     }
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let outd = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
@@ -402,7 +443,15 @@ fn main() {
     let link_chunks = chunks_for(&link_files, &["user_id_a", "user_id_b"]);
     let ev_chunks = chunks_for(
         &event_files,
-        &["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"],
+        &[
+            "event_id",
+            "user_id",
+            "ts",
+            "ingest_ts",
+            "event_type",
+            "product_id",
+            "price_cents",
+        ],
     );
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
     let hs = rs();
@@ -413,14 +462,23 @@ fn main() {
     let ev_by_person = events::by_person(&ev_chunks, &sm, &names, ws, we, &hs, &log);
     log("events deduped");
 
-    let cl_by_person = cl_chunks.par_iter().map(|c| parse_clicks(c, &sm, ws - WEEK, we, &names)).collect();
+    let cl_by_person = cl_chunks
+        .par_iter()
+        .map(|c| parse_clicks(c, &sm, ws - WEEK, we, &names))
+        .collect();
     log("clicks routed");
 
-    let mut jobs: Vec<_> = by_destination(ev_by_person).into_iter()
-        .zip(by_destination(cl_by_person)).collect();
-    jobs.sort_unstable_by_key(|(e, c)| std::cmp::Reverse(
-        e.iter().map(Vec::len).sum::<usize>() + c.iter().map(Vec::len).sum::<usize>()));
-    let outs: Vec<_> = jobs.into_par_iter().map(|(e, c)| process_shard(gather(e), gather(c), &sm, &names.codec)).collect();
+    let mut jobs: Vec<_> = by_destination(ev_by_person)
+        .into_iter()
+        .zip(by_destination(cl_by_person))
+        .collect();
+    jobs.sort_unstable_by_key(|(e, c)| {
+        std::cmp::Reverse(e.iter().map(Vec::len).sum::<usize>() + c.iter().map(Vec::len).sum::<usize>())
+    });
+    let outs: Vec<_> = jobs
+        .into_par_iter()
+        .map(|(e, c)| process_shard(gather(e), gather(c), &sm, &names.codec))
+        .collect();
     log("sessions done");
 
     let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
@@ -446,14 +504,27 @@ fn main() {
             } else {
                 (sm.camp_names[c as usize], sm.camp_channel[c as usize])
             };
-            output::CampRow { campaign, channel, day: *k as u32 as i32, counts: *v }
+            output::CampRow {
+                campaign,
+                channel,
+                day: *k as u32 as i32,
+                counts: *v,
+            }
         })
         .collect();
     let shards: Vec<&[UserRow]> = outs.iter().map(|o| &o.users[..]).collect();
     let parts = rayon::current_num_threads().clamp(1, 16);
     rayon::join(
         || output::campaign_daily(&cd.join("part-0.parquet"), &camp_rows),
-        || output::user_daily(&ud, &shards, parts, &|p, out| out.extend_from_slice(names.codec.bytes(links::unmix(p), &mut [0; 9])), &sm.cat_names),
+        || {
+            output::user_daily(
+                &ud,
+                &shards,
+                parts,
+                &|p, out| out.extend_from_slice(names.codec.bytes(links::unmix(p), &mut [0; 9])),
+                &sm.cat_names,
+            )
+        },
     );
     log("written");
     // Everything is on disk; skip tearing down the shard tables and mmaps.

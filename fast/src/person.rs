@@ -62,8 +62,11 @@ impl<'a> Codec<'a> {
 
     #[inline]
     pub fn less(&self, a: u64, b: u64) -> bool {
-        if (a | b) & EXTERNAL == 0 { a < b }
-        else { self.bytes(a, &mut [0; 9]) < self.bytes(b, &mut [0; 9]) }
+        if (a | b) & EXTERNAL == 0 {
+            a < b
+        } else {
+            self.bytes(a, &mut [0; 9]) < self.bytes(b, &mut [0; 9])
+        }
     }
 
     #[cold]

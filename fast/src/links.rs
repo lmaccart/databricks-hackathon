@@ -207,10 +207,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
                     }
                     // Every successful edge points to a strictly smaller name.
                     // A concurrent union can change either root, never form a cycle.
-                    if parent[b as usize]
-                        .compare_exchange(b, a, Relaxed, Relaxed)
-                        .is_ok()
-                    {
+                    if parent[b as usize].compare_exchange(b, a, Relaxed, Relaxed).is_ok() {
                         break;
                     }
                 }
@@ -219,14 +216,9 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
     lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
         for slot in &mut lane.slots {
             if slot.key != 0 {
-                slot.value =
-                    mix(keys[root(&parent, (offsets[s] + slot.value as usize) as u32) as usize]);
+                slot.value = mix(keys[root(&parent, (offsets[s] + slot.value as usize) as u32) as usize]);
             }
         }
     });
-    People {
-        codec,
-        lanes,
-        count,
-    }
+    People { codec, lanes, count }
 }

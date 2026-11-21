@@ -63,7 +63,7 @@ jobs:
             lscpu | grep -E 'Model name:|Thread.s. per core:'
             echo "Rayon workers: $t; five pairs; process start to exit, no container startup"
             python3 tools/bench_pair.py "$RUNNER_TEMP/scored" "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/practice" \
-              --threads "$t" --tmpdir "$RUNNER_TEMP"
+              --threads "$t" --tmpdir "$RUNNER_TEMP" --phases
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Compare default allocator and mimalloc on the identical binary

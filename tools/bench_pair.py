@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import statistics
 import subprocess
 import tempfile
@@ -35,6 +36,7 @@ def main():
     p.add_argument("--no-warmup", action="store_true")
     p.add_argument("--json", type=Path)
     p.add_argument("--tmpdir", type=Path)
+    p.add_argument("--phases", action="store_true", help="print median increments from the pipeline's stderr clock")
     for side in ("baseline", "candidate"):
         p.add_argument(f"--{side}-env", metavar="NAME=VALUE", action="append", default=[],
                        help=f"Override an environment variable for the {side} process only")
@@ -60,6 +62,17 @@ def main():
               flush=True)
     base, test = [statistics.median(pair[j]["seconds"] for pair in pairs) for j in (0, 1)]
     print(f"medians: {base:.3f} → {test:.3f} s, {(1-test/base)*100:+.1f}% less time, {base/test:.2f}×")
+    if args.phases:
+        for j, label in enumerate(("baseline", "candidate")):
+            phases = {}
+            for pair in pairs:
+                prev = 0
+                for stamp, name in re.findall(r"^\[\s*([\d.]+)s\] (.+)$", pair[j]["stderr"], re.M):
+                    cur = float(stamp)
+                    phases.setdefault(name.split(":")[0], []).append(cur - prev)
+                    prev = cur
+                phases.setdefault("outside internal timer", []).append(pair[j]["seconds"] - prev)
+            print(label, ", ".join(f"{k}: {statistics.median(v):.3f} s" for k, v in phases.items()))
     if args.json:
         args.json.write_text(json.dumps(dict(baseline=str(bins[0]), candidate=str(bins[1]),
                                              data=str(args.data), threads=args.threads, pairs=pairs,

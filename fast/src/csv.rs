@@ -54,7 +54,11 @@ fn chunks_sized<'a>(file: &'a [u8], cols: &[&str], path: &Path, size: usize) -> 
             .unwrap_or_else(|| panic!("{}: header lacks column {c}", path.display()));
         assert!(!idx[..k].contains(&idx[k]), "column {c} selected twice");
     }
-    let body = if hdr_end < file.len() { &file[hdr_end + 1..] } else { &file[file.len()..] };
+    let body = if hdr_end < file.len() {
+        &file[hdr_end + 1..]
+    } else {
+        &file[file.len()..]
+    };
     let mut start = 0;
     while start < body.len() {
         let mut end = start.saturating_add(size).min(body.len());
@@ -64,7 +68,12 @@ fn chunks_sized<'a>(file: &'a [u8], cols: &[&str], path: &Path, size: usize) -> 
                 None => body.len(),
             };
         }
-        out.push(Chunk { data: &body[start..end], nfields: header.len(), ncols: cols.len(), idx });
+        out.push(Chunk {
+            data: &body[start..end],
+            nfields: header.len(),
+            ncols: cols.len(),
+            idx,
+        });
         start = end;
     }
     out
@@ -168,7 +177,12 @@ impl<'a, C: Classify> Cursor<'a, C> {
     #[inline(always)]
     fn new(data: &'a [u8]) -> Self {
         let bits = if data.is_empty() { 0 } else { Self::block(data, 0) };
-        Cursor { data, base: 0, bits, _c: PhantomData }
+        Cursor {
+            data,
+            base: 0,
+            bits,
+            _c: PhantomData,
+        }
     }
 
     #[inline(always)]
@@ -264,12 +278,18 @@ impl Classify for Sse2 {
         use std::arch::x86_64::*;
         // SAFETY: caller guarantees 64 readable bytes; SSE2 is baseline on x86_64.
         unsafe {
-            let (cm, qt, nl) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'"' as i8), _mm_set1_epi8(b'\n' as i8));
+            let (cm, qt, nl) = (
+                _mm_set1_epi8(b',' as i8),
+                _mm_set1_epi8(b'"' as i8),
+                _mm_set1_epi8(b'\n' as i8),
+            );
             let mut m = 0u64;
             for i in 0..4 {
                 let v = _mm_loadu_si128(p.add(16 * i).cast());
-                let hit =
-                    _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, cm), _mm_cmpeq_epi8(v, qt)), _mm_cmpeq_epi8(v, nl));
+                let hit = _mm_or_si128(
+                    _mm_or_si128(_mm_cmpeq_epi8(v, cm), _mm_cmpeq_epi8(v, qt)),
+                    _mm_cmpeq_epi8(v, nl),
+                );
                 m |= (_mm_movemask_epi8(hit) as u16 as u64) << (16 * i);
             }
             m
@@ -297,7 +317,11 @@ unsafe fn avx2_mask(p: *const u8) -> u64 {
     use std::arch::x86_64::*;
     // SAFETY: caller guarantees 64 readable bytes.
     unsafe {
-        let (cm, qt, nl) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8), _mm256_set1_epi8(b'\n' as i8));
+        let (cm, qt, nl) = (
+            _mm256_set1_epi8(b',' as i8),
+            _mm256_set1_epi8(b'"' as i8),
+            _mm256_set1_epi8(b'\n' as i8),
+        );
         let lo = _mm256_loadu_si256(p.cast());
         let hi = _mm256_loadu_si256(p.add(32).cast());
         let lo = _mm256_or_si256(
@@ -329,7 +353,10 @@ impl Classify for Neon {
             let mut h = [vdupq_n_u8(0); 4];
             for (i, h) in h.iter_mut().enumerate() {
                 let v = vld1q_u8(p.add(16 * i));
-                *h = vandq_u8(vorrq_u8(vorrq_u8(vceqq_u8(v, cm), vceqq_u8(v, qt)), vceqq_u8(v, nl)), bit);
+                *h = vandq_u8(
+                    vorrq_u8(vorrq_u8(vceqq_u8(v, cm), vceqq_u8(v, qt)), vceqq_u8(v, nl)),
+                    bit,
+                );
             }
             // pairwise adds fold each 8-byte group into the byte holding its 8 bits
             let s = vpaddq_u8(vpaddq_u8(h[0], h[1]), vpaddq_u8(h[2], h[3]));
@@ -382,8 +409,10 @@ mod tests {
                 _ => h,
             })
             .collect();
-        let idx: Vec<usize> =
-            cols.iter().map(|c| header.iter().position(|h| *h == c.as_bytes()).expect("column")).collect();
+        let idx: Vec<usize> = cols
+            .iter()
+            .map(|c| header.iter().position(|h| *h == c.as_bytes()).expect("column"))
+            .collect();
         let mut out = vec![];
         for line in &lines[1..] {
             if let Some(vals) = py_parse_line(line, header.len()) {
@@ -424,7 +453,12 @@ mod tests {
     fn fast_rows(data: &[u8], cols: &[&str], size: usize) -> Rows {
         let rows = kernel_rows(data, cols, size, 0);
         for k in kernels() {
-            assert_eq!(kernel_rows(data, cols, size, k), rows, "kernel {k} {:?}", String::from_utf8_lossy(data));
+            assert_eq!(
+                kernel_rows(data, cols, size, k),
+                rows,
+                "kernel {k} {:?}",
+                String::from_utf8_lossy(data)
+            );
         }
         rows
     }
@@ -433,12 +467,19 @@ mod tests {
         let want = py_rows(data, cols);
         for size in [usize::MAX, 1, 2, 3, 63, 64, 65, 200] {
             let got = fast_rows(data, cols, size);
-            assert_eq!(got, want, "file {:?} cols {cols:?} chunk {size}", String::from_utf8_lossy(data));
+            assert_eq!(
+                got,
+                want,
+                "file {:?} cols {cols:?} chunk {size}",
+                String::from_utf8_lossy(data)
+            );
         }
     }
 
     fn scalar_mask(b: &[u8]) -> u64 {
-        (0..64).filter(|&i| matches!(b[i], b',' | b'"' | b'\n')).fold(0, |m, i| m | 1 << i)
+        (0..64)
+            .filter(|&i| matches!(b[i], b',' | b'"' | b'\n'))
+            .fold(0, |m, i| m | 1 << i)
     }
 
     #[test]
@@ -503,8 +544,12 @@ mod tests {
     #[test]
     fn exhaustive_short_bodies() {
         const ALPHA: &[u8] = b"a,\"\n\r";
-        let headers: [(&[u8], &[&str]); 4] =
-            [(b"x", &["x"]), (b"x,y", &["x", "y"]), (b"x,y", &["y"]), (b"x,\"y\",z", &["z", "x", "y"])];
+        let headers: [(&[u8], &[&str]); 4] = [
+            (b"x", &["x"]),
+            (b"x,y", &["x", "y"]),
+            (b"x,y", &["y"]),
+            (b"x,\"y\",z", &["z", "x", "y"]),
+        ];
         let mut body = Vec::new();
         for len in 0..=7u32 {
             for mut code in 0..ALPHA.len().pow(len) {
@@ -518,7 +563,12 @@ mod tests {
                     file.push(b'\n');
                     file.extend_from_slice(&body);
                     let want = py_rows(&file, cols);
-                    assert_eq!(fast_rows(&file, cols, usize::MAX), want, "{:?}", String::from_utf8_lossy(&file));
+                    assert_eq!(
+                        fast_rows(&file, cols, usize::MAX),
+                        want,
+                        "{:?}",
+                        String::from_utf8_lossy(&file)
+                    );
                     assert_eq!(fast_rows(&file, cols, 1), want, "{:?}", String::from_utf8_lossy(&file));
                 }
             }
@@ -528,11 +578,25 @@ mod tests {
     #[test]
     fn header_mapping() {
         // reordered, quoted names, first of duplicate names wins, columns we do not read
-        check(b"c,\"b\",a,b\n1,2,3,4\n\"1\",\"2\",\"3\",\"4\"\n1,2,3\n", &["a", "b", "c"]);
-        check(b"a,b,c,d,e,f,g,h,i,j\n0,1,2,3,4,5,6,7,8,9\n0,1,2,3,4,5,6,7,8\n", &["j", "a", "e"]);
+        check(
+            b"c,\"b\",a,b\n1,2,3,4\n\"1\",\"2\",\"3\",\"4\"\n1,2,3\n",
+            &["a", "b", "c"],
+        );
+        check(
+            b"a,b,c,d,e,f,g,h,i,j\n0,1,2,3,4,5,6,7,8,9\n0,1,2,3,4,5,6,7,8\n",
+            &["j", "a", "e"],
+        );
         check(b"z0,z1,z2,z3,z4,z5,z6,z7,z8,a\n0,1,2,3,4,5,6,7,8,9\n", &["a"]);
         check(b"\"\",a\n1,2\n", &["a"]);
-        let ev = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"];
+        let ev = [
+            "event_id",
+            "user_id",
+            "ts",
+            "ingest_ts",
+            "event_type",
+            "product_id",
+            "price_cents",
+        ];
         check(
             b"price_cents,product_id,event_type,ingest_ts,ts,user_id,event_id\n7,p,view,i,t,u,e\n\"7\",p,view,i,t,u,\"e\"\n",
             &ev,
@@ -604,7 +668,11 @@ mod tests {
                         file.push(b'"');
                     }
                     for _ in 0..rng.below(30) {
-                        file.push(if rng.below(200) == 0 { b'"' } else { b'a' + rng.below(26) as u8 });
+                        file.push(if rng.below(200) == 0 {
+                            b'"'
+                        } else {
+                            b'a' + rng.below(26) as u8
+                        });
                     }
                     if q && rng.below(30) != 0 {
                         file.push(b'"');

@@ -137,7 +137,11 @@ fn epoch_ms(s: &[u8]) -> i64 {
             // the first n-8 digits, left-padded with '0' to a full word
             let k = n - 8;
             let x = load8(s, 0);
-            let hi = if k == 8 { x } else { (x << (8 * (8 - k))) | (0x3030_3030_3030_3030 >> (8 * k)) };
+            let hi = if k == 8 {
+                x
+            } else {
+                (x << (8 * (8 - k))) | (0x3030_3030_3030_3030 >> (8 * k))
+            };
             eight(hi).zip(eight(load8(s, k))).map(|(h, l)| h * 100_000_000 + l)
         }
         _ => {
@@ -205,7 +209,11 @@ mod tests {
         if py_digits(s) {
             let z = s.iter().position(|&c| c != b'0').unwrap_or(s.len());
             let significant = &s[z..];
-            return Some(if significant.len() <= 19 { py_int(significant) } else { 10i128.pow(19) });
+            return Some(if significant.len() <= 19 {
+                py_int(significant)
+            } else {
+                10i128.pow(19)
+            });
         }
         if s.len() != 20 && s.len() != 25 {
             return None;
@@ -328,11 +336,15 @@ mod tests {
 
     #[test]
     fn calendar_sweep() {
-        let years =
-            [0, 1, 4, 99, 100, 400, 1600, 1900, 1969, 1970, 2000, 2024, 2025, 2026, 2027, 2028, 2100, 2400, 9996, 9999];
-        let times = ["00:00:00", "23:59:59", "24:00:00", "12:60:00", "12:00:60", "99:99:99", "19:58:10"];
-        let zones =
-            ["Z", "+00:00", "-00:00", "+23:59", "-23:59", "+24:00", "-05:60", "+12:00", "-10:00", "+05:30", "+99:99"];
+        let years = [
+            0, 1, 4, 99, 100, 400, 1600, 1900, 1969, 1970, 2000, 2024, 2025, 2026, 2027, 2028, 2100, 2400, 9996, 9999,
+        ];
+        let times = [
+            "00:00:00", "23:59:59", "24:00:00", "12:60:00", "12:00:60", "99:99:99", "19:58:10",
+        ];
+        let zones = [
+            "Z", "+00:00", "-00:00", "+23:59", "-23:59", "+24:00", "-05:60", "+12:00", "-10:00", "+05:30", "+99:99",
+        ];
         for y in years {
             for mo in 0..=13 {
                 for d in 0..=32 {

@@ -42,9 +42,9 @@ Measure every change on the 20M official dataset, 5 runs, report the median. Kee
 
 - [x] **T8. Profile.** Sampled all native threads at 1 ms on the scored 20M seed-7 binary with macOS `sample -mayDie` (platform equivalent of a sampling profile). Five busiest non-wait leaves and phase timings in `docs/NOTES.md`.
 - [x] **T9. Faster parse.** Runtime AVX2/SSE2, NEON and portable classifiers; the strict scanner fills selected columns without a copy. Word-based F1/F2/F3 checks and conversion. Integrated 20M median 0.949 → 0.774 s (-18.5%); differential scanner/timestamp tests and dev parity green.
-- [ ] **T10. Shrink rows.** Store event_id / user / click_id as (u64 hash, offset, len) into the mmap; compare bytes only on hash ties. Target EvRow ≤ 32 bytes.
-- [ ] **T11. Fewer passes.** Fuse dedup-shard and person-shard work where possible; avoid the `flat_map` gather copy by pre-sizing per-shard vectors.
-- [ ] **T12. Radix sort** person shards by (hash, ts) instead of `sort_unstable_by`.
+- [x] **T10. Shrink rows.** The 64-byte event row no longer exists: a 24-byte claim and a 24-byte valid payload travel independently. Exact 64-bit person/click keys keep arbitrary spellings. Also tested 16-byte layouts; they missed the end-to-end gain threshold.
+- [x] **T11. Fewer passes.** Payloads are routed directly, source buckets are consumed into correctly sized sort buffers, and identical click copies no longer require a separate click-ID partition. See paired medians in `docs/NOTES.md`.
+- [x] **T12. Sort experiments.** Tried two-level bucketing and a gather fused with a radix pass; neither beat the compact exact-key comparison sorts by >3% overall. Kept the faster control.
 - [x] **T13. Output.** Sonnet’s typed, uncompressed PLAIN writer uses the Parquet crate’s supported column API and explicitly closes both tables before exit. Official dev answer exact. Integrated 20M median 1.073 → 1.036 s (-3.4%).
 - [ ] **T14. Image and start-up.** Try `FROM scratch` with a static musl build (`x86_64-unknown-linux-musl`, mimalloc or jemalloc for the allocator). Measure container start to exit.
 - [ ] **T15. Thread tuning.** Read `NCPU`; try rayon pool = 8 vs 16; try `CHUNK` 2/4/8/16 MB and `NS` 64/256/1024.

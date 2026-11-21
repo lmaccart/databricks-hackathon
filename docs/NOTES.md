@@ -1,5 +1,19 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Rebuilt pipeline: whole-process comparisons
+
+Scored baseline `cc9f33e` vs the SIMD/direct-routing/typed-writer candidate (`3f1d667`). Official practice time is known only for the baseline, **5.03 s**.
+
+| Host, input | Scored binary | Rebuild | Speedup |
+|---|---:|---:|---:|
+| M2 Pro, 8 workers, 20M seed 7 | 2.339 s | 0.833 s | 2.81× |
+| M2 Pro, 8 workers, 20M seed 15 (leap day) | 2.329 s | 0.773 s | 3.01× |
+| [Native Linux Intel Xeon 6975P-C](https://github.com/lmaccart/databricks-hackathon/actions/runs/44865536651), 4 workers, 20M seed 7 | 6.112 s | 2.078 s | 2.94× |
+
+Medians of five warm, alternating-order process pairs. Mac used the equivalent rustfmt/lint cleanup build. These are end-to-end **local/CI** measurements, not hidden practice results. Rows in each table are compared by key, not by Parquet file bytes.
+
+The rebuilt binary repeated all **60 official-generator comparisons** against the Python oracle (20 seeds each at 10k, 100k, and 1M). All matched. Native final-scale exact diff and Docker dev/practice checks are detailed below.
+
 ## First hidden practice result
 
 Leif reports **5.03 s** for `cc9f33e`. At the user-reported 0.68 s lead that is a 7.40× gap on the practice clock. The 2.45 s native baseline below is a different measurement; use interleaved local runs to rank changes and a fresh organizer run to evaluate rank.
@@ -27,11 +41,15 @@ The explicit prefetch hint dereferences no input and is issued only for an in-bo
 
 **Allocator control:** identical amd64 executable under Rosetta, glibc vs Debian mimalloc: 3.534 vs 2.605 s across five interleaved full Docker runs. But on [native Intel](https://github.com/lmaccart/databricks-hackathon/actions/runs/44864914334), the identical-binary medians were 2.795 vs 2.721 s, only **2.6%**. No mimalloc dependency or preload in the submitted image. An emulation-only improvement is not enough.
 
+**Rebuilt candidate `3f1d667`:** restricted amd64 Docker build 59.61 s; dev matches both official tables. On 20M seed 7, the full starter invocation took 3.38 s under emulation and matched every reference-checkpoint row (2,242,393 user-days / 28,014 campaign-days), with zero stdout. On native 60M seed 13, the same click/event data path finished in **7.88 s** with **9.25 GiB** max RSS in one capacity run (other work on the host). Both tables matched the scored implementation **row-for-row**, including 6,587,957 distinct user-days; the separate global self-check passed. These are not hidden scorer times.
+
 Rejected trials: a second round of hash bucketing before the session sorts gave 1.879 vs 1.836 s on the compact-key control. Direct click routing plus lazy interval assist counters gave 1.841 vs 1.572 s in a noisy batch. Neither result meets the five-run end-to-end acceptance threshold; retain the existing sorts and click path for that checkpoint.
 
 Shard/chunk sweep on the routing checkpoint (each is a five-pair candidate vs its own `256 shards / 8 MiB` control): 64/2 MiB: 1.412 vs 1.331 s; 64/8 MiB: 1.245 vs 1.215 s; 128/4 MiB: 1.255 vs 1.254 s; 32/2 MiB: 1.298 vs 1.271 s. None justify a parameter change.
 
 Other exact representations that passed correctness but missed the cutoff on the integrated native run: 16-byte claims with a lossless outlier table (0.998 vs 0.971 s); 16-byte session events selected only when time offsets/category IDs provably fit, with a wide fallback (0.776 vs 0.791 s); and an ingestion-month cache (1.114 vs 1.132 s). These remain experiments; production retains full-width timestamps.
+
+Two more negative results: fusing the gather with a most-significant-radix partition before local sorting yielded 0.852 vs 0.820 s. LLVM application PGO trained on a separate 250k-event kit input (no dev answers or benchmark seed in training) yielded 0.746 vs 0.709 s. Neither is in the production build.
 
 Opus also tried the opposite event layout, first scattering 40-byte source-span rows by event ID, then passing only frequency-filter collisions to a full byte comparison. On the unmodified scored pipeline this measured 2.149 → 1.927 s (10.3%). The integrated entry uses direct payload routing instead; these are alternative algorithms, not additive gains.
 

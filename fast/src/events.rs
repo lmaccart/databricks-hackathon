@@ -43,9 +43,7 @@ fn parse<'a>(
 ) -> (Vec<Vec<PEv>>, Vec<Vec<Claim>>) {
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Vec<PEv>> = (0..NS).map(|_| Vec::with_capacity(reserve)).collect();
-    let mut claims: Vec<Vec<Claim>> = (0..NS)
-        .map(|_| Vec::with_capacity(reserve + reserve / 8))
-        .collect();
+    let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
     let mut emit = |e: Pending| {
         let mut target = NONE;
         if e.uid != 0 {
@@ -80,11 +78,7 @@ fn parse<'a>(
             ingest,
             ..Default::default()
         };
-        if !r[1].is_empty()
-            && !r[5].is_empty()
-            && (ws..we).contains(&ts)
-            && ingest.saturating_sub(ts) <= DAY
-        {
+        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
             let purchase = match r[4] {
                 b"purchase" => parse_price(r[6]),
                 b"view" | b"cart" => Some(0),
@@ -189,10 +183,7 @@ pub(super) fn by_person<'a>(
     hs: &RandomState,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Vec<PEv>>> {
-    let parsed: Vec<_> = chunks
-        .par_iter()
-        .map(|c| parse(c, sm, people, ws, we, hs))
-        .collect();
+    let parsed: Vec<_> = chunks.par_iter().map(|c| parse(c, sm, people, ws, we, hs)).collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
     let mut claims: Vec<Vec<_>> = (0..NS).map(|_| Vec::new()).collect();
@@ -211,18 +202,15 @@ pub(super) fn by_person<'a>(
             by_batch[loc.batch].push(loc.target);
         }
     }
-    payloads
-        .par_iter_mut()
-        .zip(by_batch)
-        .for_each(|(payload, locations)| {
-            for target in locations {
-                let x = target as usize;
-                payload[x % NS][x / NS].price = KILLED;
-            }
-            for dest in payload {
-                dest.retain(|e| e.price != KILLED);
-            }
-        });
+    payloads.par_iter_mut().zip(by_batch).for_each(|(payload, locations)| {
+        for target in locations {
+            let x = target as usize;
+            payload[x % NS][x / NS].price = KILLED;
+        }
+        for dest in payload {
+            dest.retain(|e| e.price != KILLED);
+        }
+    });
     payloads
 }
 

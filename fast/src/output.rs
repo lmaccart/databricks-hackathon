@@ -14,9 +14,7 @@ use bytes::Bytes;
 use parquet::basic::{ConvertedType, LogicalType, Repetition, Type as Physical};
 use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesPtr};
-use parquet::file::writer::{
-    SerializedColumnWriter, SerializedFileWriter, SerializedRowGroupWriter,
-};
+use parquet::file::writer::{SerializedColumnWriter, SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::types::{Type, TypePtr};
 use rayon::prelude::*;
 use std::fs::File;
@@ -39,12 +37,7 @@ fn props() -> WriterPropertiesPtr {
     )
 }
 
-fn field(
-    name: &str,
-    physical: Physical,
-    logical: Option<LogicalType>,
-    optional: bool,
-) -> Arc<Type> {
+fn field(name: &str, physical: Physical, logical: Option<LogicalType>, optional: bool) -> Arc<Type> {
     let rep = if optional {
         Repetition::OPTIONAL
     } else {
@@ -75,12 +68,7 @@ fn schema(fields: Vec<Arc<Type>>) -> TypePtr {
 }
 
 fn string(name: &str, optional: bool) -> Arc<Type> {
-    field(
-        name,
-        Physical::BYTE_ARRAY,
-        Some(LogicalType::String),
-        optional,
-    )
+    field(name, Physical::BYTE_ARRAY, Some(LogicalType::String), optional)
 }
 fn date(name: &str) -> Arc<Type> {
     field(name, Physical::INT32, Some(LogicalType::Date), false)
@@ -104,9 +92,7 @@ fn fixed<'a, T: DataType, R: 'a>(
         if buf.is_empty() {
             return;
         }
-        cw.typed::<T>()
-            .write_batch(&buf, None, None)
-            .expect("write column");
+        cw.typed::<T>().write_batch(&buf, None, None).expect("write column");
     }
 }
 
@@ -130,10 +116,7 @@ fn strings<'a, R: 'a>(
             let start = arena.len();
             let present = put(r, &mut arena);
             if present {
-                assert!(
-                    std::str::from_utf8(&arena[start..]).is_ok(),
-                    "IDs must be UTF-8"
-                );
+                assert!(std::str::from_utf8(&arena[start..]).is_ok(), "IDs must be UTF-8");
                 spans.push((start, arena.len()));
             }
             defs.push(present as i16);
@@ -143,11 +126,7 @@ fn strings<'a, R: 'a>(
         }
         let shared = Bytes::from(arena);
         vals.clear();
-        vals.extend(
-            spans
-                .iter()
-                .map(|&(a, b)| ByteArray::from(shared.slice(a..b))),
-        );
+        vals.extend(spans.iter().map(|&(a, b)| ByteArray::from(shared.slice(a..b))));
         let levels = nullable.then_some(&defs[..]);
         cw.typed::<ByteArrayType>()
             .write_batch(&vals, levels, None)
@@ -155,12 +134,8 @@ fn strings<'a, R: 'a>(
     }
 }
 
-fn next<'a, W: Write + Send>(
-    rg: &'a mut SerializedRowGroupWriter<'_, W>,
-) -> SerializedColumnWriter<'a> {
-    rg.next_column()
-        .expect("column")
-        .expect("schema has more columns")
+fn next<'a, W: Write + Send>(rg: &'a mut SerializedRowGroupWriter<'_, W>) -> SerializedColumnWriter<'a> {
+    rg.next_column().expect("column").expect("schema has more columns")
 }
 
 fn close(cw: SerializedColumnWriter<'_>) {
@@ -168,8 +143,7 @@ fn close(cw: SerializedColumnWriter<'_>) {
 }
 
 fn file(path: &Path, schema: TypePtr) -> SerializedFileWriter<File> {
-    SerializedFileWriter::new(File::create(path).expect("create parquet"), schema, props())
-        .expect("writer")
+    SerializedFileWriter::new(File::create(path).expect("create parquet"), schema, props()).expect("writer")
 }
 
 /// `user_daily`: shards are grouped into at most `parts` files, one thread each.
