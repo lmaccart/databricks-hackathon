@@ -245,7 +245,12 @@ fn parse_clicks<'a>(
         camp: u32,
     }
     let mut emit = |row: PendingClick| {
-        let (dest, person) = match names.lookup(row.uid, row.hash) {
+        let identity = if row.uid == 0 {
+            Identity::Standalone(row.hash)
+        } else {
+            names.lookup(row.uid, row.hash)
+        };
+        let (dest, person) = match identity {
             Identity::Linked(p) if packed => (&mut b[shard(p)].packed, u64::from(p as u32)),
             Identity::Linked(p) => (&mut b[shard(p)].wide, names.original(p as u32)),
             Identity::Standalone(p) => (&mut b[shard(p)].wide, p),
@@ -272,7 +277,7 @@ fn parse_clicks<'a>(
         }
         let key = names.codec.key(uid);
         let hash = links::mix(key);
-        names.prefetch(hash);
+        let key = if names.prefetch_if_linked(hash) { key } else { 0 };
         let i = n % ring.len();
         if n >= ring.len() {
             emit(ring[i]);
@@ -554,7 +559,8 @@ fn main() {
         ],
     );
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
-    let names = person_names(&link_chunks);
+    let mut names = person_names(&link_chunks);
+    names.configure_filter(&ev_chunks, &cl_chunks);
     let packing = Packing::new(ws, we, names.count);
     log(&format!("links: {} linked ids", names.count));
 

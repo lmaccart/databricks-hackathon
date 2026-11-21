@@ -1,5 +1,25 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Blocked link membership candidate — 2026-11-21
+
+Two Bloom bits in one word, built in one pass over all distinct graph keys
+(including aliases), with 8 MiB maximum storage. Negatives skip both the
+prefetch and full-key probe; positives still need the immutable exact table.
+Empty graphs skip all probes. A startup sample at most 64 KiB per stream
+bypasses the filter if at most 1/16 of sampled IDs are absent. Sampling can
+affect speed but not correctness. `SS_ID_FILTER_SAMPLE_LOG=1` reports the
+bounded startup sample, not counters on the parsing path.
+
+| Input | Stream | Sampled | Standalone | Exact table probes | Filter |
+|---|---|---:|---:|---:|---:|
+| Official dev, seed 1 | Events | 836 | 302 (36.1%) | 537 (64.2%) | 128 KiB |
+| Official dev, seed 1 | Clicks | 1,371 | 537 (39.2%) | 841 (61.3%) | 128 KiB |
+| Official seed 15, 100k events | Events | 834 | 296 (35.5%) | 541 (64.9%) | 16 KiB |
+| Official seed 15, 100k events | Clicks | 944 | 342 (36.2%) | 603 (63.9%) | 16 KiB |
+
+The sample counts nonempty IDs on well-formed lines before payload validation
+or dedup. No local 20M timing; native paired timing is pending.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

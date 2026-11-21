@@ -96,8 +96,8 @@ struct Location {
 #[derive(Clone, Copy, Default)]
 struct Pending {
     claim_key: u64,
-    uid: u64, // zero is never the key of a nonempty ID
-    hash: u64,
+    uid: u64, // zero when invalid or definitely absent from the link table
+    hash: u64, // zero only when invalid (no nonempty ID mixes to zero)
     ts: i64,
     claim_order: u64,
     price: u32,
@@ -129,8 +129,12 @@ fn parse<'a>(
     let mut spill = Vec::new();
     let mut emit = |e: Pending| {
         let mut target = NONE;
-        if e.uid != 0 {
-            let person = people.lookup(e.uid, e.hash);
+        if e.hash != 0 {
+            let person = if e.uid == 0 {
+                Identity::Standalone(e.hash)
+            } else {
+                people.lookup(e.uid, e.hash)
+            };
             let p = shard(match person {
                 Identity::Linked(routed) | Identity::Standalone(routed) => routed,
             });
@@ -168,9 +172,11 @@ fn parse<'a>(
                 } else {
                     sm.product_cat.get(r[5]).unwrap_or(sm.unknown_cat)
                 };
-                next.uid = people.codec.key(r[1]);
-                next.hash = links::mix(next.uid);
-                people.prefetch(next.hash);
+                let key = people.codec.key(r[1]);
+                next.hash = links::mix(key);
+                if people.prefetch_if_linked(next.hash) {
+                    next.uid = key;
+                }
                 next.price = price;
                 next.cat = cat;
             }
