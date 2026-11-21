@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Input-reader decision: keep mmap — 2026-11-21
+
+The [Linux Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44939527659) found that `pread` saved 4.1% on warmed 20M data but took 7.3% longer at warmed 60M. With cold input pages it saved only 1.1% / 0.2%. All 24 timed outputs matched. Keep the practice code on `main` (`087c35d`, production-identical to the directly timed `1a3d0fd`).
+
 ## Public practice SHA rebuilt and timed directly — 2026-11-21
 
 [`1a3d0fd`](https://github.com/lmaccart/databricks-hackathon/commit/1a3d0fdf38c14e858a92ba53bfa29da2f0f9b94a) won **18/18 pairs** in the [Intel repeat against the 1.54 s control](https://github.com/lmaccart/databricks-hackathon/actions/runs/44938836557). Warm full Docker medians: **1.825 → 1.294 s** at 20M; **5.508 → 3.871 s** at 60M. Both campaign accumulator paths, 60 independent Python comparisons, the official fixtures and all 6,615,971 final-scale rows matched. Peak 60M RSS was 7.83 GiB. Across this run and the three production-identical AMD runs the total is 71/72. The latest organizer result is still 1.54 s.
