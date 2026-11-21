@@ -5,35 +5,49 @@ use super::*;
 const ONES: u64 = 0x0101_0101_0101_0101;
 const HIGH: u64 = ONES << 7;
 const FLOOR: u64 = ONES * b'-' as u64;
+const PACKET: usize = 128;
 
+// Callers prove a maximum offset for each phase in `decode`. Unaligned
+// array references have alignment 1, including when backed by an mmap.
 #[inline(always)]
-fn quoted(s: &[u8]) -> (bool, &[u8]) {
-    match s.strip_prefix(b"\"") {
-        Some(body) => (true, body),
-        None => (false, s),
-    }
+unsafe fn bytes<const N: usize>(b: &[u8; PACKET], at: usize) -> &[u8; N] {
+    debug_assert!(at <= PACKET - N);
+    // SAFETY: the caller guarantees `at + N <= PACKET`.
+    unsafe { &*b.as_ptr().add(at).cast() }
 }
 
 #[inline(always)]
-fn comma(s: &[u8], q: bool) -> Option<&[u8]> {
-    s.strip_prefix(if q { b"\"," as &[u8] } else { b"," })
+fn boundary(pair: u16, q: usize) -> bool {
+    // For unquoted fields the high byte belongs to the next field.
+    let quoted = q != 0;
+    let mask = if quoted { u16::MAX } else { 0xff };
+    let expected = if quoted {
+        u16::from_le_bytes(*b"\",")
+    } else {
+        u16::from(b',')
+    };
+    (pair & mask) == expected
 }
 
 /// The tight ID path uses the same load to prove ASCII and construct the
 /// inline token. `'-'..=127` excludes all three CSV structural bytes and NUL;
 /// IDs with any other spelling are still handled by the ordinary codec.
+/// Caller supplies up to 12 readable bytes at `at`.
 #[inline(always)]
-fn id(s: &[u8]) -> Option<(u64, &[u8])> {
-    let (q, b) = quoted(s);
-    let b11 = b.first_chunk::<11>()?;
+unsafe fn id(b: &[u8; PACKET], at: usize) -> Option<(u64, usize, u64)> {
+    // SAFETY: one opening byte, followed by at most 11 bytes examined.
+    let q = usize::from(unsafe { bytes::<1>(b, at) }[0] == b'"');
+    let at = at + q;
+    let b11 = unsafe { bytes::<11>(b, at) };
     let w = u64::from_le_bytes(b11[..8].try_into().unwrap());
-    let end = if q { b'"' } else { b',' };
+    let end = if q != 0 { b'"' } else { b',' };
     let tail = b11[8];
-    if b11[9] == end && (b'-'..=127).contains(&tail) {
-        if ((w.wrapping_sub(FLOOR) | w) & HIGH) != 0 || (q && b11[10] != b',') {
-            return None;
-        }
-        return Some((person::pack_inline(w.swap_bytes(), tail), &b[10 + usize::from(q)..]));
+    if boundary(u16::from_le_bytes([b11[9], b11[10]]), q) && (b'-'..=127).contains(&tail) {
+        return Some((
+            person::pack_inline(w.swap_bytes(), tail),
+            at + 10 + q,
+            w.wrapping_sub(FLOOR) | w,
+        ));
     }
     // Search the two shorter boundary positions. The subtract-based
     // zero mask can have borrow artifacts after a match, never before it.
@@ -43,59 +57,81 @@ fn id(s: &[u8]) -> Option<(u64, &[u8])> {
     if n > 8 {
         return None;
     }
-    let more = n + usize::from(q) + 1;
-    if q && b11[n + 1] != b',' {
+    if q != 0 && b11[n + 1] != b',' {
         return None;
     }
     let active = if n == 7 { 0x00ff_ffff_ffff_ffff } else { u64::MAX };
     // If any byte underflows, the first offending byte either raises its
     // high bit on subtract or already had its high bit set.
-    if ((w.wrapping_sub(FLOOR) | w) & HIGH & active) != 0 {
-        return None;
-    }
-    Some((person::pack_inline((w & active).swap_bytes(), 0), &b[more..]))
+    Some((
+        person::pack_inline((w & active).swap_bytes(), 0),
+        at + n + q + 1,
+        (w.wrapping_sub(FLOOR) | w) & active,
+    ))
 }
 
+/// Caller supplies at least 51 bytes (28 event + 23 ingest).
 #[inline(always)]
-fn fixed<const N: usize>(s: &[u8], q: bool) -> Option<(&[u8; N], &[u8])> {
-    let body = s.first_chunk::<N>()?;
-    Some((body, comma(&s[N..], q)?))
-}
-
-#[inline(always)]
-fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [u8])> {
-    let (q, b) = quoted(s);
-    let (ts, rest) = if *b.get(4)? != b'-' {
-        let (body, rest) = fixed::<13>(b, q)?;
-        (ManifestClock::event_f3(body), rest)
-    } else if *b.get(19)? == b'Z' {
-        let (body, rest) = fixed::<20>(b, q)?;
-        let sec = clock.event_f1_seconds(body);
-        if sec == BAD {
+unsafe fn timestamps(b: &[u8; PACKET], at: usize, clock: &ManifestClock) -> Option<(i64, i64, usize)> {
+    // SAFETY: the longest event timestamp advances 28 bytes; the ingest
+    // timestamp reads at most another 23 bytes.
+    unsafe {
+        let q = usize::from(bytes::<1>(b, at)[0] == b'"');
+        let at = at + q;
+        let head = u64::from_le_bytes(*bytes::<8>(b, at));
+        let (len, gate, tail) = if (head >> 32) as u8 != b'-' {
+            (13, u16::from_le_bytes(*bytes::<2>(b, at + 13)), 0)
+        } else {
+            // One load supplies the F1 parser's final second digit and Z,
+            // the F1 comma gate, and the choice between F1 and F2.
+            let tail = u32::from_le_bytes(*bytes::<4>(b, at + 18));
+            if (tail >> 8) as u8 == b'Z' {
+                (20, (tail >> 16) as u16, tail as u16)
+            } else {
+                (25, u16::from_le_bytes(*bytes::<2>(b, at + 25)), 0)
+            }
+        };
+        if !boundary(gate, q) {
             return None;
         }
-        (sec * 1000, rest)
-    } else {
-        let (body, rest) = fixed::<25>(b, q)?;
-        (ManifestClock::event_f2(body), rest)
-    };
-    if ts == BAD {
-        return None;
+        let ingest = at + len + q + 1;
+        let iq = usize::from(bytes::<1>(b, ingest)[0] == b'"');
+        let ingest = ingest + iq;
+        let itail = u32::from_le_bytes(*bytes::<4>(b, ingest + 18));
+        if !boundary((itail >> 16) as u16, iq) {
+            return None;
+        }
+        let ts = match len {
+            13 => ManifestClock::event_f3(head, u64::from_le_bytes(*bytes::<8>(b, at + 5))),
+            20 => clock.event_f1_seconds(bytes::<20>(b, at), head, tail),
+            _ => ManifestClock::event_f2(bytes::<25>(b, at)),
+        };
+        let ibody = bytes::<20>(b, ingest);
+        let seconds = clock.event_f1_seconds(ibody, u64::from_le_bytes(*ibody.first_chunk().unwrap()), itail as u16);
+        if (ts == BAD) | (seconds == BAD) {
+            return None;
+        }
+        let ts = ts * if len == 20 { 1000 } else { 1 };
+        Some((ts, seconds, ingest + 21 + iq))
     }
-    let (q, rest) = quoted(rest);
-    let (body, rest) = fixed::<20>(rest, q)?;
-    let seconds = clock.event_f1_seconds(body);
-    (seconds != BAD).then_some((ts, seconds, rest))
 }
 
+/// Caller supplies at least 11 bytes.
 #[inline(always)]
-fn event_type(s: &[u8]) -> Option<(bool, &[u8])> {
-    let (q, s) = quoted(s);
-    let purchase = match s.first_chunk::<4>()? {
-        b"view" | b"cart" => false,
-        _ => return Some((true, comma(s.strip_prefix(b"purchase")?, q)?)),
-    };
-    Some((purchase, comma(&s[4..], q)?))
+unsafe fn event_type(b: &[u8; PACKET], at: usize) -> Option<(bool, usize)> {
+    // SAFETY: at most one opening quote, eight value bytes, and two
+    // boundary bytes, ending within the caller's 11-byte span.
+    let q = usize::from(unsafe { bytes::<1>(b, at) }[0] == b'"');
+    let at = at + q;
+    let body = unsafe { bytes::<10>(b, at) };
+    const VIEW: u32 = u32::from_le_bytes(*b"view");
+    const CART: u32 = u32::from_le_bytes(*b"cart");
+    let head = u64::from_le_bytes(*body.first_chunk::<8>().unwrap());
+    if matches!(head as u32, VIEW | CART) {
+        return boundary((head >> 32) as u16, q).then_some((false, at + 5 + q));
+    }
+    (head == u64::from_le_bytes(*b"purchase") && boundary(u16::from_le_bytes([body[8], body[9]]), q))
+        .then_some((true, at + 9 + q))
 }
 
 // NEON naturally supplies a nibble per byte. SSE supplies a single bit.
@@ -158,45 +194,45 @@ type PriceCategory = (u32, u32);
 /// One classification for both product and price, even when the price is
 /// ignored. The first structural byte in each body must be its exact end.
 #[inline(always)]
-fn suffix<'a>(s: &'a [u8], purchase: bool, sm: &Small) -> Option<(Option<PriceCategory>, &'a [u8])> {
-    let b = s.first_chunk::<16>()?;
+fn suffix(b: &[u8; 16], purchase: bool, sm: &Small) -> Option<(Option<PriceCategory>, usize)> {
     let mask = structural(b);
     let p = usize::from(b[0] == b'"');
     let end = next(mask, p);
-    let comma = if p == 1 {
-        if *b.get(end)? != b'"' {
-            return None;
-        }
-        end + 1
-    } else {
-        end
-    };
-    if *b.get(comma)? != b',' {
+    if end + p >= 15 {
         return None;
     }
-    let p2 = comma + 1;
-    let q2 = usize::from(*b.get(p2)? == b'"');
+    // SAFETY: end <= 14 and the next field's first byte (p2) is <= 15.
+    let pair = u16::from_le_bytes(unsafe { *b.as_ptr().add(end).cast::<[u8; 2]>() });
+    if !boundary(pair, p) {
+        return None;
+    }
+    let p2 = end + p + 1;
+    let q2 = usize::from(unsafe { *b.get_unchecked(p2) } == b'"');
     let start2 = p2 + q2;
     let end2 = next(mask, start2);
-    let nl = if q2 == 1 {
-        if *b.get(end2)? != b'"' {
-            return None;
-        }
-        end2 + 1
-    } else {
-        end2
-    };
-    if *b.get(nl)? != b'\n' {
+    let nl = end2 + q2;
+    if nl >= 16 {
+        return None;
+    }
+    // SAFETY: end2 <= nl < 16. When there is no opening quote the
+    // first structural byte must be LF; otherwise it must be the quote.
+    if unsafe { (*b.get_unchecked(nl) != b'\n') | (q2 != 0 && *b.get_unchecked(end2) != b'"') } {
         return None;
     }
     let payload = if end == p {
         None
     } else if purchase {
-        parse_price(&b[start2..end2]).map(|price| (price, sm.product_cat.get(&b[p..end]).unwrap_or(sm.unknown_cat)))
+        priced(&b[start2..end2], &b[p..end], sm)
     } else {
         Some((0, 0))
     };
-    Some((payload, &s[nl + 1..]))
+    Some((payload, nl + 1))
+}
+
+#[cold]
+#[inline(never)]
+fn priced(price: &[u8], product: &[u8], sm: &Small) -> Option<PriceCategory> {
+    parse_price(price).map(|price| (price, sm.product_cat.get(product).unwrap_or(sm.unknown_cat)))
 }
 
 #[cfg(test)]
@@ -220,10 +256,81 @@ mod tests {
                             input.push(b'"');
                         }
                         input.extend_from_slice(b",following-field");
-                        let (key, rest) = id(&input).expect("ASCII ID must use the fast path");
+                        let mut packet = [0; PACKET];
+                        packet[..input.len()].copy_from_slice(&input);
+                        // SAFETY: a full packet is available from offset 0.
+                        let (key, rest, bad) = unsafe { id(&packet, 0) }.expect("ASCII ID must use the fast path");
+                        assert_eq!(bad & HIGH, 0);
                         assert_eq!(Some(key), person::inline(&value), "{value:?}");
-                        assert_eq!(rest, b"following-field");
+                        assert_eq!(&input[rest..], b"following-field");
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packet_edges_match_strict_decoder_without_padding() {
+        let path = Path::new("packet.csv");
+        let sm = read_small(
+            b"product_id,category\nitem-7,shoes\n",
+            b"campaign_id,channel\n",
+            path,
+            path,
+        );
+        let ws = parse_ts(b"2026-10-01T00:00:00Z");
+        let we = parse_ts(b"2026-10-15T00:00:00Z");
+        let clock = ManifestClock::new(ws, we);
+        let window = (ws, we, &clock);
+        let cols = [
+            "event_id",
+            "user_id",
+            "ts",
+            "ingest_ts",
+            "event_type",
+            "product_id",
+            "price_cents",
+        ];
+        let header = cols.join(",") + "\n";
+        // Max cursor advance: both IDs, both timestamps and event type
+        // take their longest quoted form; the tail fills all 16 bytes.
+        let first = b"\"opaque009\",\"USER_0007\",\"2026-10-03T10:30:00+00:30\",\"2026-10-03T10:00:00Z\",\"purchase\",\"item-7\",\"0002\"\n";
+        assert_eq!(first.len(), 102);
+        let last = b"opaque07,user0007,1791021600001,2026-10-03T10:00:00Z,view,item-7,";
+        let check = |body: &[u8]| {
+            let file = [header.as_bytes(), body].concat();
+            let codec = Codec::new();
+            let [chunk] = &chunks_of(&file, &cols, path)[..] else {
+                panic!()
+            };
+            // Simulate a chunk ending at the first newline with
+            // further mapped bytes belonging to another chunk.
+            for end in [memchr::memchr(b'\n', body).map_or(body.len(), |p| p + 1), body.len()] {
+                let mut c = *chunk;
+                c.data = &chunk.data[..end];
+                let (mut want, mut got) = (vec![], vec![]);
+                let (mut want_spill, mut got_spill) = (vec![], vec![]);
+                for_rows(&c, |r| {
+                    want.extend(decode_fields(r, &sm, &codec, window, &mut want_spill))
+                });
+                for_events(&c, &sm, &codec, window, &mut got_spill, |e| got.push(e));
+                assert_eq!(got, want, "{end}: {body:?}");
+                assert_eq!(got_spill, want_spill);
+            }
+        };
+        for n in [first.len() - 1, first.len()] {
+            check(&first[..n]);
+            check(&[first, &first[..n]].concat());
+        }
+        for n in [127, 128, 129, 255, 256, 257] {
+            for final_newline in [false, true] {
+                for first in [&first[..], &first[..first.len() - 1], &[]] {
+                    let mut body = [first, last].concat();
+                    body.resize(n, b'x');
+                    if final_newline {
+                        body[n - 1] = b'\n';
+                    }
+                    check(&body);
                 }
             }
         }
@@ -274,9 +381,10 @@ mod tests {
             b"opaque009,\"USER_07\",\"2026-10-03T10:30:00+00:30\",\"2026-10-03T10:00:00Z\",\"purchase\",\"item-7\",\"0123\"",
         ] {
             let file = [row, &followed].concat();
-            let (event, rest) = decode(&file, &sm, window).unwrap_or_else(|| panic!("must exercise the word path: {row:?}"));
+            let (event, rest) = decode(file.first_chunk().unwrap(), &sm, window)
+                .unwrap_or_else(|| panic!("must exercise the word path: {row:?}"));
             assert_ne!(event.uid, 0);
-            assert_eq!(rest, following);
+            assert_eq!(&file[rest..], following);
             check(row, b"");
             for i in 0..row.len() {
                 check(&row[..i], &followed);
@@ -295,30 +403,48 @@ mod tests {
 }
 
 #[inline(always)]
-fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestClock)) -> Option<(Pending, &'a [u8])> {
-    let (eid, s) = id(s)?;
-    let (uid, s) = id(s)?;
-    let (ts, seconds, s) = timestamps(s, clock)?;
-    let (purchase, s) = event_type(s)?;
-    let (payload, rest) = suffix(s, purchase, sm)?;
-    let mut e = Pending {
-        claim_key: links::mix(eid),
-        ts,
-        claim_order: seconds as u64, // same exact F1 seconds encoding as Claim::order
-        ..Default::default()
+fn decode(b: &[u8; PACKET], sm: &Small, (ws, we, clock): (i64, i64, &ManifestClock)) -> Option<(Pending, usize)> {
+    // SAFETY: both IDs advance at most 12 bytes each, timestamps 51
+    // together, type 11, and the suffix reads 16. Their sum is 102, so
+    // even a malformed candidate never requires bytes outside this array.
+    let (eid, uid, ts, seconds, payload, end) = unsafe {
+        let (eid, at, eid_bad) = id(b, 0)?;
+        let (uid, at, uid_bad) = id(b, at)?;
+        if (eid_bad | uid_bad) & HIGH != 0 {
+            return None;
+        }
+        let (ts, seconds, at) = timestamps(b, at, clock)?;
+        let (purchase, at) = event_type(b, at)?;
+        let (payload, n) = suffix(bytes::<16>(b, at), purchase, sm)?;
+        (eid, uid, ts, seconds, payload, at + n)
     };
+    let claim_key = links::mix(eid);
+    let claim_order = seconds as u64; // same exact F1 seconds encoding as Claim::order
     // The accepted forms (four-digit civil year or 13 digits) make the
     // millisecond difference safe in i64, including pre-epoch ingest.
-    if (ws..we).contains(&ts)
-        && seconds * 1000 - ts <= DAY
-        && let Some((price, cat)) = payload
-    {
-        e.uid = uid;
-        e.hash = links::mix(uid);
-        e.price = price;
-        e.cat = cat;
+    if let Some((price, cat)) = payload {
+        if (ws..we).contains(&ts) && seconds * 1000 - ts <= DAY {
+            let e = Pending {
+                claim_key,
+                claim_order,
+                ts,
+                uid,
+                hash: links::mix(uid),
+                price,
+                cat,
+            };
+            return Some((e, end));
+        }
     }
-    Some((e, rest))
+    Some((
+        Pending {
+            claim_key,
+            claim_order,
+            ts,
+            ..Default::default()
+        },
+        end,
+    ))
 }
 
 #[cold]
@@ -354,10 +480,11 @@ pub(super) fn for_events<'a>(
         });
     }
     let mut rest = c.data;
-    while !rest.is_empty() {
-        if let Some((e, tail)) = decode(rest, sm, window) {
+    while let Some(packet) = rest.first_chunk::<PACKET>() {
+        if let Some((e, n)) = decode(packet, sm, window) {
             emit(e);
-            rest = tail;
+            // SAFETY: decode consumes at most 102 bytes, within this packet.
+            rest = unsafe { rest.get_unchecked(n..) };
         } else {
             let (e, tail) = fallback(rest, sm, codec, window, spill);
             if let Some(e) = e {
@@ -365,5 +492,16 @@ pub(super) fn for_events<'a>(
             }
             rest = tail;
         }
+    }
+    if !rest.is_empty() {
+        // No packet overlaps a chunk boundary. The regular line decoder
+        // handles the short tail, including a final row without LF.
+        let mut tail = *c;
+        tail.data = rest;
+        for_rows(&tail, |r| {
+            if let Some(e) = decode_fields(r, sm, codec, window, spill) {
+                emit(e);
+            }
+        });
     }
 }

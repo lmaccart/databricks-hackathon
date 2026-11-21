@@ -40,16 +40,18 @@ def write(path, header, lines):
 
 
 def run_case(events=(), clicks=(), links=(), products=("p1,shoes", "p2,hats", "p3,bags"),
-             campaigns=("c_1,search", "c_2,social", "c_3,email"), extra=None, window=(WS, WE)):
+             campaigns=("c_1,search", "c_2,social", "c_3,email"), extra=None, window=(WS, WE),
+             unterminated_event=None):
     with tempfile.TemporaryDirectory() as tmp:
-        return _run_case_at(tmp, events, clicks, links, products, campaigns, extra, window)
+        return _run_case_at(tmp, events, clicks, links, products, campaigns, extra, window, unterminated_event)
 
 
 HEADERS = {"events": "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents",
            "clicks": "click_id,user_id,campaign_id,ts", "links": "user_id_a,user_id_b"}
 
 
-def _run_case_at(tmp, events, clicks, links, products, campaigns, extra=None, window=(WS, WE)):
+def _run_case_at(tmp, events, clicks, links, products, campaigns, extra=None, window=(WS, WE),
+                 unterminated_event=None):
     data, out = os.path.join(tmp, "data"), os.path.join(tmp, "out")
     os.makedirs(data)
     with open(os.path.join(data, "manifest.json"), "w") as fh:
@@ -58,6 +60,9 @@ def _run_case_at(tmp, events, clicks, links, products, campaigns, extra=None, wi
     write(os.path.join(data, "campaigns.csv"), "campaign_id,channel", campaigns)
     write(os.path.join(data, "events", "part-0.csv"),
           "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents", events)
+    if unterminated_event is not None:
+        with open(os.path.join(data, "events", "part-0.csv"), "ab") as fh:
+            fh.write(unterminated_event.encode())
     write(os.path.join(data, "events", "part-1.csv"),
           "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents", [])  # header only
     write(os.path.join(data, "clicks", "part-0.csv"), "click_id,user_id,campaign_id,ts", clicks)
@@ -90,6 +95,17 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_packet_sized_event_file_keeps_last_row_without_lf(self):
+        first = ev("opaque07", "visitor7", str(WS_MS), "view", ingest=WS)
+        last = ev("opaque08", "visitor7", str(WS_MS + 1), "cart", ingest=WS)
+        for n in (127, 128, 129):
+            with self.subTest(body_bytes=n):
+                filler = "x" * (n - len(first) - 1 - len(last))
+                self.assertEqual(len(first) + 1 + len(last) + len(filler), n)
+                u, _ = run_case(events=[first], unterminated_event=last + filler)
+                row = u[("visitor7", "2026-10-01")]
+                self.assertEqual((row["sessions"], row["events"], row["revenue_cents"]), (1, 2, 0))
+
     def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
         stamp = "2026-10-03T10:00:00Z"
         early = "2026-10-03T09:59:59Z"

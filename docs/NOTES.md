@@ -1,5 +1,33 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Fixed-span typed event parser — 2026-11-21 UTC
+
+The canonical event decoder proves one 128-byte span in its current chunk.
+The grammar advances at most 102 bytes and requires a physical LF to hit;
+short or unusual rows go through the exact decoder, with no padding
+assumption. Offsets and packed quote/comma gates replace suffix slices.
+Both IDs share a final ASCII range gate. Timestamp boundary probes reuse
+the already loaded words, and the F1 hot path uses a direct manifest date
+slot and packed time-of-day range checks instead of the minute lookup table.
+
+Paired against `f4ac682` on the official 1M dev input, native ARM64
+(11 alternating pairs per worker count):
+
+| Workers | Whole process | Event parse |
+|---|---:|---:|
+| 1 | 0.305 → 0.286 s (−6.2%, 9/11 pairs) | 0.130 → 0.112 s |
+| 4 | 0.143 → 0.141 s (−1.4%, 7/11 pairs) | 0.047 → 0.044 s |
+
+A cursor-only trial was effectively flat in event parse, with no whole-run
+gain. No 20M run, Docker, or Intel benchmark was performed here. The
+final ARM64 result is enough to warrant an Intel A/B, not a promotion by
+itself.
+
+Validation: 22 Rust tests, 40 Python cases against each implementation,
+10 dirty differential seeds, and all 36 official fixtures against both
+implementations. Both dev comparers matched all 144,438 rows; stdout was
+empty. New cases cover exact 128-byte boundaries and EOF without LF.
+
 ## Experimental word-offset event parser — 2026-11-21 UTC
 
 For the seven-column canonical header, validate and pack 7–9 byte ASCII IDs
