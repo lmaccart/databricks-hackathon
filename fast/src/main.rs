@@ -304,7 +304,6 @@ struct UserRow {
 }
 
 struct ShardOut {
-    users: Vec<UserRow>,
     camps: Map<u64, [i64; 4]>, // (camp << 32 | day) -> sessions, purchasing, revenue, assisted
 }
 
@@ -334,7 +333,8 @@ fn process_stream<T: Temporal>(
     sm: &Small,
     people: &People,
     layout: T::Layout,
-    ShardOut { users, camps }: &mut ShardOut,
+    camps: &mut Map<u64, [i64; 4]>,
+    users: &mut output::UserWriter<'_>,
 ) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
     let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
@@ -489,17 +489,17 @@ fn process_shard(
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
+    users: &mut output::UserWriter<'_>,
 ) -> ShardOut {
     let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
     let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
     let mut out = ShardOut {
-        users: Vec::new(),
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        process_stream(packed, gather(pc), sm, people, pack, &mut out.camps, users);
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
+    process_stream(wide, gather(wc), sm, people, (), &mut out.camps, users);
     out
 }
 
@@ -580,55 +580,58 @@ fn main() {
             e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
         )
     });
-    let outs: Vec<_> = jobs
-        .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
-        .collect();
-    log("sessions done");
-
-    let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
-    for o in &outs {
-        for (k, v) in &o.camps {
-            let e = camps.entry(*k).or_insert([0; 4]);
-            for q in 0..4 {
-                e[q] += v[q];
-            }
-        }
-    }
     let ud = outd.join("user_daily");
     let cd = outd.join("campaign_daily");
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
-
-    let camp_rows: Vec<output::CampRow> = camps
-        .iter()
-        .map(|(k, v)| {
-            let c = (*k >> 32) as u32;
-            let (campaign, channel) = if c == ORGANIC {
-                (&b"organic"[..], &b"organic"[..])
-            } else {
-                (sm.camp_names[c as usize], sm.camp_channel[c as usize])
-            };
-            output::CampRow {
-                campaign,
-                channel,
-                day: *k as u32 as i32,
-                counts: *v,
-            }
+    let key = |p, out: &mut Vec<u8>| out.extend_from_slice(names.codec.bytes(links::unmix(p), &mut [0; 9]));
+    let lanes: Vec<_> = (0..rayon::current_num_threads().clamp(1, 16))
+        .map(|i| std::sync::Mutex::new(output::UserWriter::new(&ud, i, &key, &sm.cat_names)))
+        .collect();
+    let outs: Vec<_> = jobs
+        .into_par_iter()
+        .map(|(e, c)| {
+            let lane = rayon::current_thread_index().expect("Rayon worker") % lanes.len();
+            let mut writer = lanes[lane].lock().expect("user writer");
+            process_shard(e, c, &sm, &names, packing, &mut writer)
         })
         .collect();
-    let shards: Vec<&[UserRow]> = outs.iter().map(|o| &o.users[..]).collect();
-    let parts = rayon::current_num_threads().clamp(1, 16);
+    log("sessions and user row groups done");
+
     rayon::join(
-        || output::campaign_daily(&cd.join("part-0.parquet"), &camp_rows),
         || {
-            output::user_daily(
-                &ud,
-                &shards,
-                parts,
-                &|p, out| out.extend_from_slice(names.codec.bytes(links::unmix(p), &mut [0; 9])),
-                &sm.cat_names,
-            )
+            lanes
+                .into_par_iter()
+                .for_each(|lane| lane.into_inner().expect("user writer").finish())
+        },
+        || {
+            let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
+            for o in &outs {
+                for (k, v) in &o.camps {
+                    let e = camps.entry(*k).or_insert([0; 4]);
+                    for q in 0..4 {
+                        e[q] += v[q];
+                    }
+                }
+            }
+            let camp_rows: Vec<output::CampRow> = camps
+                .iter()
+                .map(|(k, v)| {
+                    let c = (*k >> 32) as u32;
+                    let (campaign, channel) = if c == ORGANIC {
+                        (&b"organic"[..], &b"organic"[..])
+                    } else {
+                        (sm.camp_names[c as usize], sm.camp_channel[c as usize])
+                    };
+                    output::CampRow {
+                        campaign,
+                        channel,
+                        day: *k as u32 as i32,
+                        counts: *v,
+                    }
+                })
+                .collect();
+            output::campaign_daily(&cd.join("part-0.parquet"), &camp_rows);
         },
     );
     log("written");

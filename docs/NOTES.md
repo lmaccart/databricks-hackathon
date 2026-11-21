@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Fused bounded user Parquet lanes — 2026-11-21 UTC
+
+Candidate against `5fd0d05`: workers flush 8,192-row user groups during session processing, with at most 16 files and no retained all-shard user vectors. The final flush overlaps campaign aggregation. Within each column block, repeated user IDs share one arena span; PLAIN still writes a value per row. All integer columns remain INT64, with typed DATE and nullable categories. Empty inputs produce valid empty files.
+
+Local warm native M2 Pro, official generator seed 7, **3M events/750k clicks**, 8 workers: seven alternating pairs against the baseline had process medians **0.151 → 0.147 s** (2.3% less; noisy), with median parsed-event increments **0.046 → 0.044 s**, session increment **0.029 → 0.033 s** (candidate includes completed row groups), and final writing increment **0.025 → 0.024 s**. An earlier seven-pair 8K trial before ID-span reuse was **0.167 → 0.152 s** (9.0%); a separate paired ID-span trial was **0.163 → 0.155 s** versus that fused control. A user-ID dictionary experiment measured **0.149 → 0.150 s** against PLAIN; per-person allocated ByteArray values measured **0.138 → 0.150 s**. Neither was retained. These small-input, variable measurements do not establish a 20M/60M benefit or satisfy the scale performance gate; parent must benchmark at scale.
+
+Validation: 40 Python tests against each implementation, 19 Rust tests, clippy, 10 dirty seeds, 36/36 official fixtures for each implementation, both official dev-answer comparers, and dev self-check passed. PyArrow and Polars matched all dev rows and schemas and also independently read empty output and a Unicode/NUL 8,194-day person spanning two row groups. The 3M baseline matched candidate outputs at one and 17 workers (346,988 user and 28,008 campaign rows). Stdout was empty. No 20M/60M or Docker run was performed here; final-scale RSS remains unmeasured.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.
