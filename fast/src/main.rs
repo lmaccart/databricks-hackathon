@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+mod dims;
 mod events;
 mod links;
 mod output;
@@ -108,11 +109,11 @@ fn chunks_for<'a>(files: &'a [(PathBuf, Mmap)], cols: &[&str]) -> Vec<Chunk<'a>>
 }
 
 struct Small<'a> {
-    product_cat: Map<&'a [u8], u32>,
+    product_cat: dims::Dimension<'a>,
     cat_names: Vec<Vec<u8>>, // index -> name; last one is "unknown"
     cat_rank: Vec<u32>,      // index -> byte-wise rank among all names
     unknown_cat: u32,
-    camp_idx: Map<&'a [u8], u32>,
+    camp_idx: dims::Dimension<'a>,
     camp_names: Vec<&'a [u8]>,
     camp_channel: Vec<&'a [u8]>,
 }
@@ -121,8 +122,10 @@ fn read_small<'a>(prod: &'a [u8], camp: &'a [u8], pp: &Path, cp: &Path) -> Small
     let mut cat_id: HashMap<Vec<u8>, u32> = HashMap::new();
     let mut cat_names: Vec<Vec<u8>> = Vec::new();
     let mut product_cat = Map::with_hasher(rs());
+    let mut first_product = None;
     for c in chunks_of(prod, &["product_id", "category"], pp) {
         for_rows(&c, |r| {
+            first_product.get_or_insert(r[0]);
             let n = cat_names.len() as u32;
             let id = *cat_id.entry(r[1].to_vec()).or_insert_with(|| {
                 cat_names.push(r[1].to_vec());
@@ -140,21 +143,23 @@ fn read_small<'a>(prod: &'a [u8], camp: &'a [u8], pp: &Path, cp: &Path) -> Small
         cat_rank[i as usize] = rank as u32;
     }
     let mut camp_idx = Map::with_hasher(rs());
+    let mut first_campaign = None;
     let mut camp_names = Vec::new();
     let mut camp_channel = Vec::new();
     for c in chunks_of(camp, &["campaign_id", "channel"], cp) {
         for_rows(&c, |r| {
+            first_campaign.get_or_insert(r[0]);
             camp_idx.insert(r[0], camp_names.len() as u32);
             camp_names.push(r[0]);
             camp_channel.push(r[1]);
         });
     }
     Small {
-        product_cat,
+        product_cat: dims::Dimension::new(product_cat, first_product),
         cat_names,
         cat_rank,
         unknown_cat,
-        camp_idx,
+        camp_idx: dims::Dimension::new(camp_idx, first_campaign),
         camp_names,
         camp_channel,
     }
@@ -224,29 +229,59 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<
             packed: Vec::with_capacity(if packed { hint / 2 } else { 0 }),
         })
         .collect();
-    for_rows(c, |r| {
-        // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
-        let (cid, uid, camp) = (r[0], r[1], r[2]);
-        if cid.is_empty() || uid.is_empty() {
-            return;
-        }
-        let Some(&ci) = sm.camp_idx.get(camp) else { return };
-        let ts = parse_ts(r[3]);
-        if ts == BAD || ts < lo || ts >= we {
-            return;
-        }
-        let (dest, person) = match names.resolve(uid) {
+    #[derive(Clone, Copy, Default)]
+    struct PendingClick {
+        uid: u64,
+        hash: u64,
+        cid: u64,
+        ts: i64,
+        camp: u32,
+    }
+    let mut emit = |row: PendingClick| {
+        let (dest, person) = match names.lookup(row.uid, row.hash) {
             Identity::Linked(p) if packed => (&mut b[shard(p)].packed, u64::from(p as u32)),
             Identity::Linked(p) => (&mut b[shard(p)].wide, names.original(p as u32)),
             Identity::Standalone(p) => (&mut b[shard(p)].wide, p),
         };
         dest.push(PCl {
             person,
+            ts: row.ts,
+            cid: row.cid,
+            camp: row.camp,
+        });
+    };
+    let mut ring = [PendingClick::default(); 16];
+    let mut n = 0usize;
+    for_rows(c, |r| {
+        // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
+        let (cid, uid, camp) = (r[0], r[1], r[2]);
+        if cid.is_empty() || uid.is_empty() {
+            return;
+        }
+        let Some(ci) = sm.camp_idx.get(camp) else { return };
+        let ts = parse_ts(r[3]);
+        if ts == BAD || ts < lo || ts >= we {
+            return;
+        }
+        let key = names.codec.key(uid);
+        let hash = links::mix(key);
+        names.prefetch(hash);
+        let i = n % ring.len();
+        if n >= ring.len() {
+            emit(ring[i]);
+        }
+        ring[i] = PendingClick {
+            uid: key,
+            hash,
             ts,
             cid: names.codec.key(cid),
             camp: ci,
-        });
+        };
+        n += 1;
     });
+    for i in n.saturating_sub(ring.len())..n {
+        emit(ring[i % ring.len()]);
+    }
     b
 }
 

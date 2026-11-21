@@ -96,7 +96,7 @@ fn parse<'a>(
                 let cat = if price == 0 {
                     0
                 } else {
-                    *sm.product_cat.get(r[5]).unwrap_or(&sm.unknown_cat)
+                    sm.product_cat.get(r[5]).unwrap_or(sm.unknown_cat)
                 };
                 next.uid = people.codec.key(r[1]);
                 next.hash = links::mix(next.uid);

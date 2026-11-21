@@ -1,6 +1,6 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
-## Round 2 challenger: compact linked rank + purchase stream — 2026-11-20
+## Round 2 integration: compact streams, exact catalog index and click prefetch — 2026-11-20
 
 The link graph already assigns each exact ID a node. Reuse its canonical root
 index as an exact rank; when the manifest span and rank width fit, sort linked
@@ -14,10 +14,22 @@ either an event key or revenue. Only purchases carry price/category. Their
 timestamps still contribute one key apiece to the temporal sort; the session
 scan consumes all purchase records through each inclusive session-end key.
 Ties preserve event and purchase multiplicity and use the session start day.
-Both official dev checkers matched; 36/36 official fixtures for each
-implementation, 33/33 Python cases against both, 14 Rust tests, and 10/10
-kit-generated 20k-event differential seeds passed. Performance comparison is
-delegated to the parent A/B run.
+Malformed copies still emit no claims; well-formed invalid copies can suppress
+later valid copies.
+
+The catalog fast path only indexes canonical ASCII decimal suffixes under an
+input-derived size bound; all other spellings use the exact byte-keyed map. A
+16-row FIFO hides click-owner lookup latency without changing packed/wide
+routing. The packed width check accounts for the signed window span and leaves
+room for the removal sentinel.
+
+Separately, the compact streams (`e81c18d`) improved two-seed medians by
+5.5–7.3%, and the catalog and click changes (`1c57a0e`) by 4.6–5.2%.
+Neither result measures the combined binary.
+
+Combined: 34 Python cases and 36 official fixtures passed against each
+implementation, 16 Rust tests passed, and all 10 kit seeds matched. Both
+official dev checks matched; stdout stayed empty.
 
 ## Final-scale Docker check — 2026-11-21 04:57 UTC
 

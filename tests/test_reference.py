@@ -399,6 +399,42 @@ class Clicks(unittest.TestCase):
 
 
 class ByteDistinctIds(unittest.TestCase):
+    def test_dimension_spellings_and_pipelined_click_ties(self):
+        s = ms("2026-10-09T12:00:00Z")
+        products = ["p1,first", "p2,second", "p3,third", "p4,fourth", "p5,fifth", "p01,padded", "P1,upper",
+                    "p\u00e91,unicode", "p\x001,nul", "p999999999999999999999999999,large"]
+        campaigns = ["c_1,one", "c_2,two", "c_3,three", "c_4,four", "c_5,five", "c_01,padded", "C_1,upper",
+                     "c_\u00e91,unicode", "c_\x001,nul",
+                     "c_999999999999999999999999999,large"]
+        # More than one FIFO rotation, including external and zero-padded keys.
+        clicks = [f"z{i},alias,c_1,{s - HOUR}" for i in range(40)]
+        clicks += [f"\u00e9,user,c_2,{s - HOUR}", f"a\x00,alias,c_01,{s - HOUR}",
+                   f"a,alias,C_1,{s - HOUR}", f"b,user,c_\u00e91,{s - HOUR}",
+                   f"c,alias,c_\x001,{s - HOUR}",
+                   f"d,alias,c_999999999999999999999999999,{s - HOUR}",
+                   f"bad,alias,c_001,{s - HOUR}",
+                   f'0,alias,c_4,{s - HOUR},extra',  # malformed; would win the tie
+                   f'"a",alias,"C_1",{s - HOUR}',  # identical parsed copy
+                   f"solo,standalone,c_3,{s - HOUR}"]
+        events = [ev(f"e{i}", "user", str(s), "purchase", product, str(i + 1))
+                  for i, product in enumerate(("p1", "p2", "p01", "P1", "p\u00e91",
+                                                "p\x001", "p999999999999999999999999999", "p001"))]
+        events.append(ev("solo", "standalone", str(s)))
+        for window in ((WS, WE), ("0001-01-01T00:00:00Z", str(2**63 - 1))):
+            with self.subTest(window=window):
+                users, result = run_case(events=events, clicks=clicks, links=["user,alias"],
+                                         products=products, campaigns=campaigns, window=window)
+                day = "2026-10-09"
+                self.assertEqual(set(users), {("alias", day), ("standalone", day)})
+                self.assertEqual(users[("alias", day)]["top_category"], "unknown")
+                self.assertEqual(result[("C_1", day)]["sessions"], 1)
+                self.assertEqual(result[("c_3", day)]["sessions"], 1)
+                for campaign in ("c_1", "c_2", "c_01", "C_1", "c_\u00e91", "c_\x001",
+                                 "c_999999999999999999999999999"):
+                    self.assertEqual(result[(campaign, day)]["assisted_sessions"], 1)
+                self.assertNotIn(("c_001", day), result)
+                self.assertNotIn(("c_4", day), result)
+
     def test_lookalike_ids_and_lexical_click_tie(self):
         s = ms("2026-10-09T12:00:00Z")
         k = s - HOUR
