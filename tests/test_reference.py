@@ -90,6 +90,37 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_duplicate_winners_cross_typed_streams_and_canonical_owners(self):
+        stamp = "2026-10-03T10:00:00Z"
+        early = "2026-10-03T09:59:59Z"
+        later = "2026-10-03T10:00:01Z"
+        opaque = "different-id-\0é"
+        events = [
+            ev("event0001", "user00001", stamp, "purchase", "p1", "21", later),
+            ev("event0002", "wide", stamp, ingest=later),
+            ev("event0003", opaque, stamp, "purchase", "p2", "28", later),
+            ev("event0004", "user00002", stamp, ingest=later),
+            ev("event0005", "wide", stamp, "purchase", "p2", "37", later),
+            ev("event0006", "canonical", stamp, ingest=later),
+            ev("event0007", "user00001", stamp, "purchase", "p3", "11", early),
+        ]
+        copies = [
+            ev('"event0001"', "wide", stamp, ingest=early),
+            ev("event0002", "user00002", stamp, "purchase", "p3", "14", early),
+            ev("event0003", "", stamp, ingest=early),
+            ev("event0004", "wide", stamp, "purchase", "p2", "0", early),
+            ev("event0005", "user00001", stamp, price='mal"formed', ingest=early),
+            ev("event0006", "user00002", stamp, ingest=early),
+            ev('"event0007"', "user00001", stamp, "purchase", "p3", "11", early),
+            ev("event0003\0", opaque, stamp, "purchase", "p2", "5", early),
+        ]
+        users, _ = run_case(events, links=["user00001,canonical", "user00002,user00001"],
+                            extra={"events/part-1.csv": copies})
+        self.assertEqual({key[0]: (row["events"], row["revenue_cents"], row["top_category"])
+                          for key, row in users.items()},
+                         {"canonical": (3, 25, "bags"), "wide": (2, 37, "hats"),
+                          opaque: (1, 5, "hats")})
+
     def test_fixed_width_rows_prove_ignored_price_and_physical_line(self):
         stamp = "2026-10-03T10:00:00Z"
         early = "2026-10-03T09:59:59Z"

@@ -19,7 +19,7 @@ impl Packing {
     pub fn new(ws: i64, we: i64, ranks: usize) -> Option<Self> {
         let span = (we as i128 - ws as i128 - 1).try_into().ok()?;
         let bits = u64::BITS - u64::leading_zeros(span);
-        let rank_bits = usize::BITS - ranks.checked_sub(1)?.leading_zeros();
+        let rank_bits = usize::BITS - ranks.saturating_sub(1).leading_zeros();
         // The top bit stays clear, leaving u64::MAX as a tombstone.
         if bits + rank_bits >= u64::BITS {
             return None;

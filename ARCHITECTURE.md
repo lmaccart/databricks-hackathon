@@ -4,6 +4,8 @@ The scored v1 (`cc9f33e`, 5.03 s) sent every parsed event through an event-ID ha
 
 `events/word.rs` handles common rows whose header order, field boundaries, quoting, and typed values it can prove from bounded byte loads. Its ID load both validates the spelling and produces the exact inline token. A failed guard retries from the start of that physical line with the strict CSV scanner; noncanonical headers use the normal mapped-column path for the whole chunk. Both paths emit the same claim and tentative payload.
 
+The contiguous radix experiment (`events/radix.rs`) consumes that same typed input. For a representable window and catalog, each chunk appends complete 32-byte records and builds an event-ID radix histogram. Histograms assign disjoint slices of each event-ID bucket to the chunk writers. Each bucket finds the globally earliest claim for its exact IDs; well-formed invalid winners still suppress all later copies. Local survivor counts give those buckets disjoint ranges in the four typed owner streams. The session worker can sort those buffers in place without gathering per-chunk payloads. Too-wide windows or catalogs use the separate claim/payload path described below.
+
 ```text
 manifest, products, campaigns ────────────────► windows and dimension lookups
 links ─► exact ID keys ─► parallel union-find ─► immutable ID → canonical person

@@ -4,6 +4,7 @@
 use super::*;
 use std::hash::{BuildHasherDefault, Hasher};
 
+mod radix;
 mod word;
 
 #[derive(Clone, Copy)]
@@ -203,21 +204,20 @@ fn parse<'a>(
 }
 
 #[inline]
-fn probe_index(c: Claim, mask: usize) -> usize {
-    // The mask excludes the colocated payload-shard byte.
-    c.key_and_target as usize & mask
+fn probe_index(key: u64, mask: usize) -> usize {
+    // The claim path's mask excludes the colocated payload-shard byte.
+    key as usize & mask
 }
 
 #[inline]
-fn probe(c: Claim, mask: usize) -> (usize, u64) {
-    let k = c.key_and_target;
+fn probe(k: u64, mask: usize) -> (usize, u64) {
     let bits = 1u64.rotate_left((k >> 36) as u32) | 1u64.rotate_left((k >> 42) as u32);
-    (probe_index(c, mask), bits)
+    (probe_index(k, mask), bits)
 }
 
 #[inline]
-fn prefetch(bloom: &[(u64, u64)], c: Claim, mask: usize) {
-    let ptr: *const (u64, u64) = &bloom[probe_index(c, mask)];
+fn prefetch(bloom: &[(u64, u64)], key: u64, mask: usize) {
+    let ptr: *const (u64, u64) = &bloom[probe_index(key, mask)];
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
@@ -245,9 +245,9 @@ fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location>
     for (_, claims) in &parts {
         for (j, &c) in claims.iter().enumerate() {
             if let Some(&next) = claims.get(j + 6) {
-                prefetch(&bloom, next, mask);
+                prefetch(&bloom, next.key_and_target, mask);
             }
-            let (i, b) = probe(c, mask);
+            let (i, b) = probe(c.key_and_target, mask);
             let (seen, repeated) = &mut bloom[i];
             if *seen & b == b {
                 *repeated |= b;
@@ -264,9 +264,9 @@ fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location>
     for (batch, claims) in parts {
         for (j, &c) in claims.iter().enumerate() {
             if let Some(&next) = claims.get(j + 6) {
-                prefetch(&bloom, next, mask);
+                prefetch(&bloom, next.key_and_target, mask);
             }
-            let (i, b) = probe(c, mask);
+            let (i, b) = probe(c.key_and_target, mask);
             if bloom[i].1 & b != b {
                 continue;
             }
@@ -297,6 +297,24 @@ fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location>
 }
 
 pub(super) fn by_person<'a>(
+    chunks: &[Chunk<'a>],
+    sm: &Small,
+    people: &People<'a>,
+    window: (i64, i64, &ManifestClock),
+    packing: Option<Packing>,
+    log: &impl Fn(&str),
+) -> Vec<Vec<Payload>> {
+    let (ws, we, _) = window;
+    if let Some(pack) = packing
+        && (1..=(1i128 << 32)).contains(&(we as i128 - ws as i128))
+        && sm.cat_names.len() <= 1 << 31
+    {
+        return vec![radix::by_person(chunks, sm, people, window, pack, log)];
+    }
+    claims_by_person(chunks, sm, people, window, packing, log)
+}
+
+fn claims_by_person<'a>(
     chunks: &[Chunk<'a>],
     sm: &Small,
     people: &People<'a>,
@@ -365,7 +383,7 @@ mod tests {
         let alias = id ^ (1 << 24);
         let later = Claim::new(id, 0, 3);
         let distinct = Claim::new(alias, 1, 4);
-        assert_eq!(probe(later, 1023), probe(distinct, 1023));
+        assert_eq!(probe(later.key_and_target, 1023), probe(distinct.key_and_target, 1023));
         let mut spill = Vec::new();
         let invalid = Claim::new(id, NONE, Claim::order(1234, BAD, &mut spill));
         let lost = losers(vec![(0, vec![later, distinct]), (1, vec![invalid])], &[vec![], spill]);

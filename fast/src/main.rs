@@ -329,7 +329,7 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
 }
 
 fn process_stream<T: Temporal>(
-    pieces: Vec<Stream<T>>,
+    mut pieces: Vec<Stream<T>>,
     mut cls: Vec<PCl>,
     sm: &Small,
     people: &People,
@@ -341,13 +341,20 @@ fn process_stream<T: Temporal>(
     if ne == 0 {
         return;
     }
-    let mut evs = Vec::with_capacity(ne);
-    let mut purchases = Vec::with_capacity(np);
-    for s in pieces {
-        evs.extend_from_slice(&s.times);
-        evs.extend(s.purchases.iter().map(|p| p.key));
-        purchases.extend_from_slice(&s.purchases);
-    }
+    let (mut evs, mut purchases) = if pieces.len() == 1 {
+        let mut s = pieces.pop().unwrap();
+        s.times.extend(s.purchases.iter().map(|p| p.key));
+        (s.times, s.purchases)
+    } else {
+        let mut evs = Vec::with_capacity(ne);
+        let mut purchases = Vec::with_capacity(np);
+        for s in pieces {
+            evs.extend_from_slice(&s.times);
+            evs.extend(s.purchases.iter().map(|p| p.key));
+            purchases.extend_from_slice(&s.purchases);
+        }
+        (evs, purchases)
+    };
     evs.sort_unstable();
     purchases.sort_unstable_by_key(|p| p.key);
     cls.sort_unstable_by_key(|c| (c.person, c.ts));

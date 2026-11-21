@@ -1,5 +1,19 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round four: contiguous event-ID radix challenger — 2026-11-21
+
+Against `dfbd330`, tested a 32-byte typed record rather than separate claims and tentative payload buckets. Each chunk appends records contiguously, histograms their event-ID radix, and scatters them into disjoint ranges. Bucket-local exact minimum-ingest selection counts surviving packed/wide events and purchases. A second prefix allocation writes those survivors into the final owner buffers. This path never rereads raw CSV or follows a full-size vector of source locators. Only exceptional ingest values need a side table. Wide windows and large category counts retain the control path.
+
+Native M2 Pro, eight workers, alternating whole-process pairs after warmup. These are fresh inputs and local elapsed times, **not an organizer score**:
+
+| Input (events + clicks) | Seed | Pairs | `dfbd330` → radix median | Radix pair wins |
+|---|---:|---:|---:|---:|
+| 4M + 1M (first pass) | 8753029 | 5 | 0.226 → 0.236 s | 3/5 |
+| 4M + 1M (repeat) | 8753029 | 7 | 0.451 → 0.398 s | 5/7 |
+| 8M + 2M | 5348912 | 7 | 0.741 → 0.764 s | 4/7 |
+
+The timing direction is not stable; do not promote over the control on this evidence. On 8M the paired savings ranged from −28.3% to +27.8%. A separate matched-output run had 906,584 user-day rows and 28,014 campaign-day rows, with no differences or stdout; peak RSS was 1.44 → 1.28 GB (single run per binary). Both dev comparers, 36/36 fixtures, 40 edge tests, 22 Rust tests, ten fresh kit seeds, three fresh official-generator cases, and 7,254 competing grammar mutations at one and eight workers passed. The new tests specifically mix linked/standalone and purchase/nonpurchase duplicates, invalid earliest copies, malformed earlier rows, a forced Bloom alias and cross-chunk ingest spills.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).
