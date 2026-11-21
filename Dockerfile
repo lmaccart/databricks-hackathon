@@ -11,4 +11,6 @@ FROM --platform=linux/amd64 debian:bookworm-slim
 COPY --from=build /src/target/release/shopping_sessions /usr/local/bin/shopping_sessions
 USER 1000
 ENV DATA_DIR=/data OUTPUT_DIR=/output
+# Trial: keep purge regions aligned to the configured transparent huge page size.
+ENV MIMALLOC_ALLOW_THP=2
 ENTRYPOINT ["/usr/local/bin/shopping_sessions"]
