@@ -343,6 +343,32 @@ class Clicks(unittest.TestCase):
 
 
 class ByteDistinctIds(unittest.TestCase):
+    def test_dimension_spellings_and_pipelined_click_ties(self):
+        s = ms("2026-10-09T12:00:00Z")
+        products = ["p1,first", "p2,second", "p01,padded", "P1,upper",
+                    "p\u00e91,unicode", "p\x001,nul", "p999999999999999999999999999,large"]
+        campaigns = ["c_1,one", "c_2,two", "c_01,padded", "C_1,upper",
+                     "c_\u00e91,unicode", "c_\x001,nul",
+                     "c_999999999999999999999999999,large"]
+        # More than one FIFO rotation, including external and zero-padded keys.
+        clicks = [f"z{i},user,c_1,{s - HOUR}" for i in range(40)]
+        clicks += [f"\u00e9,user,c_2,{s - HOUR}", f"a\x00,user,c_01,{s - HOUR}",
+                   f"a,user,C_1,{s - HOUR}", f"b,user,c_\u00e91,{s - HOUR}",
+                   f"c,user,c_\x001,{s - HOUR}",
+                   f"d,user,c_999999999999999999999999999,{s - HOUR}",
+                   f"bad,user,c_001,{s - HOUR}"]
+        events = [ev(f"e{i}", "user", str(s), "purchase", product, str(i + 1))
+                  for i, product in enumerate(("p1", "p2", "p01", "P1", "p\u00e91",
+                                                "p\x001", "p999999999999999999999999999", "p001"))]
+        users, result = run_case(events=events, clicks=clicks, products=products, campaigns=campaigns)
+        day = "2026-10-09"
+        self.assertEqual(users[("user", day)]["top_category"], "unknown")
+        self.assertEqual(result[("C_1", day)]["sessions"], 1)
+        for campaign in ("c_1", "c_2", "c_01", "C_1", "c_\u00e91", "c_\x001",
+                         "c_999999999999999999999999999"):
+            self.assertEqual(result[(campaign, day)]["assisted_sessions"], 1)
+        self.assertNotIn(("c_001", day), result)
+
     def test_lookalike_ids_and_lexical_click_tie(self):
         s = ms("2026-10-09T12:00:00Z")
         k = s - HOUR
