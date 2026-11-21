@@ -233,6 +233,8 @@ jobs:
           git show "$GITHUB_SHA:tools/official_diff.py" >tools/ci_oracle_diff.py
           RAYON_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 "$RUNNER_TEMP/venv/bin/python" tools/ci_oracle_diff.py \
             --generator "$RUNNER_TEMP/generator/target/release/generate" --binary "$RUNNER_TEMP/candidate" --jobs 2
+          git show "$GITHUB_SHA:tools/grammar_diff.py" >tools/ci_grammar_diff.py
+          "$RUNNER_TEMP/venv/bin/python" tools/ci_grammar_diff.py "$RUNNER_TEMP/candidate"
           echo '### Python oracle: all 60 generated cases matched on native amd64' >>"$GITHUB_STEP_SUMMARY"
       - name: Compare the actual scorer images on native Linux
         if: ${{ inputs.containers || github.ref_name == 'bench/container' || github.ref_name == 'bench/scale' }}
