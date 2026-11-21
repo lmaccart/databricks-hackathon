@@ -257,6 +257,8 @@ jobs:
           "$RUNNER_TEMP/venv/bin/python" tools/ci_grammar_diff.py "$RUNNER_TEMP/candidate"
           git show "$GITHUB_SHA:tools/opaque_diff.py" >tools/ci_opaque_diff.py
           "$RUNNER_TEMP/venv/bin/python" tools/ci_opaque_diff.py "$RUNNER_TEMP/dev" "$RUNNER_TEMP/candidate"
+          git show "$GITHUB_SHA:tools/graph_diff.py" >tools/ci_graph_diff.py
+          "$RUNNER_TEMP/venv/bin/python" tools/ci_graph_diff.py "$RUNNER_TEMP/candidate"
           echo '### Python oracle: all 60 generated cases matched on native amd64' >>"$GITHUB_STEP_SUMMARY"
       - name: Compare the actual scorer images on native Linux
         if: ${{ inputs.containers || github.ref_name == 'bench/container' || github.ref_name == 'bench/scale' }}

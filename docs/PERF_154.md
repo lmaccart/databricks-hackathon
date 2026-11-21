@@ -47,9 +47,35 @@ Each row uses five alternating whole-process pairs per seed. Compare **across th
 | [Exact base-36 standalone key plus timestamp](https://github.com/lmaccart/databricks-hackathon/actions/runs/44934323811) | 1.460 → 1.546 | 1.427 → 1.500 |
 | [12-byte claims with window-relative seconds and lossless escapes](https://github.com/lmaccart/databricks-hackathon/actions/runs/44934368753) | 1.663 → 1.669 | 1.620 → 1.647 |
 | [Build-time LLVM PGO trained on three synthetic layouts](https://github.com/lmaccart/databricks-hackathon/actions/runs/44934102542) | 1.730 → 1.833 | 1.668 → 1.778 |
+| [One physical slot for graph construction, ownership and sort rank](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935176864) | 1.700 → **1.589** | 1.644 → **1.549** |
+| [Highway vector sort, exact wide and compact keys](https://github.com/lmaccart/databricks-hackathon/actions/runs/44934661503) | 1.659 → 1.559 | 1.615 → 1.622 |
+| [SSSE3 timestamp digit-pair dot products](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935024259) | 2.084 → 2.097 | 2.059 → 2.061 |
+| [Two-extent bucket-owner peeling before exact dedup](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935456488) | 1.692 → 1.768 | 1.650 → 1.711 |
+| [Fold union components locally, then resolve bridges](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935516680) | 1.685 → 1.796 | 1.626 → 1.724 |
+| [Find newlines ahead and decode the tail backwards](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935522155) | 1.709 → 1.818 | 1.683 → 1.784 |
+| [Prove both common-width ID addresses concurrently](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935548399) | 1.650 → 1.659 | 1.630 → 1.623 |
+| [Overlap Linux `MADV_POPULATE_READ` with link-graph work](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935576835) | 2.078 → 2.131 | 2.074 → 2.127 |
+| [Direct per-person temporal ranges, vs first singleton ranks `a32d0b7`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935266183) | 1.651 → **1.594** | 1.631 → **1.591** |
+| [Timestamp-run click winners plus distinct assisting campaigns, vs `a32d0b7`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935456168) | 1.667 → 1.660 | 1.665 → 1.658 |
+| [Pooled payload and claim pages, vs `4ad0e5d`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935576863) | 1.552 → 1.540 | 1.559 → 1.562 |
+| [Encode a guaranteed session gap between consecutive ranks, vs `4933dbe`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935698391) | 1.531 → 1.547 | 1.486 → 1.495 |
 
 The column writer won **10/10** pairs and cut the seed-7 output stage from 0.094 to 0.054 s. It emits each person's spelling once per run, carries typed numeric columns directly from session aggregation, and encodes nullable categories with bounded dictionaries. Singleton ranks won **9/10**; their strongest effect was in sessions (0.456 → 0.427 s on seed 7). A singleton can claim a previously empty slot only by comparing its full exact ID; occupants never move and a collision retains the full-width key.
 
 The radix rewrite removed work from the initial parse/route phase (0.727 → 0.639 s) and session pass (0.454 → 0.390 s), but its additional grouping/coalescing passes cost more than that saved. The suffix motif hit almost 97% of dev rows and nevertheless regressed on both practice seeds. An isolated 1M-event 32-bit time-bin prototype also lost 14–19% against exact temporal sorting; it did not reach an end-to-end trial.
 
 For PGO the workflow extracted and timed the trained executable actually shipped by the image. The candidate built in 73 s on this runner, passed 60 Python comparisons and matched all 6,615,971 final-scale rows. It lost **every** pair, including 1.789 → 1.897 s in full practice Docker and 5.463 → 5.725 s at 60M. The event parse/route regression outweighed the smaller gain on clicks.
+
+## Component head-to-heads in the restricted container
+
+Each row compares a component with and without the other change on the **same** runner, at 20M (five pairs) and 60M (three pairs, no swap). The Highway package uses the same `libhwy` in host-native and container tests.
+
+| Trial (baseline → candidate) | 20M Docker | 60M Docker |
+|---|---:|---:|
+| [First-slot ranks → first-slot ranks + columns (`4ad0e5d`)](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935189493) | 2.482 → **2.372** | 7.736 → **7.438** |
+| [Columns → columns + first-slot ranks](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935189403) | 2.360 → 2.361 | 6.843 → 6.850 |
+| [First-slot ranks + columns → physical graph slots + columns (`4933dbe`)](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935485266) | 1.729 → **1.681** | 5.170 → **4.994** |
+| [Physical graph slots → physical graph slots + columns](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935485357) | 1.697 → **1.642** | 5.335 → **5.007** |
+| [Scored control → Highway vector sort](https://github.com/lmaccart/databricks-hackathon/actions/runs/44934661503) | 2.026 → 1.975 | 6.208 → 6.274 |
+
+The initial singleton technique by itself added almost nothing to the columns in the two full-Docker comparisons on the Xeon 8370C. Replacing the graph construction as well made a measurable difference on the 6975P-C: every pair favored physical slots, including all three final-scale pairs. Keeping a slot as the union node eliminates endpoint sorting/deduplication and gives the parser a direct rank to write.
