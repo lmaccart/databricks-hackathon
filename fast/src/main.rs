@@ -535,37 +535,51 @@ fn main() {
     let cf = File::open(data.join("campaigns.csv")).expect("campaigns.csv");
     let pm = unsafe { Mmap::map(&pf).unwrap() };
     let cm = unsafe { Mmap::map(&cf).unwrap() };
-    let sm = read_small(&pm, &cm, &data.join("products.csv"), &data.join("campaigns.csv"));
-
-    let link_files = mmap_files(&data.join("links"));
-    let event_files = mmap_files(&data.join("events"));
-    let click_files = mmap_files(&data.join("clicks"));
-    let link_chunks = chunks_for(&link_files, &["user_id_a", "user_id_b"]);
-    let ev_chunks = chunks_for(
-        &event_files,
-        &[
-            "event_id",
-            "user_id",
-            "ts",
-            "ingest_ts",
-            "event_type",
-            "product_id",
-            "price_cents",
-        ],
+    let (link_files, (event_files, click_files)) = rayon::join(
+        || mmap_files(&data.join("links")),
+        || rayon::join(|| mmap_files(&data.join("events")), || mmap_files(&data.join("clicks"))),
     );
-    let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
-    let names = person_names(&link_chunks);
+    let (names, (sm, (ev_chunks, cl_chunks))) = rayon::join(
+        || person_names(&chunks_for(&link_files, &["user_id_a", "user_id_b"])),
+        || {
+            rayon::join(
+                || read_small(&pm, &cm, &data.join("products.csv"), &data.join("campaigns.csv")),
+                || {
+                    rayon::join(
+                        || {
+                            chunks_for(
+                                &event_files,
+                                &[
+                                    "event_id",
+                                    "user_id",
+                                    "ts",
+                                    "ingest_ts",
+                                    "event_type",
+                                    "product_id",
+                                    "price_cents",
+                                ],
+                            )
+                        },
+                        || chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]),
+                    )
+                },
+            )
+        },
+    );
     let packing = Packing::new(ws, we, names.count);
     log(&format!("links: {} linked ids", names.count));
 
-    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, &log);
-    log("events deduped");
-
-    let cl_by_person = cl_chunks
-        .par_iter()
-        .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names, packing.is_some()))
-        .collect();
-    log("clicks routed");
+    // Clicks depend on the completed link graph, not on the event winner.
+    let (ev_by_person, cl_by_person) = rayon::join(
+        || events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, &log),
+        || {
+            cl_chunks
+                .par_iter()
+                .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names, packing.is_some()))
+                .collect()
+        },
+    );
+    log("events deduped and clicks routed");
 
     let len =
         |e: &Payload| e.packed.times.len() + e.packed.purchases.len() + e.wide.times.len() + e.wide.purchases.len();
