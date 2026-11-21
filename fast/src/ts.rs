@@ -212,6 +212,26 @@ pub struct ManifestClock {
 }
 
 impl ManifestClock {
+    /// Look up a register-gathered F1 date after the caller validates HMS.
+    /// A miss does not imply an invalid date; the caller uses the full parser.
+    #[cfg(any(target_arch = "x86_64", test, feature = "event-gather-model"))]
+    #[inline]
+    pub fn gathered_f1(&self, first: u64, last: u16, ddhhmmss: u64) -> Option<i64> {
+        let day = ddhhmmss as u16;
+        let h = (ddhhmmss >> 16) as u16;
+        let m = (ddhhmmss >> 32) as u16;
+        let s = (ddhhmmss >> 48) as u16;
+        if h > 23 || m > 59 || s > 59 {
+            return None;
+        }
+        for entry in self.days.get(day as usize)? {
+            if first == entry.first && last == entry.last {
+                return Some(entry.midnight_seconds + i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(s));
+            }
+        }
+        None
+    }
+
     pub fn new(ws: i64, we: i64) -> Self {
         const DAY: i64 = 86_400_000;
         const LIMIT: i64 = 256;

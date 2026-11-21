@@ -90,6 +90,22 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_cross_field_quotes_do_not_make_a_claim(self):
+        ts = "2026-10-02T10:00:00Z"
+        early = "2026-10-02T09:59:59Z"
+        long_price = "0" * 128 + "7"
+        users, _ = run_case(events=[
+            # Each quote is at an endpoint, but not of the same field.
+            f'keep,"owner,{ts}",{early},purchase,p1,99',
+            ev('"remove"', '"owner"', '"123foo4567890"', ingest=f'"{early}"'),
+            # Overlong rows use the old scanner; their ID keys must agree.
+            ev("keep", "owner", ts, "purchase", price=long_price, ingest=ts),
+            ev("remove", "owner", ts, "purchase", price=long_price, ingest=ts),
+            ev("count", "owner", f'"{ms(ts)}"', ingest=ts),
+        ])
+        row = users[("owner", "2026-10-02")]
+        self.assertEqual((row["events"], row["revenue_cents"]), (2, 7))
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"

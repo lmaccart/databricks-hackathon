@@ -2,6 +2,7 @@
 //! stream of claims (ID, ingest time, payload location) decides which payloads
 //! must be removed. In particular, an invalid copy has a claim but no payload.
 use super::*;
+use crate::event_gather::for_events;
 use std::hash::{BuildHasherDefault, Hasher};
 
 #[derive(Clone, Copy)]
@@ -143,22 +144,19 @@ fn parse<'a>(
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
-    for_rows(c, |r| {
-        if r[0].is_empty() {
-            return;
-        }
-        let claim_key = links::mix(people.codec.key(r[0]));
-        let (ingest, seconds) = clock.ingest_for_claim(r[3]);
-        let ts = clock.parse_ts(r[2]);
+    for_events(c, clock, |r| {
+        let claim_key = links::mix(r.event.key(&people.codec));
+        let (ingest, seconds) = r.ingest;
+        let ts = r.ts;
         let mut next = Pending {
             claim_key,
             ts,
             claim_order: Claim::order(ingest, seconds, &mut spill),
             ..Default::default()
         };
-        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
-            let purchase = match r[4] {
-                b"purchase" => parse_price(r[6]),
+        if !r.user.is_empty() && !r.product.is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
+            let purchase = match r.kind {
+                b"purchase" => parse_price(r.price),
                 b"view" | b"cart" => Some(0),
                 _ => None,
             };
@@ -166,9 +164,9 @@ fn parse<'a>(
                 let cat = if price == 0 {
                     0
                 } else {
-                    sm.product_cat.get(r[5]).unwrap_or(sm.unknown_cat)
+                    sm.product_cat.get(r.product).unwrap_or(sm.unknown_cat)
                 };
-                next.uid = people.codec.key(r[1]);
+                next.uid = r.user.key(&people.codec);
                 next.hash = links::mix(next.uid);
                 people.prefetch(next.hash);
                 next.price = price;

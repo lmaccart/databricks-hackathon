@@ -1,5 +1,24 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 3 experiment: register-gathered event rows — 2026-11-21
+
+This candidate uses the same production baseline as `9758471`. On x86-64,
+`avx512vbmi` + `avx512bw` + `bmi2` + `popcnt` enable the new path once per
+canonical event chunk. One bounded 128-byte load pair supplies the structural
+masks and the byte-permutation table. Quote endpoints must pair within each
+field. The gathered row supplies exact inline ID keys, manifest-clock F1
+seconds, and 13-digit F3 milliseconds. Unusual fields, noncanonical headers,
+short tails, and overlong rows use the existing routines. No semantic change.
+
+The ARM `event-gather-model` build exercises the shared layout and typed
+decoder end-to-end. Both dev checkers matched (117,038 user-days and 27,400
+campaign-days), as did all 36 fixtures, 10 kit dirty seeds, 10 small official
+generator cases including seed 15 (leap day), and 39 Python edge cases.
+The 22 Rust tests include all quote combinations, byte mutations, bounds
+cases and assertions that the typed path fires on both sides of byte 64.
+Linux/x86-64 code cross-checked with Cargo `-Z build-std`; native instruction
+execution and performance remain for the x86 benchmark host.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

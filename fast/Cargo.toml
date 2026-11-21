@@ -3,6 +3,10 @@ name = "shopping_sessions"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Exercise the complete gather path without an x86 VBMI host.
+event-gather-model = []
+
 [dependencies]
 ahash = "0.8.12"
 bytes = "1"

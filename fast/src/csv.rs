@@ -34,6 +34,24 @@ pub struct Chunk<'a> {
     idx: [usize; 8],
 }
 
+#[cfg(any(target_arch = "x86_64", test, feature = "event-gather-model"))]
+impl Chunk<'_> {
+    #[cfg(any(target_arch = "x86_64", feature = "event-gather-model"))]
+    pub fn canonical_events(&self) -> bool {
+        self.nfields == 7 && self.ncols == 7 && self.idx[..7] == [0, 1, 2, 3, 4, 5, 6]
+    }
+
+    /// A one-line/tail chunk has the same header mapping as its source.
+    pub fn subchunk<'a>(&self, data: &'a [u8]) -> Chunk<'a> {
+        Chunk {
+            data,
+            nfields: self.nfields,
+            ncols: self.ncols,
+            idx: self.idx,
+        }
+    }
+}
+
 pub fn chunks_of<'a>(file: &'a [u8], cols: &[&str], path: &Path) -> Vec<Chunk<'a>> {
     chunks_sized(file, cols, path, crate::CHUNK)
 }
