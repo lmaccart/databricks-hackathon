@@ -22,6 +22,7 @@ mod dims;
 mod events;
 mod links;
 mod output;
+mod permutation;
 mod person;
 use links::{People, person_names};
 use person::Codec;
@@ -32,6 +33,7 @@ const WEEK: i64 = 7 * DAY;
 const BAD: i64 = i64::MIN;
 const MAX_PRICE: i64 = 10_000_000;
 const NS: usize = 256; // shards for every hash partition
+const SHARD_SHIFT: u32 = 40;
 const CHUNK: usize = 8 << 20; // bytes per parse task
 const ORGANIC: u32 = u32::MAX;
 
@@ -47,7 +49,7 @@ mod csv;
 mod ts;
 
 use csv::{Chunk, chunks_of, for_rows};
-use ts::{parse_ingest, parse_ts};
+use ts::{DayCache, parse_ts, parse_ts_cached};
 
 // ------------------------------------------------------------------ prices
 
@@ -182,7 +184,7 @@ struct PCl {
 
 #[inline]
 fn shard(h: u64) -> usize {
-    ((h >> 40) as usize) % NS
+    ((h >> SHARD_SHIFT) as usize) % NS
 }
 
 // A small live sample is only an allocation hint. Vectors still grow normally
@@ -242,6 +244,7 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<
     };
     let mut ring = [PendingClick::default(); 16];
     let mut n = 0usize;
+    let mut days = DayCache::new();
     for_rows(c, |r| {
         // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
         let (cid, uid, camp) = (r[0], r[1], r[2]);
@@ -249,7 +252,7 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, lo: i64, we: i64, names: &People<
             return;
         }
         let Some(ci) = sm.camp_idx.get(camp) else { return };
-        let ts = parse_ts(r[3]);
+        let ts = parse_ts_cached(r[3], &mut days);
         if ts == BAD || ts < lo || ts >= we {
             return;
         }
@@ -311,9 +314,7 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
     best.map(|b| b as u32)
 }
 
-fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small, codec: &Codec) -> ShardOut {
-    evs.sort_unstable_by_key(|e| (e.person, e.ts));
-    cls.sort_unstable_by_key(|c| (c.person, c.ts));
+fn process_shard(evs: Vec<PEv>, cls: Vec<PCl>, sm: &Small, codec: &Codec) -> ShardOut {
     let ncamp = sm.camp_names.len();
     let mut users = Vec::new();
     let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
@@ -512,7 +513,11 @@ fn main() {
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(gather(e), gather(c), &sm, &names.codec))
+        .map(|(e, c)| {
+            let evs = permutation::gather_sorted(e, ws, we - 1, |e| (e.person, e.ts));
+            let cls = permutation::gather_sorted(c, ws - WEEK, we - 1, |c| (c.person, c.ts));
+            process_shard(evs, cls, &sm, &names.codec)
+        })
         .collect();
     log("sessions done");
 
