@@ -46,6 +46,8 @@ Adding exact owner lookup cost about 83 ms in this comparison; writing the two s
 
 Each row uses five alternating whole-process pairs per seed. Compare **across the arrow**, not across rows: hosts range from AMD EPYC to different Intel Xeons. A successful challenge also checks the official dev answer, 36 fixtures, both 20M outputs row-for-row and the native Rust tests. `+` savings in the subsequent text means **less elapsed time**.
 
+[Complete run ledger with commit IDs, CPUs, Docker timings and pair counts](PERF_154_RUNS.md).
+
 | Candidate and run | Seed 7: control → trial | Seed 15: control → trial |
 |---|---:|---:|
 | [Claim empty alias slots for exact singleton sort ranks](https://github.com/lmaccart/databricks-hackathon/actions/runs/44933922444) | 1.683 → **1.636** | 1.653 → **1.612** |
@@ -98,6 +100,10 @@ Each row compares a component with and without the other change on the **same** 
 | [Scored control → slot-based union + columns, AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935468450) | 2.258 → **2.096** | 6.870 → **6.332** |
 | [Scored control → slot-based union, direct time ranges and columns (`0558eaa`), AMD EPYC 9V45](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935810599) | 1.792 → **1.617** | 5.451 → **4.618** |
 | [Add direct per-person ranges to `4933dbe`, AMD EPYC 9V74](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935810612) | 2.042 → **1.968** | 5.917 → **5.734** |
+| [Scored control → physical graph slots + columns, independent Intel repeat](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936040920) | 1.816 → **1.651** | 5.336 → **4.852** |
+| [Size event buffers from live data on top of `4933dbe`, Intel repeat](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936299795) | 1.585 → 1.563 | 4.719 → 4.663 |
+| [Add the same buffer sizing to direct ranges](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936375552) | 1.602 → 1.593 | 4.779 → 4.719 |
+| [First-slot ranks + columns → add worker-local campaign/day counts, Xeon 8370C](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936299807) | 2.281 → **2.090** | 6.923 → **6.480** |
 
 The initial singleton technique by itself added almost nothing to the columns in the two full-Docker comparisons on the Xeon 8370C. Replacing the graph construction as well made a measurable difference on the 6975P-C: every pair favored physical slots, including all three final-scale pairs. Keeping a slot as the union node eliminates endpoint sorting/deduplication and gives the parser a direct rank to write.
 
