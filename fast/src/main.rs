@@ -376,10 +376,6 @@ fn process_stream<T: Temporal>(
     while i < evs.len() {
         let rank = evs[i].person(layout);
         let person = T::name(rank, people);
-        let mut j = i;
-        while j < evs.len() && evs[j].person(layout) == rank {
-            j += 1;
-        }
         while ci < cls.len() && cls[ci].person < rank {
             ci += 1;
         }
@@ -395,11 +391,11 @@ fn process_stream<T: Temporal>(
         let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
 
         let mut k = i;
-        while k < j {
+        loop {
             // one session is evs[k..m]
             let start = evs[k].ts(layout);
             let mut m = k + 1;
-            while m < j && evs[m].gap(evs[m - 1]) <= GAP as u64 {
+            while m < evs.len() && evs[m].connected(evs[m - 1]) {
                 m += 1;
             }
             let day = start.div_euclid(DAY) as i32;
@@ -467,6 +463,9 @@ fn process_stream<T: Temporal>(
                 camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
             }
             k = m;
+            if k == evs.len() || evs[k].person(layout) != rank {
+                break;
+            }
         }
         finish_user_day(users, cur_day, d_sess, d_ev, d_rev, &mut catsum, &sm.cat_rank);
         users.finish_person(person);
@@ -474,7 +473,7 @@ fn process_stream<T: Temporal>(
             cnt[a as usize] = 0;
         }
         active.clear();
-        i = j;
+        i = k;
     }
     debug_assert_eq!(pi, np);
 }

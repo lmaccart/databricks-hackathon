@@ -17,7 +17,9 @@ pub(super) struct Packing {
 
 impl Packing {
     pub fn new(ws: i64, we: i64, ranks: usize) -> Option<Self> {
-        let span = (we as i128 - ws as i128 - 1).try_into().ok()?;
+        let span = u64::try_from(we as i128 - ws as i128 - 1)
+            .ok()?
+            .checked_add(crate::GAP as u64)?;
         let bits = u64::BITS - u64::leading_zeros(span);
         let rank_bits = usize::BITS - ranks.checked_sub(1)?.leading_zeros();
         // The top bit stays clear, leaving u64::MAX as a tombstone.
@@ -43,6 +45,7 @@ pub(super) trait Temporal: Copy + Ord {
     fn ts(self, layout: Self::Layout) -> i64;
     // Only compared within one person's ordered keys.
     fn gap(self, prev: Self) -> u64;
+    fn connected(self, prev: Self) -> bool;
     fn name(person: u64, people: &People) -> u64;
 }
 
@@ -62,6 +65,11 @@ impl Temporal for Wide {
     #[inline]
     fn gap(self, prev: Self) -> u64 {
         self.ts.abs_diff(prev.ts)
+    }
+
+    #[inline]
+    fn connected(self, prev: Self) -> bool {
+        self.person == prev.person && self.gap(prev) <= crate::GAP as u64
     }
 
     #[inline]
@@ -86,6 +94,13 @@ impl Temporal for u64 {
     #[inline]
     fn gap(self, prev: Self) -> u64 {
         self - prev
+    }
+
+    #[inline]
+    fn connected(self, prev: Self) -> bool {
+        // The unused interval at the end of each rank is at least GAP:
+        // the first timestamp of any other person always breaks the run.
+        self.gap(prev) <= crate::GAP as u64
     }
 
     #[inline]
@@ -167,6 +182,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn adjacent_people_never_share_a_packed_session_at_stride_edges() {
+        for span in [1, 128, 1_800_000, 1_800_001, 1 << 24, 1 << 31] {
+            let lo = -1_000_000;
+            let p = Packing::new(lo, lo + span, 4).unwrap();
+            let a = p.encode(1, lo + span - 1);
+            let b = p.encode(2, lo);
+            assert!(b - a > crate::GAP as u64);
+        }
+    }
+
+    #[test]
     fn packing_checks_total_width_and_preserves_signed_millisecond_order() {
         let p = Packing::new(-5000, 5000, 4).unwrap();
         assert!(p.encode(1, -5000) > p.encode(0, 4999));
@@ -176,10 +202,8 @@ mod tests {
         assert_eq!(p.encode(3, 4999).person(p), 3);
         assert!(Packing::new(i64::MIN + 1, i64::MAX, 4).is_none());
         assert!(Packing::new(0, 1i64 << 48, 1 << 17).is_none());
-        let p = Packing::new(0, 1i64 << 31, u32::MAX as usize).unwrap();
-        assert_eq!(
-            p.encode(u32::MAX - 1, (1i64 << 31) - 1).person(p),
-            (u32::MAX - 1) as u64
-        );
+        let last = (1i64 << 31) - crate::GAP;
+        let p = Packing::new(0, last, u32::MAX as usize).unwrap();
+        assert_eq!(p.encode(u32::MAX - 1, last - 1).person(p), (u32::MAX - 1) as u64);
     }
 }
