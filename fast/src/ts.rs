@@ -179,26 +179,7 @@ pub fn parse_ingest(s: &[u8]) -> i64 {
     }
 }
 
-const CLOCK_TEMPLATE: u64 = word(b"T00:00:0");
-const CLOCK_ADD: u64 = word(&[L, D, D, L, D, D, L, D]);
-
-const fn minute_table() -> [i32; 65536] {
-    let mut table = [-1; 65536];
-    let mut hour = 0;
-    while hour < 24 {
-        let mut minute = 0;
-        while minute < 60 {
-            let key = (hour / 10) << 12 | (hour % 10) << 8 | (minute / 10) << 4 | (minute % 10);
-            table[key] = (hour * 3600 + minute * 60) as i32;
-            minute += 1;
-        }
-        hour += 1;
-    }
-    table
-}
-
-static MINUTES: [i32; 65536] = minute_table();
-
+#[derive(Clone, Copy, Default)]
 struct CivilDay {
     first: u64,
     last: u16,
@@ -208,7 +189,20 @@ struct CivilDay {
 /// Immutable exact date lookup derived from the manifest. A miss always
 /// falls back to the complete Gregorian parser, including for ingest claims.
 pub struct ManifestClock {
-    days: [Vec<CivilDay>; 32],
+    // The unchecked BCD nibbles are only an address; the stored date bytes
+    // are authoritative, including for all non-ASCII input and colliding months.
+    days: [CivilDay; 64],
+    decimals: [(u64, i64); 256],
+}
+
+#[inline(always)]
+fn day_slot(last: u16) -> usize {
+    (((last & 3) << 4) | ((last >> 8) & 15)) as usize
+}
+
+#[inline(always)]
+fn decimal_slot(prefix: u64) -> usize {
+    (((prefix >> 20) & 0xf0) | ((prefix >> 32) & 0x0f)) as usize
 }
 
 impl ManifestClock {
@@ -225,9 +219,25 @@ impl ManifestClock {
             .saturating_add(2 * DAY)
             .div_euclid(DAY)
             .clamp(first_valid, last_valid);
+        // Ineligible entries have a tag impossible in the compared width.
         let mut clock = Self {
-            days: std::array::from_fn(|_| Vec::new()),
+            days: [CivilDay {
+                first: 0,
+                last: 0,
+                midnight_seconds: BAD,
+            }; 64],
+            decimals: [(u64::MAX, 0); 256],
         };
+        let low = ws.saturating_sub(8 * DAY).max(1_000_000_000_000) / 100_000_000;
+        let high = we.saturating_add(2 * DAY).min(9_999_999_999_999) / 100_000_000;
+        if high >= low && high - low < 256 {
+            for pre in low..=high {
+                let mut v = [0u8; 8];
+                v[..5].copy_from_slice(format!("{pre:05}").as_bytes());
+                let tag = u64::from_le_bytes(v);
+                clock.decimals[decimal_slot(tag)] = (tag, pre * 100_000_000);
+            }
+        }
         // Very wide windows get both ends, with all other dates using fallback.
         if hi - lo >= LIMIT {
             for day in lo..lo + LIMIT / 2 {
@@ -258,54 +268,68 @@ impl ManifestClock {
         let y = y + i64::from(m <= 2);
         let date = format!("{y:04}-{m:02}-{d:02}");
         let bytes = date.as_bytes();
-        self.days[d as usize].push(CivilDay {
+        let last = u16::from_le_bytes([bytes[8], bytes[9]]);
+        self.days[day_slot(last)] = CivilDay {
             first: load8(bytes, 0),
-            last: u16::from_le_bytes([bytes[8], bytes[9]]),
+            last,
             midnight_seconds: day * 86_400,
-        });
+        };
     }
 
     /// `s` has the F1 length and a date separator at byte 4.
     #[inline]
-    fn f1_seconds(&self, s: &[u8]) -> i64 {
-        let tens = s[8].wrapping_sub(b'0');
-        let ones = s[9].wrapping_sub(b'0');
-        if tens <= 3 && ones <= 9 {
-            let day = usize::from(tens) * 10 + usize::from(ones);
-            if let Some(entries) = self.days.get(day) {
-                let first = load8(s, 0);
-                let last = u16::from_le_bytes([s[8], s[9]]);
-                for entry in entries {
-                    if entry.first == first && entry.last == last {
-                        let t = load8(s, 10) ^ CLOCK_TEMPLATE;
-                        let last_second = s[18].wrapping_sub(b'0');
-                        if !fits(t, CLOCK_ADD) || last_second > 9 || s[19] != b'Z' {
-                            return BAD;
-                        }
-                        let index = ((b(t, 1) as usize) << 12)
-                            | ((b(t, 2) as usize) << 8)
-                            | ((b(t, 4) as usize) << 4)
-                            | b(t, 5) as usize;
-                        let minute_seconds = MINUTES[index];
-                        let seconds = b(t, 7) * 10 + i64::from(last_second);
-                        if minute_seconds < 0 || seconds > 59 {
-                            return BAD;
-                        }
-                        return entry.midnight_seconds + i64::from(minute_seconds) + seconds;
-                    }
-                }
-            }
+    fn iso_seconds<const OFFSET: bool>(&self, s: &[u8]) -> i64 {
+        let last = u16::from_le_bytes([s[8], s[9]]);
+        let entry = &self.days[day_slot(last)];
+        // The caller checked s[4] == '-', so an uninitialized zero prefix cannot match.
+        if entry.first != load8(s, 0) || entry.last != last {
+            return iso::<OFFSET, true>(s);
         }
-        iso::<false, true>(s)
+        let t = load8(s, 11) ^ word(b"00:00:00");
+        if !(fits(t, word(&[D, D, L, D, D, L, D, D])) & (s[10] == b'T')) {
+            return BAD;
+        }
+        // BCD-to-binary for all three byte pairs with one multiply-add.
+        let pairs = t.wrapping_mul(256 * 10 + 1);
+        let (h, m, sec) = (b(pairs, 1), b(pairs, 4), b(pairs, 7));
+        if !(h < 24 && m < 60 && sec < 60) {
+            return BAD;
+        }
+        let mut seconds = entry.midnight_seconds + h * 3600 + m * 60 + sec;
+        if OFFSET {
+            let sign = s[19];
+            let z = load8(s, 16) ^ (T_F2 | u64::from(sign) << 24);
+            let d = i64::from(s[24].wrapping_sub(b'0'));
+            let (oh, om) = (b(z, 4) * 10 + b(z, 5), b(z, 7) * 10 + d);
+            if !(fits(z, A_F2) & (d < 10) & (sign == b'+' || sign == b'-') & (oh < 24) & (om < 60)) {
+                return BAD;
+            }
+            let offset = oh * 3600 + om * 60;
+            seconds += if sign == b'-' { offset } else { -offset };
+        } else if s[19] != b'Z' {
+            return BAD;
+        }
+        seconds
     }
 
     #[inline]
     pub fn parse_ts(&self, s: &[u8]) -> i64 {
-        if s.len() == 20 && s[4] == b'-' {
-            let seconds = self.f1_seconds(s);
+        if matches!(s.len(), 20 | 25) && s[4] == b'-' {
+            let seconds = if s.len() == 20 {
+                self.iso_seconds::<false>(s)
+            } else {
+                self.iso_seconds::<true>(s)
+            };
             return if seconds == BAD { BAD } else { seconds * 1000 };
         }
-        parse_ts(s)
+        if s.len() == 13 {
+            let prefix = load8(s, 0) & 0xff_ffff_ffff;
+            let (tag, base) = self.decimals[decimal_slot(prefix)];
+            if prefix == tag {
+                return eight(load8(s, 5)).map_or(BAD, |n| base + n as i64);
+            }
+        }
+        epoch_ms(s)
     }
 
     /// The F1 path supplies both exact milliseconds for the late check
@@ -313,7 +337,7 @@ impl ManifestClock {
     #[inline]
     pub fn ingest_for_claim(&self, s: &[u8]) -> (i64, i64) {
         if s.len() == 20 && s[4] == b'-' {
-            let seconds = self.f1_seconds(s);
+            let seconds = self.iso_seconds::<false>(s);
             if seconds != BAD {
                 return (seconds * 1000, seconds);
             }
@@ -452,10 +476,40 @@ mod tests {
     }
 
     #[test]
+    fn window_grammar_proves_bytes_on_both_sides_of_decimal_splices_and_zones() {
+        let clock = ManifestClock::new(parse_ts(b"2028-02-25T00:00:00Z"), parse_ts(b"2028-03-06T00:00:00Z"));
+        for base in [
+            &b"2028-02-29T00:00:00-23:59"[..],
+            &b"2028-03-01T23:59:59+00:00"[..],
+            &b"1835395199999"[..],
+            &b"1835400000000"[..],
+        ] {
+            for pos in 0..base.len() {
+                let mut v = base.to_vec();
+                for b in 0..=255 {
+                    v[pos] = b;
+                    check_clock(&clock, &v);
+                }
+            }
+        }
+        for n in [
+            0i64,
+            1,
+            99_999_999,
+            100_000_000,
+            999_999_999_999,
+            1_000_000_000_000,
+            9_999_999_999_999,
+        ] {
+            check_clock(&clock, format!("{n:013}").as_bytes());
+        }
+    }
+
+    #[test]
     fn clock_validates_every_second_and_byte_of_cached_dates() {
         let clock = ManifestClock::new(parse_ts(b"2028-01-20T00:00:00Z"), parse_ts(b"2028-04-10T00:00:00Z"));
         // Same day number but distinct YYYY-MM prefixes, including a miss.
-        assert!(clock.days[1].len() >= 3);
+        assert!(clock.days.iter().any(|v| v.midnight_seconds != BAD));
         for s in [
             "2028-01-01T05:06:07Z",
             "2028-02-01T05:06:07Z",
@@ -496,15 +550,12 @@ mod tests {
             (parse_ts(b"1969-12-30T00:00:00Z"), parse_ts(b"1970-01-02T00:00:00Z")),
         ] {
             let clock = ManifestClock::new(ws, we);
-            assert!(clock.days.iter().map(Vec::len).sum::<usize>() <= 256);
-            for entries in &clock.days {
-                for entry in entries {
-                    let mut s = *b"0000-00-00T00:00:00Z";
-                    s[..8].copy_from_slice(&entry.first.to_le_bytes());
-                    s[8..10].copy_from_slice(&entry.last.to_le_bytes());
-                    assert_eq!(entry.midnight_seconds * 1000, want(&s), "{s:?}");
-                    check_clock(&clock, &s);
-                }
+            for entry in clock.days.iter().filter(|e| e.midnight_seconds != BAD) {
+                let mut s = *b"0000-00-00T00:00:00Z";
+                s[..8].copy_from_slice(&entry.first.to_le_bytes());
+                s[8..10].copy_from_slice(&entry.last.to_le_bytes());
+                assert_eq!(entry.midnight_seconds * 1000, want(&s), "{s:?}");
+                check_clock(&clock, &s);
             }
             for s in [
                 "0000-02-29T23:59:59Z",
