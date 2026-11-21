@@ -1,5 +1,21 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Rank-routed direct chronological bins — 2026-11-20
+
+Experimental candidate against `012174f`; performance A/B is deliberately
+deferred. Linked events and clicks route by canonical rank modulo shard count.
+Bounded chronological bins accumulate per-rank extrema via `rank / NS`,
+touch only occupied ranks, and emit session chains in rank order without a
+compound session sort. Purchases remain an inclusive sorted sidecar. Canonical
+display still uses `people.original(rank)`.
+
+Wide keys and windows use the original full sort. The direct state array is
+bounded by actual linked events in the shard, and excessive session counts
+abort to the full sort; this also bounds sparse graphs and whale cases.
+21 Rust tests, 36 Python cases against both implementations, all 36 official
+fixtures against both implementations, 10 dirty seeds, and both dev-answer
+comparisons passed. Dev stdout was empty. No Docker or performance run.
+
 ## Round 2 integration: compact streams, exact catalog index and click prefetch — 2026-11-20
 
 The link graph already assigns each exact ID a node. Reuse its canonical root

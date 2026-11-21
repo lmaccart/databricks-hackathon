@@ -12,8 +12,8 @@ pub(super) fn mix(key: u64) -> u64 {
     x ^ (x >> 33)
 }
 
-/// `mix` is a permutation, so the routing hash can *be* the person token.
-/// Unpack it only when spelling a key for the output.
+/// `mix` is a permutation, so the standalone routing hash can be its person
+/// token. Linked identities route by root rank instead.
 #[inline]
 pub(super) fn unmix(x: u64) -> u64 {
     const INVERSE: u64 = {
@@ -233,7 +233,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         for slot in &mut lane.slots {
             if slot.key != 0 {
                 let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
-                let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
+                let routing = u64::from(rank % NS as u32) << SHARD_SHIFT;
                 slot.value = LINKED | routing | u64::from(rank);
             }
         }

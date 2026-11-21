@@ -24,9 +24,11 @@ mod links;
 mod output;
 mod person;
 mod stream;
+mod timesweep;
 use links::{Identity, People, person_names};
 use person::Codec;
-use stream::{Packing, Payload, Stream, Temporal};
+use stream::{Packing, Payload, Purchase, Stream, Temporal};
+use timesweep::{Bins, Ordered, Session, exact_sessions};
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
@@ -323,26 +325,36 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
 
 fn process_stream<T: Temporal>(
     pieces: Vec<Stream<T>>,
-    mut cls: Vec<PCl>,
+    cls: Vec<PCl>,
     sm: &Small,
     people: &People,
     layout: T::Layout,
-    ShardOut { users, camps }: &mut ShardOut,
+    sweep: Option<(Bins, usize, usize)>,
+    out: &mut ShardOut,
 ) {
     let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
     let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
     if ne == 0 {
         return;
     }
-    let mut evs = Vec::with_capacity(ne);
-    let mut purchases = Vec::with_capacity(np);
-    for s in pieces {
-        evs.extend_from_slice(&s.times);
-        evs.extend(s.purchases.iter().map(|p| p.key));
-        purchases.extend_from_slice(&s.purchases);
-    }
-    evs.sort_unstable();
+    let (bins, direct) = sweep.map_or((None, None), |(b, shard, count)| (Some(b), Some((shard, count))));
+    let (ordered, mut purchases) = timesweep::prepare(pieces, layout, bins, direct, ne, np);
     purchases.sort_unstable_by_key(|p| p.key);
+    match ordered {
+        Ordered::Events(evs) => attribute(exact_sessions(&evs, layout), &purchases, cls, sm, people, layout, out),
+        Ordered::Sessions(sessions) => attribute(sessions.into_iter(), &purchases, cls, sm, people, layout, out),
+    }
+}
+
+fn attribute<T: Temporal>(
+    sessions: impl Iterator<Item = Session<T>>,
+    purchases: &[Purchase<T>],
+    mut cls: Vec<PCl>,
+    sm: &Small,
+    people: &People,
+    layout: T::Layout,
+    ShardOut { users, camps }: &mut ShardOut,
+) {
     cls.sort_unstable_by_key(|c| (c.person, c.ts));
     let ncamp = sm.camp_names.len();
     let mut cnt = vec![0usize; ncamp]; // copies enter and leave the window together
@@ -351,15 +363,11 @@ fn process_stream<T: Temporal>(
     let mut catsum = vec![0i64; sm.cat_names.len()];
 
     let mut ci = 0usize;
-    let mut i = 0usize;
     let mut pi = 0usize;
-    while i < evs.len() {
-        let rank = evs[i].person(layout);
+    let mut sessions = sessions.peekable();
+    while let Some(first) = sessions.peek() {
+        let rank = first.start.person(layout);
         let person = T::name(rank, people);
-        let mut j = i;
-        while j < evs.len() && evs[j].person(layout) == rank {
-            j += 1;
-        }
         while ci < cls.len() && cls[ci].person < rank {
             ci += 1;
         }
@@ -374,14 +382,9 @@ fn process_stream<T: Temporal>(
         let mut cur_day: i32 = i32::MIN;
         let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
 
-        let mut k = i;
-        while k < j {
-            // one session is evs[k..m]
-            let start = evs[k].ts(layout);
-            let mut m = k + 1;
-            while m < j && evs[m].gap(evs[m - 1]) <= GAP as u64 {
-                m += 1;
-            }
+        while sessions.peek().is_some_and(|s| s.start.person(layout) == rank) {
+            let s = sessions.next().unwrap();
+            let start = s.start.ts(layout);
             let day = start.div_euclid(DAY) as i32;
             if day != cur_day {
                 if cur_day != i32::MIN {
@@ -404,16 +407,14 @@ fn process_stream<T: Temporal>(
             // before the sort. Sessions end on inclusive, disjoint key ranges:
             // consume ALL purchases at the last instant, including exact ties.
             let p0 = pi;
-            let end = evs[m - 1];
-            debug_assert!(purchases.get(pi).is_none_or(|p| p.key >= evs[k]));
-            while pi < np && purchases[pi].key <= end {
-                let e = &purchases[pi];
+            debug_assert!(purchases.get(pi).is_none_or(|p| p.key >= s.start));
+            while let Some(e) = purchases.get(pi).filter(|p| p.key <= s.end) {
                 rev += e.price as i64;
                 catsum[e.cat as usize] += e.price as i64;
                 pi += 1;
             }
             d_sess += 1;
-            d_ev += (m - k) as i64;
+            d_ev += s.count;
             d_rev += rev;
 
             // slide the click window to [start - 7d, start]
@@ -455,7 +456,6 @@ fn process_stream<T: Temporal>(
             for &a in &active {
                 camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
             }
-            k = m;
         }
         let top = top_category(&catsum, &sm.cat_rank);
         users.push(UserRow {
@@ -471,9 +471,8 @@ fn process_stream<T: Temporal>(
             cnt[a as usize] = 0;
         }
         active.clear();
-        i = j;
     }
-    debug_assert_eq!(pi, np);
+    debug_assert_eq!(pi, purchases.len());
 }
 
 fn process_shard(
@@ -482,6 +481,8 @@ fn process_shard(
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
+    bins: Option<Bins>,
+    shard: usize,
 ) -> ShardOut {
     let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
     let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
@@ -490,9 +491,17 @@ fn process_shard(
         camps: Map::with_hasher(rs()),
     };
     if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+        process_stream(
+            packed,
+            gather(pc),
+            sm,
+            people,
+            pack,
+            bins.map(|b| (b, shard, people.count)),
+            &mut out,
+        );
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
+    process_stream(wide, gather(wc), sm, people, (), None, &mut out);
     out
 }
 
@@ -568,15 +577,17 @@ fn main() {
         .zip(by_destination(cl_by_person, |c| {
             !c.packed.is_empty() || !c.wide.is_empty()
         }))
+        .enumerate()
         .collect();
-    jobs.sort_unstable_by_key(|(e, c)| {
+    jobs.sort_unstable_by_key(|(_, (e, c))| {
         std::cmp::Reverse(
             e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
         )
     });
+    let bins = Bins::new(ws, we);
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(shard, (e, c))| process_shard(e, c, &sm, &names, packing, bins, shard))
         .collect();
     log("sessions done");
 
