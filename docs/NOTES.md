@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round four: three in-chunk typed event cursors — 2026-11-21
+
+Trial only, against `dfbd330` (same production tree as the 1.54 s `7fd1b76`). Split canonical-header chunks of at least 64 KiB into three bounded slices with up to two forward newline searches. Unroll the existing typed stages across cursors and prefetch all three decoded identities before queueing them in the existing emission ring. A failed batch commits nothing: only the failed lane advances through the strict single-line fallback. Uncommitted work in the other lanes can be redone. Drain residual lanes with the original word decoder.
+
+Seven alternating pairs on the public 1M-event dev set (native M2 Pro): eight-worker process medians **56 → 55 ms**, parser phase **15 → 15 ms**; one-worker process medians **309 → 338 ms**, parser phase **100 → 110 ms**. The candidate won 4/7 pairs in both tests; the one-worker process pair deltas spanned 23% slower to 18% faster. This is not evidence of a throughput win. No local 20M run; leave the Linux timing to native CI.
+
+Both dev comparers matched all 144,438 rows; stdout was empty. Passed 22 Rust tests, 40 end-to-end cases and 36 official fixtures against each implementation, 10 dirty seeds, and official seeds 7 and 15 (leap day) at 100k events.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).

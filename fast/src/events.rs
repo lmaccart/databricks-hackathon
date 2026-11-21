@@ -185,17 +185,22 @@ fn parse<'a>(
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
-    word::for_events(c, sm, &people.codec, window, &mut spill, |next| {
-        if next.uid != 0 {
-            people.prefetch(next.hash);
-        }
-        let i = n % ring.len();
-        if n >= ring.len() {
-            emit(ring[i]);
-        }
-        ring[i] = next;
-        n += 1;
-    });
+    word::for_events(
+        c,
+        sm,
+        &people.codec,
+        window,
+        &mut spill,
+        |hash| people.prefetch(hash),
+        |next| {
+            let i = n % ring.len();
+            if n >= ring.len() {
+                emit(ring[i]);
+            }
+            ring[i] = next;
+            n += 1;
+        },
+    );
     for i in n.saturating_sub(ring.len())..n {
         emit(ring[i % ring.len()]);
     }

@@ -250,6 +250,31 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_duplicate_claims_across_stripes_keep_earliest_well_formed_copy(self):
+        t = "2026-10-02T12:00:00Z"
+        early = "2026-10-02T11:59:59Z"
+        # Keep all copies in one chunk but spread them across the three
+        # stripes. The filler copies have equal ingests and identical values.
+        filler = [ev("filler000", "user00000", t, pid="item-1")] * 400
+        users, camps = run_case(
+            events=[
+                ev("invalid01", "user00001", t, "purchase", "item-1", "999"),
+                ev("winner002", "user00001", "bad", ingest=early) + ",extra",
+                *filler,
+                ev("winner002", "user00001", t, "purchase", "item-1", "777"),
+                *filler,
+                ev("invalid01", "user00001", "bad", ingest=early),
+                ev("winner002", "user00002", t, "purchase", "item-1", "7", early),
+                *filler,
+            ],
+            products=["item-1,shoes"],
+        )
+        day = "2026-10-02"
+        self.assertEqual(set(users), {("user00000", day), ("user00002", day)})
+        self.assertEqual(users[("user00000", day)]["events"], 1)
+        self.assertEqual(users[("user00002", day)]["events"], 1)
+        self.assertEqual(camps[("organic", day)]["revenue_cents"], 7)
+
     def test_line_wider_than_a_parse_chunk_does_not_shift_duplicate_targets(self):
         t = "2026-10-02T12:00:00Z"
         early = "2026-10-02T11:59:59Z"

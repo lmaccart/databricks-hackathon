@@ -63,7 +63,7 @@ fn fixed<const N: usize>(s: &[u8], q: bool) -> Option<(&[u8; N], &[u8])> {
 }
 
 #[inline(always)]
-fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [u8])> {
+fn event_time<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, &'a [u8])> {
     let (q, b) = quoted(s);
     let (ts, rest) = if *b.get(4)? != b'-' {
         let (body, rest) = fixed::<13>(b, q)?;
@@ -79,13 +79,15 @@ fn timestamps<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, i64, &'a [
         let (body, rest) = fixed::<25>(b, q)?;
         (ManifestClock::event_f2(body), rest)
     };
-    if ts == BAD {
-        return None;
-    }
-    let (q, rest) = quoted(rest);
-    let (body, rest) = fixed::<20>(rest, q)?;
+    (ts != BAD).then_some((ts, rest))
+}
+
+#[inline(always)]
+fn ingest_time<'a>(s: &'a [u8], clock: &ManifestClock) -> Option<(i64, &'a [u8])> {
+    let (q, s) = quoted(s);
+    let (body, rest) = fixed::<20>(s, q)?;
     let seconds = clock.event_f1_seconds(body);
-    (seconds != BAD).then_some((ts, seconds, rest))
+    (seconds != BAD).then_some((seconds, rest))
 }
 
 #[inline(always)]
@@ -203,9 +205,15 @@ fn suffix<'a>(s: &'a [u8], purchase: bool, sm: &Small) -> Option<(Option<PriceCa
 fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestClock)) -> Option<(Pending, &'a [u8])> {
     let (eid, s) = id(s)?;
     let (uid, s) = id(s)?;
-    let (ts, seconds, s) = timestamps(s, clock)?;
+    let (ts, s) = event_time(s, clock)?;
+    let (seconds, s) = ingest_time(s, clock)?;
     let (purchase, s) = event_type(s)?;
     let (payload, rest) = suffix(s, purchase, sm)?;
+    Some((pending(eid, uid, ts, seconds, payload, ws, we), rest))
+}
+
+#[inline(always)]
+fn pending(eid: u64, uid: u64, ts: i64, seconds: i64, payload: Option<PriceCategory>, ws: i64, we: i64) -> Pending {
     let mut e = Pending {
         claim_key: links::mix(eid),
         ts,
@@ -223,7 +231,7 @@ fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestCloc
         e.price = price;
         e.cat = cat;
     }
-    Some((e, rest))
+    e
 }
 
 #[cold]
@@ -249,24 +257,121 @@ pub(super) fn for_events<'a>(
     codec: &Codec<'a>,
     window: (i64, i64, &ManifestClock),
     spill: &mut Vec<i64>,
+    mut prefetch: impl FnMut(u64),
     mut emit: impl FnMut(Pending),
 ) {
     if !c.identity_order(7) {
         return for_rows(c, |r| {
             if let Some(e) = decode_fields(r, sm, codec, window, spill) {
-                emit(e);
+                offer(e, &mut prefetch, &mut emit);
             }
         });
     }
-    let mut rest = c.data;
+    // Avoid splitting tiny chunks, where the scalar drain could dominate.
+    if c.data.len() >= 64 * 1024 {
+        for_stripes(c.data, sm, codec, window, spill, &mut prefetch, &mut emit);
+    } else {
+        for_tail(c.data, sm, codec, window, spill, &mut prefetch, &mut emit);
+    }
+}
+
+#[inline(always)]
+fn hint(e: Pending, prefetch: &mut impl FnMut(u64)) {
+    if e.uid != 0 {
+        prefetch(e.hash);
+    }
+}
+
+#[inline(always)]
+fn offer(e: Pending, prefetch: &mut impl FnMut(u64), emit: &mut impl FnMut(Pending)) {
+    hint(e, prefetch);
+    emit(e);
+}
+
+// Bound every word load and strict retry by its own slice. Advance each cut
+// to the next line start, reusing the previous cut if a long line covered it.
+fn stripes(data: &[u8]) -> [&[u8]; 3] {
+    let cut = |at| memchr::memchr(b'\n', &data[at..]).map_or(data.len(), |i| at + i + 1);
+    let a = cut(data.len() / 3);
+    let ideal_b = data.len() - data.len() / 3;
+    let b = if ideal_b <= a { a } else { cut(ideal_b) };
+    [&data[..a], &data[a..b], &data[b..]]
+}
+
+#[inline(never)]
+fn for_stripes<'a>(
+    data: &'a [u8],
+    sm: &Small,
+    codec: &Codec<'a>,
+    window: (i64, i64, &ManifestClock),
+    spill: &mut Vec<i64>,
+    prefetch: &mut impl FnMut(u64),
+    emit: &mut impl FnMut(Pending),
+) {
+    let (ws, we, clock) = window;
+    let mut lanes = stripes(data);
+    'rows: while !lanes[0].is_empty() && !lanes[1].is_empty() && !lanes[2].is_empty() {
+        // Keep stages together across independent cursors: the next row in
+        // any one stripe still depends on its preceding suffix's length.
+        let missed = 'batch: {
+            macro_rules! stage {
+                ($a:expr, $b:expr, $c:expr) => {{
+                    let Some(a) = $a else { break 'batch 0 };
+                    let Some(b) = $b else { break 'batch 1 };
+                    let Some(c) = $c else { break 'batch 2 };
+                    (a, b, c)
+                }};
+            }
+            let ((ea, a), (eb, b), (ec, c)) = stage!(id(lanes[0]), id(lanes[1]), id(lanes[2]));
+            let ((ua, a), (ub, b), (uc, c)) = stage!(id(a), id(b), id(c));
+            let ((ta, a), (tb, b), (tc, c)) = stage!(event_time(a, clock), event_time(b, clock), event_time(c, clock));
+            let ((ia, a), (ib, b), (ic, c)) =
+                stage!(ingest_time(a, clock), ingest_time(b, clock), ingest_time(c, clock));
+            let ((pa, a), (pb, b), (pc, c)) = stage!(event_type(a), event_type(b), event_type(c));
+            let ((sa, a), (sb, b), (sc, c)) = stage!(suffix(a, pa, sm), suffix(b, pb, sm), suffix(c, pc, sm));
+            lanes = [a, b, c];
+            let a = pending(ea, ua, ta, ia, sa, ws, we);
+            let b = pending(eb, ub, tb, ib, sb, ws, we);
+            let c = pending(ec, uc, tc, ic, sc, ws, we);
+            hint(a, prefetch);
+            hint(b, prefetch);
+            hint(c, prefetch);
+            emit(a);
+            emit(b);
+            emit(c);
+            continue 'rows;
+        };
+        // No lane was committed. Retry only the failed lane's original line
+        // with the strict decoder; the other cursors have not moved.
+        let (row, tail) = fallback(lanes[missed], sm, codec, window, spill);
+        lanes[missed] = tail;
+        if let Some(e) = row {
+            offer(e, prefetch, emit);
+        }
+    }
+    for rest in lanes {
+        for_tail(rest, sm, codec, window, spill, prefetch, emit);
+    }
+}
+
+#[inline(never)]
+fn for_tail<'a>(
+    mut rest: &'a [u8],
+    sm: &Small,
+    codec: &Codec<'a>,
+    window: (i64, i64, &ManifestClock),
+    spill: &mut Vec<i64>,
+    prefetch: &mut impl FnMut(u64),
+    emit: &mut impl FnMut(Pending),
+) {
     while !rest.is_empty() {
         if let Some((e, tail)) = decode(rest, sm, window) {
-            emit(e);
+            offer(e, prefetch, emit);
             rest = tail;
         } else {
             let (e, tail) = fallback(rest, sm, codec, window, spill);
             if let Some(e) = e {
-                emit(e);
+                offer(e, prefetch, emit);
             }
             rest = tail;
         }
@@ -276,6 +381,72 @@ pub(super) fn for_events<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stripes_match_strict_rows_across_unbalanced_and_unterminated_boundaries() {
+        let path = Path::new("stripe.csv");
+        let sm = read_small(
+            b"product_id,category\nitem-7,shoes\n",
+            b"campaign_id,channel\n",
+            path,
+            path,
+        );
+        let ws = parse_ts(b"2026-10-01T00:00:00Z");
+        let we = parse_ts(b"2026-10-15T00:00:00Z");
+        let clock = ManifestClock::new(ws, we);
+        let window = (ws, we, &clock);
+        let cols = [
+            "event_id",
+            "user_id",
+            "ts",
+            "ingest_ts",
+            "event_type",
+            "product_id",
+            "price_cents",
+        ];
+        let rows = [
+            "user99999,2026-10-03T10:00:00Z,2026-10-03T10:00:00Z,view,item-7,",
+            "\"user99999\",1791021600001,2026-10-03T10:00:00Z,cart,\"item-7\",\"\"",
+            "user99999,2026-10-03T10:30:00+00:30,2026-10-03T10:00:00Z,purchase,item-7,123",
+            "\"broken,2026-10-03T10:00:00Z,2026-10-03T10:00:00Z,view,item-7,",
+            "user99999,bad,00000001551,view,item-7,",
+            "user99999,2026-10-03T10:00:00Z,2026-10-03T10:00:00Z,cart,,",
+        ];
+        for extra in [0, 57, 190, 4_096] {
+            let mut file = cols.join(",") + "\n";
+            for i in 0..30 {
+                if i == 18 {
+                    // A single physical line can cover one or both ideal cuts.
+                    file.extend(std::iter::repeat_n('x', extra));
+                }
+                file.push_str(&format!("e{i:08},{}", rows[i % rows.len()]));
+                if i != 29 {
+                    file.push('\n');
+                }
+            }
+            let codec = Codec::new();
+            let chunk = chunks_of(file.as_bytes(), &cols, path)[0];
+            let collect = |striped| {
+                let mut spill = vec![];
+                let mut events = vec![];
+                if striped {
+                    for_stripes(chunk.data, &sm, &codec, window, &mut spill, &mut |_| {}, &mut |e| {
+                        events.push(e)
+                    });
+                } else {
+                    for_rows(&chunk, |r| {
+                        events.extend(decode_fields(r, &sm, &codec, window, &mut spill))
+                    });
+                }
+                for e in &mut events {
+                    e.claim_order = Claim::new(e.claim_key, 0, e.claim_order).ingest(&spill) as u64;
+                }
+                events.sort_unstable_by_key(|e| e.claim_key);
+                events
+            };
+            assert_eq!(collect(true), collect(false), "long line padding: {extra}");
+        }
+    }
 
     #[test]
     fn inline_ids_match_codec_for_every_accepted_byte_and_boundary() {
@@ -336,7 +507,7 @@ mod tests {
                 for_rows(&c, |r| {
                     want.extend(decode_fields(r, &sm, &codec, window, &mut want_spill))
                 });
-                for_events(&c, &sm, &codec, window, &mut got_spill, |e| got.push(e));
+                for_events(&c, &sm, &codec, window, &mut got_spill, |_| {}, |e| got.push(e));
                 assert_eq!(got, want, "{row:?}, {after:?}");
                 assert_eq!(got_spill, want_spill);
             }
