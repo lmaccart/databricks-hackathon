@@ -1,36 +1,71 @@
-//! Parquet output: one row group per file, PLAIN, uncompressed, no statistics.
+//! Uncompressed Parquet output, with modest file counts and bounded user groups.
 //!
-//! Rows are pushed straight into the parquet crate's typed column writers in
-//! small blocks, so there is no intermediate Arrow array (and no second copy of
-//! every column). Only the crate's own encoders, page framing, footer and
-//! thrift code write bytes; nothing here touches the file format.
+//! Required fixed-width values go straight to typed writers. For grouped
+//! user strings and sparse cents, splice encoded chunks into the same file
+//! writer; the crate still owns page framing, row groups and file metadata.
 //!
 //! Schema (rules.md, Outputs): strings are `BYTE_ARRAY (STRING)`, `day` is
 //! `INT32 (DATE)`, counts are `INT64`, only `top_category` is nullable.
 //! Every string is checked to be UTF-8 before it reaches a page; NUL bytes
 //! and non-ASCII text are legal and byte-exact.
-use crate::UserRow;
+use crate::{Map, links, person::Codec, rs};
 use bytes::Bytes;
-use parquet::basic::{ConvertedType, LogicalType, Repetition, Type as Physical};
+use parquet::basic::{ConvertedType, Encoding, LogicalType, Repetition, Type as Physical};
+use parquet::column::page::{CompressedPage, Page, PageWriter};
+use parquet::column::writer::ColumnCloseResult;
 use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
+use parquet::file::metadata::ColumnChunkMetaData;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesPtr};
-use parquet::file::writer::{SerializedColumnWriter, SerializedFileWriter, SerializedRowGroupWriter};
-use parquet::schema::types::{Type, TypePtr};
+use parquet::file::writer::{
+    SerializedColumnWriter, SerializedFileWriter, SerializedPageWriter, SerializedRowGroupWriter, TrackedWrite,
+};
+use parquet::schema::types::{ColumnDescPtr, SchemaDescriptor, Type, TypePtr};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::Write;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
 /// Values handed to a column writer per call. Also the writer's own page-size
 /// check interval, so a page never overshoots its limit by more than a block.
 const BLOCK: usize = 4096;
+const GROUP_ROWS: usize = 16 * 1024;
+const DICT_BYTES: usize = 1024 * 1024;
+const NULL_CAT: u32 = u32::MAX;
+
+#[derive(Default)]
+pub struct UserColumns {
+    day: Vec<i32>,
+    sessions: Vec<i64>,
+    events: Vec<i64>,
+    revenue: Vec<i64>,
+    category: Vec<u32>,
+    people: Vec<(u64, usize)>, // exact person token, exclusive end row
+}
+
+impl UserColumns {
+    #[inline]
+    pub fn push_day(&mut self, day: i32, sessions: i64, events: i64, revenue: i64, top: Option<u32>) {
+        self.day.push(day);
+        self.sessions.push(sessions);
+        self.events.push(events);
+        self.revenue.push(revenue);
+        self.category.push(top.unwrap_or(NULL_CAT));
+    }
+
+    #[inline]
+    pub fn finish_person(&mut self, name: u64) {
+        self.people.push((name, self.day.len()));
+    }
+}
 
 fn props() -> WriterPropertiesPtr {
     Arc::new(
         WriterProperties::builder()
             .set_dictionary_enabled(false)
             .set_statistics_enabled(EnabledStatistics::None)
+            .set_offset_index_disabled(true)
             .set_write_batch_size(BLOCK)
             .set_data_page_row_count_limit(usize::MAX)
             .build(),
@@ -146,15 +181,306 @@ fn file(path: &Path, schema: TypePtr) -> SerializedFileWriter<File> {
     SerializedFileWriter::new(File::create(path).expect("create parquet"), schema, props()).expect("writer")
 }
 
-/// `user_daily`: shards are grouped into at most `parts` files, one thread each.
-/// `key` appends a person's name (byte-wise smallest of their IDs).
-pub fn user_daily(
-    dir: &Path,
-    shards: &[&[UserRow]],
-    parts: usize,
-    key: &(impl Fn(u64, &mut Vec<u8>) + Sync),
-    cats: &[Vec<u8>],
+// PLAIN BYTE_ARRAY has a four-byte length; page payload lengths are signed i32.
+fn text_size(s: &str) -> usize {
+    let n = 4 + s.len();
+    assert!(n <= i32::MAX as usize, "string exceeds Parquet page limit");
+    n
+}
+
+fn plain_text(b: &mut Vec<u8>, s: &str) {
+    b.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    b.extend_from_slice(s.as_bytes());
+}
+
+// RLE is a subset of the Parquet RLE/bit-packed hybrid. A run is an
+// unsigned varint (length << 1) followed by the little-endian value.
+fn rle(out: &mut Vec<u8>, n: usize, value: u32, width: usize) {
+    debug_assert!(n > 0 && n <= GROUP_ROWS && width <= 4);
+    let mut header = n << 1;
+    while header >= 128 {
+        out.push((header as u8) | 128);
+        header >>= 7;
+    }
+    out.push(header as u8);
+    out.extend_from_slice(&value.to_le_bytes()[..width]);
+}
+
+#[derive(Default)]
+struct Runs {
+    runs: Vec<(u32, usize)>,
+}
+impl Runs {
+    fn push(&mut self, value: u32) {
+        if let Some((last, n)) = self.runs.last_mut()
+            && *last == value
+        {
+            *n += 1;
+        } else {
+            self.runs.push((value, 1));
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>, bits: u8) {
+        for &(value, n) in &self.runs {
+            rle(out, n, value, usize::from(bits.div_ceil(8)));
+        }
+    }
+}
+
+fn index_bits(entries: usize) -> u8 {
+    (usize::BITS - entries.saturating_sub(1).leading_zeros()) as u8
+}
+
+/// Write one already-encoded data page and its optional dictionary. Nullable
+/// columns prefix the data with V1 definition levels and their byte length.
+/// SerializedFileWriter takes care of rebasing offsets.
+fn append_page(
+    rg: &mut SerializedRowGroupWriter<'_, File>,
+    desc: ColumnDescPtr,
+    rows: usize,
+    dict: Option<(Vec<u8>, usize)>,
+    buf: Vec<u8>,
 ) {
+    let mut encoded = TrackedWrite::new(Vec::new());
+    let mut pages = SerializedPageWriter::new(&mut encoded);
+    let dictionary = dict.is_some();
+    if let Some((bytes, entries)) = dict {
+        let size = bytes.len();
+        pages
+            .write_page(CompressedPage::new(
+                Page::DictionaryPage {
+                    buf: Bytes::from(bytes),
+                    num_values: entries as u32,
+                    encoding: Encoding::PLAIN,
+                    is_sorted: false,
+                },
+                size,
+            ))
+            .expect("write dictionary page");
+    }
+    let encoding = if dictionary {
+        Encoding::RLE_DICTIONARY
+    } else {
+        Encoding::PLAIN
+    };
+    let size = buf.len();
+    let data = pages
+        .write_page(CompressedPage::new(
+            Page::DataPage {
+                buf: Bytes::from(buf),
+                num_values: rows as u32,
+                encoding,
+                def_level_encoding: Encoding::RLE,
+                rep_level_encoding: Encoding::RLE,
+                statistics: None,
+            },
+            size,
+        ))
+        .expect("write data page");
+    let encoded = Bytes::from(encoded.into_inner().expect("column pages"));
+    let mut encodings = vec![Encoding::PLAIN, Encoding::RLE];
+    if dictionary {
+        encodings.push(encoding);
+    }
+    let size = encoded.len() as i64;
+    let metadata = ColumnChunkMetaData::builder(desc)
+        .set_encodings(encodings)
+        .set_num_values(rows as i64)
+        .set_dictionary_page_offset(dictionary.then_some(0))
+        .set_data_page_offset(data.offset as i64)
+        .set_total_compressed_size(size)
+        .set_total_uncompressed_size(size)
+        .build()
+        .expect("column metadata");
+    rg.append_column(
+        &encoded,
+        ColumnCloseResult {
+            bytes_written: size as u64,
+            rows_written: rows as u64,
+            metadata,
+            bloom_filter: None,
+            column_index: None,
+            offset_index: None,
+        },
+    )
+    .expect("append column");
+}
+
+#[derive(Default)]
+struct UserGroup<'a> {
+    rows: usize,
+    spans: Vec<(&'a UserColumns, Range<usize>)>,
+    names: Vec<u8>, // each disjoint run contributes one PLAIN name
+    name_runs: Vec<usize>,
+}
+
+// Most category dimensions fit in a page even if every category is used.
+// Only a larger dimension needs to track its per-group byte budget as rows
+// are added. Like the person dictionary, a single wide value gets its own
+// budget and can still be referenced by arbitrarily many rows.
+#[derive(Default)]
+struct CategoryBudget {
+    seen: Map<u32, ()>,
+    bytes: usize,
+}
+
+impl CategoryBudget {
+    fn fit(&mut self, ids: &[u32], cats: &[&str]) -> usize {
+        for (i, &id) in ids.iter().enumerate() {
+            if id == NULL_CAT || self.seen.contains_key(&id) {
+                continue;
+            }
+            let n = text_size(cats[id as usize]);
+            if self.bytes != 0 && self.bytes + n > DICT_BYTES {
+                return i;
+            }
+            self.bytes += n;
+            self.seen.insert(id, ());
+        }
+        ids.len()
+    }
+
+    fn reset(&mut self) {
+        self.seen.clear();
+        self.bytes = 0;
+    }
+}
+
+impl<'a> UserGroup<'a> {
+    fn span(&mut self, shard: &'a UserColumns, range: Range<usize>) {
+        if !range.is_empty() {
+            self.spans.push((shard, range));
+        }
+    }
+
+    fn column<T: DataType>(&self, rg: &mut SerializedRowGroupWriter<'_, File>, get: impl Fn(&UserColumns) -> &[T::T]) {
+        let mut col = next(rg);
+        for (s, r) in &self.spans {
+            col.typed::<T>()
+                .write_batch(&get(s)[r.clone()], None, None)
+                .expect("write column");
+        }
+        close(col);
+    }
+
+    fn revenue(&self, rg: &mut SerializedRowGroupWriter<'_, File>, desc: ColumnDescPtr) {
+        let values = || {
+            self.spans
+                .iter()
+                .flat_map(|(s, r)| s.revenue[r.clone()].iter().copied())
+        };
+        let limit = self.rows / 8;
+        let nonzero = values().filter(|&v| v != 0).take(limit + 1).count();
+        if nonzero > limit {
+            self.column::<Int64Type>(rg, |s| &s.revenue);
+            return;
+        }
+        if nonzero == 0 {
+            let mut buf = vec![0]; // one dictionary entry, so zero index bits
+            rle(&mut buf, self.rows, 0, 0);
+            append_page(rg, desc, self.rows, Some((vec![0; 8], 1)), buf);
+            return;
+        }
+        let mut seen: Map<i64, u32> = Map::with_hasher(rs());
+        let mut dict = 0i64.to_le_bytes().to_vec();
+        let mut runs = Runs::default();
+        for v in values() {
+            let id = if v == 0 {
+                0
+            } else {
+                *seen.entry(v).or_insert_with(|| {
+                    let i = dict.len() / 8;
+                    dict.extend_from_slice(&v.to_le_bytes());
+                    i as u32
+                })
+            };
+            runs.push(id);
+        }
+        let entries = dict.len() / 8;
+        let bits = index_bits(entries);
+        let mut buf = vec![bits];
+        runs.write(&mut buf, bits);
+        append_page(rg, desc, self.rows, Some((dict, entries)), buf);
+    }
+
+    fn categories(&self, rg: &mut SerializedRowGroupWriter<'_, File>, desc: ColumnDescPtr, names: &[&str]) {
+        let ids = || {
+            self.spans
+                .iter()
+                .flat_map(|(s, r)| s.category[r.clone()].iter().copied())
+        };
+        let mut levels = Runs::default();
+        let mut indices = Runs::default();
+        let mut seen = Map::with_hasher(rs());
+        let mut dict = Vec::new();
+        let mut entries = 0usize;
+        for id in ids() {
+            levels.push(u32::from(id != NULL_CAT));
+            if id == NULL_CAT {
+                continue;
+            }
+            let index = seen.entry(id).or_insert(entries as u32);
+            if *index == entries as u32 {
+                plain_text(&mut dict, names[id as usize]);
+                entries += 1;
+            }
+            indices.push(*index);
+        }
+        let mut buf = vec![0; 4];
+        levels.write(&mut buf, 1);
+        let len = (buf.len() - 4) as u32;
+        buf[..4].copy_from_slice(&len.to_le_bytes());
+        let dict = if entries != 0 {
+            let bits = index_bits(entries);
+            buf.push(bits);
+            indices.write(&mut buf, bits);
+            Some((dict, entries))
+        } else {
+            None
+        };
+        append_page(rg, desc, self.rows, dict, buf);
+    }
+
+    fn write(&mut self, w: &mut SerializedFileWriter<File>, sch: &SchemaDescriptor, cats: &[&str]) {
+        if self.rows == 0 {
+            return;
+        }
+        let mut rg = w.next_row_group().expect("row group");
+        let entries = self.name_runs.len();
+        if entries == self.rows {
+            append_page(&mut rg, sch.column(0), self.rows, None, std::mem::take(&mut self.names));
+        } else {
+            let bits = index_bits(entries);
+            let width = usize::from(bits.div_ceil(8));
+            let mut buf = Vec::with_capacity(1 + entries * (width + 1));
+            buf.push(bits);
+            for (index, &n) in self.name_runs.iter().enumerate() {
+                rle(&mut buf, n, index as u32, width);
+            }
+            append_page(
+                &mut rg,
+                sch.column(0),
+                self.rows,
+                Some((std::mem::take(&mut self.names), entries)),
+                buf,
+            );
+        }
+        self.column::<Int32Type>(&mut rg, |s| &s.day);
+        self.column::<Int64Type>(&mut rg, |s| &s.sessions);
+        self.column::<Int64Type>(&mut rg, |s| &s.events);
+        self.revenue(&mut rg, sch.column(4));
+        self.categories(&mut rg, sch.column(5), cats);
+        rg.close().expect("close row group");
+        self.rows = 0;
+        self.spans.clear();
+        self.names.clear();
+        self.name_runs.clear();
+    }
+}
+
+/// `user_daily`: shards are grouped into at most `parts` files, one worker each.
+pub fn user_daily(dir: &Path, shards: &[&UserColumns], parts: usize, codec: &Codec<'_>, cats: &[&str]) {
     let per = shards.len().div_ceil(parts.max(1)).max(1);
     let sch = schema(vec![
         string("user_id", false),
@@ -165,49 +491,65 @@ pub fn user_daily(
         string("top_category", true),
     ]);
     // part-0 always exists so the table is never an empty folder.
-    let groups: Vec<&[&[UserRow]]> = if shards.is_empty() {
+    let descr = SchemaDescriptor::new(sch.clone());
+    let wide_categories = cats
+        .iter()
+        .try_fold(0, |total, s| {
+            let n = total + 4 + s.len();
+            (n <= DICT_BYTES).then_some(n)
+        })
+        .is_none();
+    let groups: Vec<&[&UserColumns]> = if shards.is_empty() {
         vec![&[][..]]
     } else {
         shards.chunks(per).collect()
     };
     groups.par_iter().enumerate().for_each(|(i, group)| {
-        let n: usize = group.iter().map(|s| s.len()).sum();
-        if n == 0 && i > 0 {
+        if i > 0 && group.iter().all(|s| s.day.is_empty()) {
             return;
         }
-        let rows = || group.iter().flat_map(|s| s.iter());
         let mut w = file(&dir.join(format!("part-{i}.parquet")), sch.clone());
-        if n > 0 {
-            let mut rg = w.next_row_group().expect("row group");
-            let mut c = next(&mut rg);
-            strings(&mut c, rows(), false, |r, out| {
-                key(r.person, out);
-                true
-            });
-            close(c);
-            let mut c = next(&mut rg);
-            fixed::<Int32Type, _>(&mut c, rows(), |r| r.day);
-            close(c);
-            let mut c = next(&mut rg);
-            fixed::<Int64Type, _>(&mut c, rows(), |r| r.sessions);
-            close(c);
-            let mut c = next(&mut rg);
-            fixed::<Int64Type, _>(&mut c, rows(), |r| r.events);
-            close(c);
-            let mut c = next(&mut rg);
-            fixed::<Int64Type, _>(&mut c, rows(), |r| r.revenue);
-            close(c);
-            let mut c = next(&mut rg);
-            strings(&mut c, rows(), true, |r, out| match r.top {
-                Some(t) => {
-                    out.extend_from_slice(&cats[t as usize]);
-                    true
+
+        let mut batch = UserGroup::default();
+        let mut budget = wide_categories.then(CategoryBudget::default);
+        for &s in *group {
+            let (mut pos, mut start) = (0, 0);
+            for &(token, end) in &s.people {
+                let mut scratch = [0; 9];
+                let name =
+                    std::str::from_utf8(codec.bytes(links::unmix(token), &mut scratch)).expect("IDs must be UTF-8");
+                let bytes = text_size(name);
+                while pos < end {
+                    if batch.rows == GROUP_ROWS || (batch.rows > 0 && batch.names.len() + bytes > DICT_BYTES) {
+                        batch.span(s, start..pos);
+                        batch.write(&mut w, &descr, cats);
+                        if let Some(b) = &mut budget {
+                            b.reset();
+                        }
+                        start = pos;
+                    }
+                    let want = (end - pos).min(GROUP_ROWS - batch.rows);
+                    let n = budget
+                        .as_mut()
+                        .map_or(want, |b| b.fit(&s.category[pos..pos + want], cats));
+                    if n > 0 {
+                        plain_text(&mut batch.names, name);
+                        batch.name_runs.push(n);
+                        batch.rows += n;
+                        pos += n;
+                    }
+                    if n < want {
+                        batch.span(s, start..pos);
+                        batch.write(&mut w, &descr, cats);
+                        budget.as_mut().unwrap().reset();
+                        start = pos;
+                    }
                 }
-                None => false,
-            });
-            close(c);
-            rg.close().expect("close row group");
+            }
+            debug_assert_eq!(pos, s.day.len());
+            batch.span(s, start..pos);
         }
+        batch.write(&mut w, &descr, cats);
         w.close().expect("close file");
     });
 }

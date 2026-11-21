@@ -410,6 +410,78 @@ class EventsOrder(unittest.TestCase):
 
 
 class LinkedIds(unittest.TestCase):
+    def test_columnar_user_output_long_names_sparse_categories_and_groups(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import pyarrow.parquet as pq
+
+        canonical = " A\0\r" + "é🧪" * 50_000
+        category = " \r\0" + "分🧪" * 40_000
+        start = dt.date(2026, 10, 1)
+        end = (start + dt.timedelta(days=90)).isoformat() + "T00:00:00Z"
+        dates = [(start + dt.timedelta(days=i)).isoformat() for i in range(80)]
+        attrs = {}
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                os.environ, {"RAYON_NUM_THREADS": "1"}):
+            events = []
+            for i, day in enumerate(dates):
+                t = day + "T00:00:00Z"
+                if i % 3 == 0:
+                    events.append(ev(f"wide{i}", "alias", t, "purchase", price="123"))
+                    attrs[(canonical, day)] = (123, category)
+                else:
+                    events.append(ev(f"wide{i}", "alias", t))
+                    attrs[(canonical, day)] = (0, None)
+            names = [" x", "x ", "x\0", "x\r", "e\u0301", "é"] + [
+                f"u{i:05}" for i in range(17_000)
+            ]
+            for i, uid in enumerate(names):
+                events.append(ev(f"solo{i}", uid, WS))
+                attrs[(uid, dates[0])] = (0, None)
+            u, c = _run_case_at(
+                tmp, events, [], [f'"{canonical}",alias'], [f'p1,"{category}"'], [],
+                window=(WS, end))
+
+            self.assertEqual(set(u), set(attrs))
+            for key, row in u.items():
+                self.assertEqual((row["sessions"], row["events"]), (1, 1))
+                self.assertEqual((row["revenue_cents"], row["top_category"]), attrs[key])
+            self.assertEqual(c[("organic", dates[0])]["sessions"], len(names) + 1)
+            if os.environ.get("SS_BIN"):
+                files = list((Path(tmp) / "out" / "user_daily").glob("*.parquet"))
+                self.assertEqual(len(files), 1)
+                meta = pq.ParquetFile(files[0]).metadata
+                self.assertGreater(meta.num_row_groups, 1)
+                self.assertIn("RLE_DICTIONARY", {
+                    encoding
+                    for i in range(meta.num_row_groups)
+                    for encoding in meta.row_group(i).column(0).encodings
+                })
+
+    def test_wide_category_budget_can_split_one_person_run(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import pyarrow.parquet as pq
+
+        # Each category fits a legal Parquet page, but not both in one
+        # budgeted dictionary. The same person's run straddles that cut.
+        names = [" a\0" + "🧪" * 270_000, "B\r" + "🧪" * 40_000]
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                os.environ, {"RAYON_NUM_THREADS": "1"}):
+            u, _ = _run_case_at(tmp, [
+                ev("a", "same", WS, "purchase", "p1", "17"),
+                ev("b", "same", "2026-10-02T00:00:00Z"),
+                ev("c", "same", "2026-10-03T00:00:00Z", "purchase", "p2", "31"),
+                ev("d", "same", "2026-10-04T00:00:00Z", "purchase", "p2", "53"),
+            ], [], [], [f'p1,"{names[0]}"', f'p2,"{names[1]}"'], [])
+            self.assertEqual([u[("same", f"2026-10-0{i}")]["top_category"] for i in range(1, 5)],
+                             [names[0], None, names[1], names[1]])
+            if os.environ.get("SS_BIN"):
+                path = Path(tmp) / "out" / "user_daily" / "part-0.parquet"
+                meta = pq.ParquetFile(path).metadata
+                self.assertEqual([meta.row_group(i).num_rows for i in range(meta.num_row_groups)],
+                                 [2, 2])
+
     def test_self_links_and_unrelated_graph_nodes_preserve_both_tables(self):
         # "A line ... may link an ID to itself; neither changes anything."
         # The same rows must agree when all, some, or none of their owners
