@@ -35,6 +35,11 @@ impl Packing {
     pub fn encode(self, rank: u32, ts: i64) -> u64 {
         (u64::from(rank) << self.bits) | (ts as u64).wrapping_sub(self.origin as u64)
     }
+
+    #[inline]
+    pub fn offset(self, key: u64) -> u64 {
+        key & self.mask
+    }
 }
 
 pub(super) trait Temporal: Copy + Ord {
@@ -80,7 +85,7 @@ impl Temporal for u64 {
 
     #[inline]
     fn ts(self, pack: Packing) -> i64 {
-        (self & pack.mask).wrapping_add(pack.origin as u64) as i64
+        pack.offset(self).wrapping_add(pack.origin as u64) as i64
     }
 
     #[inline]

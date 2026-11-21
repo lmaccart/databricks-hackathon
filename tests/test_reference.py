@@ -130,6 +130,51 @@ class EventClaims(unittest.TestCase):
         self.assertEqual(users[(uid, "2026-10-01")]["events"], len(distinct) - 1)
 
 
+class TemporalTiles(unittest.TestCase):
+    def test_shifted_window_shuffled_gap_boundaries_and_linked_credit(self):
+        ws = "2028-02-28T23:53:00Z"
+        we = "2028-03-05T00:00:00Z"
+        midnight = ms("2028-02-29T00:00:00Z")
+        start = midnight - 60_000
+        last = start + 30 * MIN
+        later = last + 30 * MIN + 1
+        events = [
+            ev("last", "z-alias", str(last), "purchase", "p2", "20"),
+            ev("later", "β-second", str(later), "purchase", "p3", "40"),
+            ev("stand", "u341", str(start), "purchase", "p1", "50"),
+            ev("other", "u419", str(last + 1), "purchase", "p3", "10"),
+        ]
+        # Dense, reverse-ordered ties activate the histogram even if this
+        # person happens to land in an otherwise empty shard.
+        events += [ev(f"e{i}", "β-second", str(start + i % 2))
+                   for i in reversed(range(160))]
+        # The three production routing tokens share shard 246; the two
+        # standalone tokens additionally share the coarse prefix in this grid.
+        events += [ev(f"s{i}", "u341" if i % 2 else "u419",
+                      str(start if i % 2 else last + 1)) for i in range(64)]
+        users, camps = run_case(
+            events,
+            links=("z-alias,β-second", "z-alias,u312"),
+            clicks=(f"z,z-alias,c_2,{start}", f"a,β-second,c_1,{start}",
+                    f"later,u312,c_3,{later}", f"own,u341,c_2,{start}",
+                    f"other,u419,c_2,{last + 1}"),
+            window=(ws, we),
+        )
+        first = users[("u312", "2028-02-28")]
+        second = users[("u312", "2028-02-29")]
+        self.assertEqual((first["sessions"], first["events"], first["revenue_cents"],
+                          first["top_category"]), (1, 161, 20, "hats"))
+        self.assertEqual((second["sessions"], second["events"], second["revenue_cents"],
+                          second["top_category"]), (1, 1, 40, "bags"))
+        self.assertEqual(camps[("c_1", "2028-02-28")]["revenue_cents"], 20)
+        self.assertEqual(camps[("c_2", "2028-02-28")]["revenue_cents"], 50)
+        self.assertEqual(camps[("c_2", "2028-02-28")]["assisted_sessions"], 2)
+        self.assertEqual(users[("u341", "2028-02-28")]["events"], 33)
+        self.assertEqual(users[("u419", "2028-02-29")]["events"], 33)
+        self.assertEqual(camps[("c_2", "2028-02-29")]["revenue_cents"], 10)
+        self.assertEqual(camps[("c_3", "2028-02-29")]["revenue_cents"], 40)
+
+
 class Timestamps(unittest.TestCase):
     def test_forms(self):
         f1 = ms("2026-10-03T23:58:10Z")

@@ -1,5 +1,48 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 3: two-dimensional event tiles — 2026-11-21
+
+Detached experiment against `5fd0d05`; no parser, dedup, identity or scoring-rule change. `tiles.rs`
+counts and scatters linked-rank and standalone events onto one grid per person shard. The grid
+uses the node-rank width, manifest-relative millisecond span and row count. Coarse counters are
+at most 16 KiB and at most one per eight events, using the same counters as scatter cursors.
+The scatter stores 16 bytes per event, drops all input pieces as it consumes them, and retains
+only one prefix's session-repair state at a time. Very large colliding cells are split on an
+exact differing person bit until the comparison stage is small (at most 128 events).
+
+**Exactness.** Within one shard, replacing known routing bits with a standalone tag is reversible,
+and tagged tokens cannot alias 32-bit root ranks. Both classes' person prefixes are monotonic in
+their private exact tokens. A person cannot occupy two distinct prefixes. When people share one
+prefix and overlap across coarse time cells, each exact token keeps its own tail; a group from
+another person neither extends nor closes that tail. Within a person, ascending non-overlapping
+fine time cells are each at most `2^20` ms wide and require only min/max/count. Across cells only
+the previous exact max and next exact min matter; a gap of exactly 1,800,000 ms still joins. A
+short actual min/max span skips even the fine stage. Clicks and purchases use the same private
+exact tokens; the inclusive session end takes all purchase ties, and the day and click window
+are still derived from the session start. Shards with fewer than 128 rows, more than `u32::MAX`
+rows, or an unrepresentable manifest-relative timestamp use the full-order fallback rather than
+truncating any value. The fine histogram uses at most 4,096 span slots and clears only occupancy
+words it used.
+
+**Validation.** The oracle and binary passed 39 edge tests each and all 36 official fixtures.
+The 21 Rust tests include forced same-prefix collisions, overlapping times, exact versus
+one-millisecond-over gaps, uneven input-piece order, and the maximum `u32` timestamp offset.
+All 10 dirty seeds and both dev-answer comparers matched. An independent binary/binary check
+on official-generator seed 15 (3M events, 750k clicks, includes leap day) matched all
+345,493 user rows and 28,006 campaign rows.
+
+**Native A/B.** Apple M2 Pro, same seed-15 input as above, warmed both binaries and alternated
+execution order. Built with `CARGO_BUILD_JOBS=2`.
+
+| Workers | Pairs | `5fd0d05` wall | Tiled wall | Control → tiled session phase |
+|---|---:|---:|---:|---:|
+| 8 | 9 | 0.143 s | 0.144 s (+1.0%) | 0.029 → 0.030 s |
+| 1 | 7 | 0.521 s | 0.528 s (+1.2%) | 0.140 → 0.144 s |
+
+The candidate did not clear the 3% bar; keep the control. This test did not run Docker or
+20M inputs. The two final timing logs are under `scratch/ab/tiled-medium-{8,1}.json` in the
+detached worktree; the experiment uses `tools/bench_pair.py --phases`.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.
