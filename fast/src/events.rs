@@ -1,105 +1,78 @@
-//! Send payloads directly to the session partition. A separate, smaller
-//! stream of claims (ID, ingest time, payload location) decides which payloads
-//! must be removed. In particular, an invalid copy has a claim but no payload.
+//! Route tentative payloads directly to the person partition. An independent
+//! stream of exact event tokens includes invalid rows, but not malformed rows.
 use super::*;
-use std::hash::{BuildHasherDefault, Hasher};
+use memchr::memchr3;
 
-#[derive(Clone, Copy)]
-struct Claim {
-    key_and_target: u64,
-    order_and_target: u64,
-}
+const ROUTE_BITS: u32 = 11;
+const ROUTE_MASK: u32 = (1 << ROUTE_BITS) - 1;
+const INVALID: usize = NS * 4;
+const ANCHOR_ROWS: usize = 128;
+const WIDE_OFFSET: u32 = 1 << (32 - ROUTE_BITS - 1);
+const _: () = {
+    assert!(INVALID <= ROUTE_MASK as usize && CHUNK < u32::MAX as usize);
+    assert!((CHUNK / WIDE_OFFSET as usize + 2) * ANCHOR_ROWS < WIDE_OFFSET as usize);
+};
 
-// An emitted event has at least six commas. At most one row extends past
-// CHUNK, so the stream kind, per-stream ordinal and shard fit in the claim.
-const _: () = assert!(NS == 256 && (CHUNK / 6 + 1) * 4 * NS < u32::MAX as usize);
-const NONE: u32 = u32::MAX;
-const KEY_BITS: u32 = u64::BITS - NS.trailing_zeros();
-const KEY_MASK: u64 = (1 << KEY_BITS) - 1;
-const TARGET_HI_BITS: u32 = 32 - NS.trailing_zeros();
-const TARGET_HI_MASK: u64 = (1 << TARGET_HI_BITS) - 1;
-// Signed 39-bit seconds cover every four-digit F1 year. In the 40-bit field,
-// the two high bits are 00/11 for seconds and 01 for a side-table index.
-const SPILL_TAG: u64 = 1 << 38;
-const _: () = assert!(std::mem::size_of::<Claim>() == 16 && ((CHUNK / 6 + 1) as u64) < SPILL_TAG);
-
-impl Claim {
-    #[inline]
-    fn order(ingest: i64, seconds: i64, spill: &mut Vec<i64>) -> u64 {
-        if seconds != BAD {
-            debug_assert!((-(SPILL_TAG as i64)..SPILL_TAG as i64).contains(&seconds));
-            seconds as u64
-        } else {
-            let i = spill.len() as u64;
-            spill.push(ingest);
-            SPILL_TAG | i
-        }
-    }
-
-    #[inline]
-    fn new(mixed: u64, target: u32, order: u64) -> Self {
-        Self {
-            key_and_target: (mixed & KEY_MASK) | (u64::from(target & (NS as u32 - 1)) << KEY_BITS),
-            order_and_target: (order << TARGET_HI_BITS) | u64::from(target >> NS.trailing_zeros()),
-        }
-    }
-
-    #[inline]
-    fn key(self) -> u64 {
-        self.key_and_target & KEY_MASK
-    }
-
-    #[inline]
-    fn target(self) -> u32 {
-        (((self.order_and_target & TARGET_HI_MASK) << NS.trailing_zeros()) | (self.key_and_target >> KEY_BITS)) as u32
-    }
-
-    #[inline]
-    fn ingest(self, spill: &[i64]) -> i64 {
-        let order = (self.order_and_target as i64) >> TARGET_HI_BITS;
-        if order >= SPILL_TAG as i64 {
-            spill[(order as u64 ^ SPILL_TAG) as usize]
-        } else {
-            order * 1000
-        }
-    }
-}
-
+/// Ordinal-aligned side buffer: a route (not a payload slot) and a byte offset
+/// into the original unquoted ingest field. Ingest is required once during
+/// validation of a tentative payload, but no parsed ingest is retained.
 #[derive(Default)]
-struct ClaimHasher(u64);
+struct Origins {
+    codes: Vec<u32>,
+    anchors: Vec<usize>,
+    wide: Vec<usize>,
+}
 
-impl Hasher for ClaimHasher {
-    fn write(&mut self, _: &[u8]) {
-        unreachable!("the claim table has only u64 keys");
+impl Origins {
+    #[inline]
+    fn push(&mut self, offset: usize, route: usize) {
+        if self.codes.len() % ANCHOR_ROWS == 0 {
+            self.anchors.push(offset);
+        }
+        let delta = offset - self.anchors[self.anchors.len() - 1];
+        let encoded = if delta < WIDE_OFFSET as usize {
+            delta as u32
+        } else {
+            let i = self.wide.len() as u32;
+            // Offsets are increasing and anchors reset every ANCHOR_ROWS.
+            // This can happen in at most one group per WIDE_OFFSET source
+            // bytes before CHUNK, plus the final (possibly enormous) row.
+            debug_assert!(i < WIDE_OFFSET);
+            self.wide.push(offset);
+            WIDE_OFFSET | i
+        };
+        self.codes.push((encoded << ROUTE_BITS) | route as u32);
     }
 
     #[inline]
-    fn write_u64(&mut self, key: u64) {
-        // Keep low bits for indexing and move independent token bits into
-        // the top byte for the table's fingerprint (also on 32-bit hosts).
-        let tag_shift = usize::BITS - 8;
-        self.0 = (key & ((1 << tag_shift) - 1)) | (((key >> 48) & 255) << tag_shift);
-    }
-
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
+    fn ingest(&self, ordinal: usize, data: &[u8], clock: &ManifestClock) -> i64 {
+        let code = self.codes[ordinal] >> ROUTE_BITS;
+        let offset = if code < WIDE_OFFSET {
+            self.anchors[ordinal / ANCHOR_ROWS] + code as usize
+        } else {
+            self.wide[(code ^ WIDE_OFFSET) as usize]
+        };
+        let tail = &data[offset..];
+        // The CSV parser already validated the whole row and removed the
+        // opening quote; comma, quote, LF and EOF are the only possible ends.
+        let field = &tail[..memchr3(b',', b'"', b'\n', tail).unwrap_or(tail.len())];
+        clock.ingest_for_claim(field).0
     }
 }
 
-#[derive(Clone, Copy)]
-struct Location {
-    batch: usize,
-    target: u32,
+struct Batch {
+    payload: Vec<Payload>,
+    ids: Vec<u64>,
+    origins: Origins,
 }
 
 #[derive(Clone, Copy, Default)]
 struct Pending {
-    claim_key: u64,
+    id: u64,
     uid: u64, // zero is never the key of a nonempty ID
     hash: u64,
     ts: i64,
-    claim_order: u64,
+    ingest_offset: usize,
     price: u32,
     cat: u32,
 }
@@ -110,7 +83,7 @@ fn parse<'a>(
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
-) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
+) -> Batch {
     let (ws, we, clock) = window;
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Payload> = (0..NS)
@@ -125,21 +98,25 @@ fn parse<'a>(
             p
         })
         .collect();
-    let mut claims: Vec<Vec<Claim>> = (0..NS).map(|_| Vec::with_capacity(reserve + reserve / 8)).collect();
-    let mut spill = Vec::new();
+    let claim_reserve = (reserve + (reserve / 8)) * NS;
+    let mut ids = Vec::with_capacity(claim_reserve);
+    let mut origins = Origins {
+        codes: Vec::with_capacity(claim_reserve),
+        anchors: Vec::with_capacity(claim_reserve.div_ceil(ANCHOR_ROWS)),
+        wide: Vec::new(),
+    };
     let mut emit = |e: Pending| {
-        let mut target = NONE;
+        let mut route = INVALID;
         if e.uid != 0 {
             let person = people.lookup(e.uid, e.hash);
             let p = shard(match person {
                 Identity::Linked(routed) | Identity::Standalone(routed) => routed,
             });
             let slot = payload[p].push(person, e.ts, e.price, e.cat, packing, people);
-            target = (slot * NS + p) as u32;
+            route = p * 4 + (slot % 4);
         }
-        // This shard supplies the omitted high bits; within it equality of
-        // the stored low bits is equality of the full byte-exact ID token.
-        claims[(e.claim_key >> KEY_BITS) as usize].push(Claim::new(e.claim_key, target, e.claim_order));
+        ids.push(e.id);
+        origins.push(e.ingest_offset, route);
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
@@ -147,32 +124,31 @@ fn parse<'a>(
         if r[0].is_empty() {
             return;
         }
-        let claim_key = links::mix(people.codec.key(r[0]));
-        let (ingest, seconds) = clock.ingest_for_claim(r[3]);
+        // Codec keys (including interned names) and mix are both exact.
+        let id = links::mix(people.codec.key(r[0]));
         let ts = clock.parse_ts(r[2]);
         let mut next = Pending {
-            claim_key,
+            id,
             ts,
-            claim_order: Claim::order(ingest, seconds, &mut spill),
+            ingest_offset: r[3].as_ptr() as usize - c.data.as_ptr() as usize,
             ..Default::default()
         };
-        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) && ingest.saturating_sub(ts) <= DAY {
-            let purchase = match r[4] {
+        if !r[1].is_empty() && !r[5].is_empty() && (ws..we).contains(&ts) {
+            let price = match r[4] {
                 b"purchase" => parse_price(r[6]),
                 b"view" | b"cart" => Some(0),
                 _ => None,
             };
-            if let Some(price) = purchase {
-                let cat = if price == 0 {
-                    0
-                } else {
-                    sm.product_cat.get(r[5]).unwrap_or(sm.unknown_cat)
-                };
+            if let Some(price) = price.filter(|_| clock.ingest_for_claim(r[3]).0.saturating_sub(ts) <= DAY) {
                 next.uid = people.codec.key(r[1]);
                 next.hash = links::mix(next.uid);
                 people.prefetch(next.hash);
                 next.price = price;
-                next.cat = cat;
+                next.cat = if price == 0 {
+                    0
+                } else {
+                    sm.product_cat.get(r[5]).unwrap_or(sm.unknown_cat)
+                };
             }
         }
         let i = n % ring.len();
@@ -185,25 +161,38 @@ fn parse<'a>(
     for i in n.saturating_sub(ring.len())..n {
         emit(ring[i % ring.len()]);
     }
-    (payload, claims, spill)
+    Batch { payload, ids, origins }
 }
 
 #[inline]
-fn probe_index(c: Claim, mask: usize) -> usize {
-    // The mask excludes the colocated payload-shard byte.
-    c.key_and_target as usize & mask
+fn probe(id: u64, mask: usize) -> (usize, u64) {
+    let bits = (1 << ((id >> 32) & 31)) | (1 << (32 + ((id >> 37) & 31)));
+    (id as usize & mask, bits)
+}
+
+#[derive(Clone, Copy, Default)]
+struct Witness {
+    seen: u64,
+    repeated: u64,
+}
+
+impl Witness {
+    #[inline]
+    fn add(&mut self, bits: u64) {
+        self.repeated |= self.seen & bits;
+        self.seen |= bits;
+    }
+
+    #[inline]
+    fn merge(&mut self, other: Self) {
+        self.repeated |= other.repeated | (self.seen & other.seen);
+        self.seen |= other.seen;
+    }
 }
 
 #[inline]
-fn probe(c: Claim, mask: usize) -> (usize, u64) {
-    let k = c.key_and_target;
-    let bits = 1u64.rotate_left((k >> 36) as u32) | 1u64.rotate_left((k >> 42) as u32);
-    (probe_index(c, mask), bits)
-}
-
-#[inline]
-fn prefetch(bloom: &[(u64, u64)], c: Claim, mask: usize) {
-    let ptr: *const (u64, u64) = &bloom[probe_index(c, mask)];
+fn prefetch<T>(filter: &[T], id: u64) {
+    let ptr = &filter[id as usize & (filter.len() - 1)] as *const T;
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
@@ -218,68 +207,125 @@ fn prefetch(bloom: &[(u64, u64)], c: Claim, mask: usize) {
     let _ = ptr;
 }
 
-fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location> {
-    let n: usize = parts.iter().map(|(_, v)| v.len()).sum();
-    // Local blocked Bloom: the second occurrence of any ID necessarily finds
-    // both bits already set and marks it suspect. False positives go to an
-    // EXACT key table. The second pass therefore includes the *first* claim of
-    // every duplicate, too; no assumption about ingest order or validity.
-    let words = n.div_ceil(8).next_power_of_two();
-    let mut bloom = vec![(0u64, 0u64); words];
-    let mask = (words - 1) & KEY_MASK as usize;
-    let mut suspects = 0usize;
-    for (_, claims) in &parts {
-        for (j, &c) in claims.iter().enumerate() {
-            if let Some(&next) = claims.get(j + 6) {
-                prefetch(&bloom, next, mask);
-            }
-            let (i, b) = probe(c, mask);
-            let (seen, repeated) = &mut bloom[i];
-            if *seen & b == b {
-                *repeated |= b;
-                suspects += 1;
-            }
-            *seen |= b;
-        }
-    }
-    let mut remove = Vec::new();
-    if suspects == 0 {
-        return remove;
-    }
-    let mut best = HashMap::with_capacity_and_hasher(suspects, BuildHasherDefault::<ClaimHasher>::default());
-    for (batch, claims) in parts {
-        for (j, &c) in claims.iter().enumerate() {
-            if let Some(&next) = claims.get(j + 6) {
-                prefetch(&bloom, next, mask);
-            }
-            let (i, b) = probe(c, mask);
-            if bloom[i].1 & b != b {
-                continue;
-            }
-            let loc = Location {
-                batch,
-                target: c.target(),
-            };
-            let ingest = c.ingest(&spills[batch]);
-            let lost = match best.entry(c.key()) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((ingest, loc));
-                    continue;
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if ingest < e.get().0 {
-                        e.insert((ingest, loc)).1
-                    } else {
-                        loc
+fn summarize(batches: &[Batch], words: usize) -> Vec<u64> {
+    let lanes = rayon::current_num_threads().min(batches.len()).min(8);
+    (0..lanes)
+        .into_par_iter()
+        .map(|lane| {
+            let mut local = vec![Witness::default(); words];
+            for batch in batches.iter().skip(lane).step_by(lanes) {
+                for (i, &id) in batch.ids.iter().enumerate() {
+                    if let Some(&next) = batch.ids.get(i + 12) {
+                        prefetch(&local, next);
                     }
+                    let (word, bits) = probe(id, words - 1);
+                    local[word].add(bits);
                 }
+            }
+            local
+        })
+        .reduce_with(|mut a, b| {
+            for (x, y) in a.iter_mut().zip(b) {
+                x.merge(y);
+            }
+            a
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|w| w.repeated)
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct Candidate {
+    id: u64,
+    batch: u32,
+    ordinal: u32,
+}
+
+fn candidates(batch: &Batch, index: usize, filter: &[u64]) -> Vec<Vec<Candidate>> {
+    let mut buckets: Vec<Vec<_>> = (0..NS).map(|_| Vec::new()).collect();
+    let index = u32::try_from(index).expect("too many event chunks");
+    for (ordinal, &id) in batch.ids.iter().enumerate() {
+        if let Some(&next) = batch.ids.get(ordinal + 12) {
+            prefetch(filter, next);
+        }
+        let (word, bits) = probe(id, filter.len() - 1);
+        if filter[word] & bits == bits {
+            buckets[(id >> (64 - NS.trailing_zeros())) as usize].push(Candidate {
+                id,
+                batch: index,
+                ordinal: ordinal as u32,
+            });
+        }
+    }
+    buckets
+}
+
+fn losers<'a>(
+    mut rows: Vec<Candidate>,
+    batches: &[Batch],
+    chunks: &[Chunk<'a>],
+    clock: &ManifestClock,
+) -> Vec<Candidate> {
+    // Saturation or adversarial aliases only increase the number of exact
+    // tokens sorted. Even then, no singleton requires a source revisit.
+    rows.sort_unstable_by_key(|x| x.id);
+    let mut lost = Vec::new();
+    for group in rows.chunk_by(|a, b| a.id == b.id).filter(|g| g.len() > 1) {
+        let order = |x: Candidate| {
+            let b = x.batch as usize;
+            let ingest = batches[b].origins.ingest(x.ordinal as usize, chunks[b].data, clock);
+            (ingest, x.batch, x.ordinal)
+        };
+        let mut best = group[0];
+        let mut best_order = order(best);
+        for &c in &group[1..] {
+            let next = order(c);
+            let loser = if next < best_order {
+                best_order = next;
+                std::mem::replace(&mut best, c)
+            } else {
+                c
             };
-            if lost.target != NONE {
-                remove.push(lost);
+            let route = batches[loser.batch as usize].origins.codes[loser.ordinal as usize] & ROUTE_MASK;
+            if route != INVALID as u32 {
+                lost.push(loser);
             }
         }
     }
-    remove
+    lost
+}
+
+fn repair(batch: &mut Batch, mut locations: Vec<u32>) {
+    if locations.is_empty() {
+        return;
+    }
+    locations.sort_unstable();
+    let mut counts = [0usize; INVALID + 1];
+    let mut start = 0;
+    for ordinal in locations.into_iter().map(|x| x as usize) {
+        for &code in &batch.origins.codes[start..ordinal] {
+            counts[(code & ROUTE_MASK) as usize] += 1;
+        }
+        let route = (batch.origins.codes[ordinal] & ROUTE_MASK) as usize;
+        let index = counts[route];
+        counts[route] += 1;
+        start = ordinal + 1;
+        let bucket = &mut batch.payload[route / 4];
+        match route % 4 {
+            0 => bucket.packed.times[index] = u64::MAX,
+            1 => bucket.packed.purchases[index].price = 0,
+            2 => bucket.wide.times[index].ts = BAD,
+            _ => bucket.wide.purchases[index].price = 0,
+        }
+    }
+    for dest in &mut batch.payload {
+        dest.packed.times.retain(|&key| key != u64::MAX);
+        dest.packed.purchases.retain(|p| p.price != 0);
+        dest.wide.times.retain(|key| key.ts != BAD);
+        dest.wide.purchases.retain(|p| p.price != 0);
+    }
 }
 
 pub(super) fn by_person<'a>(
@@ -290,54 +336,55 @@ pub(super) fn by_person<'a>(
     packing: Option<Packing>,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Payload>> {
-    let parsed: Vec<_> = chunks
+    let batches: Vec<_> = chunks
         .par_iter()
         .map(|c| parse(c, sm, people, window, packing))
         .collect();
     log("events parsed");
-    let mut payloads = Vec::with_capacity(parsed.len());
-    let mut spills = Vec::with_capacity(parsed.len());
-    let mut claims: Vec<Vec<_>> = (0..NS).map(|_| Vec::new()).collect();
-    for (batch, (payload, cs, spill)) in parsed.into_iter().enumerate() {
-        payloads.push(payload);
-        spills.push(spill);
-        for (bucket, c) in claims.iter_mut().zip(cs) {
-            if !c.is_empty() {
-                bucket.push((batch, c));
+    let n: usize = batches.iter().map(|x| x.ids.len()).sum();
+    if n < 2 {
+        return batches.into_iter().map(|b| b.payload).collect();
+    }
+    // Bound auxiliary memory independently of input distribution.
+    let words = n.div_ceil(24).next_power_of_two().min(1 << 22);
+    let filter = summarize(&batches, words);
+    log("event witnesses");
+    let candidates: Vec<_> = batches
+        .par_iter()
+        .enumerate()
+        .map(|(b, batch)| candidates(batch, b, &filter))
+        .collect();
+    drop(filter);
+    let mut buckets: Vec<Vec<Vec<Candidate>>> = (0..NS).map(|_| Vec::new()).collect();
+    for parts in candidates {
+        for (dest, v) in buckets.iter_mut().zip(parts) {
+            if !v.is_empty() {
+                dest.push(v);
             }
         }
     }
-    let removals: Vec<_> = claims.into_par_iter().map(|parts| losers(parts, &spills)).collect();
-    let mut by_batch: Vec<Vec<u32>> = (0..payloads.len()).map(|_| Vec::new()).collect();
-    for locations in removals {
-        for loc in locations {
-            by_batch[loc.batch].push(loc.target);
-        }
-    }
-    payloads.par_iter_mut().zip(by_batch).for_each(|(payload, locations)| {
-        if locations.is_empty() {
-            return;
-        }
-        for target in locations {
-            let x = target as usize;
-            let bucket = &mut payload[x % NS];
-            let slot = x / NS;
-            let index = slot / 4;
-            match slot % 4 {
-                0 => bucket.packed.times[index] = u64::MAX,
-                1 => bucket.packed.purchases[index].price = 0,
-                2 => bucket.wide.times[index].ts = BAD,
-                _ => bucket.wide.purchases[index].price = 0,
+    let lost: Vec<_> = buckets
+        .into_par_iter()
+        .map(|parts| {
+            let mut rows = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+            for p in parts {
+                rows.extend(p);
             }
-        }
-        for dest in payload {
-            dest.packed.times.retain(|&key| key != u64::MAX);
-            dest.packed.purchases.retain(|p| p.price != 0);
-            dest.wide.times.retain(|key| key.ts != BAD);
-            dest.wide.purchases.retain(|p| p.price != 0);
-        }
-    });
-    payloads
+            losers(rows, &batches, chunks, window.2)
+        })
+        .collect();
+    let mut by_batch = vec![Vec::new(); batches.len()];
+    for c in lost.into_iter().flatten() {
+        by_batch[c.batch as usize].push(c.ordinal);
+    }
+    batches
+        .into_par_iter()
+        .zip(by_batch)
+        .map(|(mut b, locations)| {
+            repair(&mut b, locations);
+            b.payload
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -345,46 +392,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bloom_alias_keeps_distinct_id_and_invalid_winner_kills_valid_loser() {
-        // Same shard, probe, and exact-table fingerprint, but distinct keys.
-        let id = 13 | (217 << KEY_BITS);
+    fn aliased_probes_and_cross_lane_repeats_keep_exact_ids() {
+        let id = 13 | (217 << 56);
         let alias = id ^ (1 << 24);
-        let later = Claim::new(id, 0, 3);
-        let distinct = Claim::new(alias, 1, 4);
-        assert_eq!(probe(later, 1023), probe(distinct, 1023));
-        let mut spill = Vec::new();
-        let invalid = Claim::new(id, NONE, Claim::order(1234, BAD, &mut spill));
-        let lost = losers(vec![(0, vec![later, distinct]), (1, vec![invalid])], &[vec![], spill]);
-        assert_eq!(lost.len(), 1);
-        assert_eq!((lost[0].batch, lost[0].target), (0, 0));
+        let (i, bits) = probe(id, 1023);
+        assert_eq!(probe(alias, 1023), (i, bits));
+
+        let mut a = Witness::default();
+        let mut b = Witness::default();
+        a.add(bits);
+        b.add(bits);
+        assert_eq!(a.repeated | b.repeated, 0);
+        a.merge(b);
+        assert_eq!(a.repeated, bits);
+        let mut saturated = a;
+        saturated.add(!bits);
+        saturated.add(!bits);
+        assert_eq!(saturated.repeated, u64::MAX);
+
+        let clock = ManifestClock::new(parse_ts(b"2026-10-01T00:00:00Z"), parse_ts(b"2026-10-15T00:00:00Z"));
+        let mut batch = Batch {
+            payload: Vec::new(),
+            ids: vec![id, alias, id],
+            origins: Origins::default(),
+        };
+        let data = b"2026-10-02T10:00:00Z\nnot read\n2026-10-02T09:00:00Z";
+        batch.origins.push(0, 0);
+        batch.origins.push(21, 0);
+        batch.origins.push(b"2026-10-02T10:00:00Z\nnot read\n".len(), INVALID);
+        let chunks = csv::chunks_of(
+            b"ingest\n2026-10-02T10:00:00Z\nnot read\n2026-10-02T09:00:00Z",
+            &["ingest"],
+            std::path::Path::new("test.csv"),
+        );
+        assert_eq!(chunks[0].data, data);
+        let mut filter = vec![0; 1024];
+        filter[i] = saturated.repeated;
+        let suspects = candidates(&batch, 0, &filter).remove(217);
+        assert_eq!(suspects.len(), 3);
+        let lost = losers(suspects, &[batch], &chunks, &clock);
+        assert_eq!(lost.iter().map(|x| x.ordinal).collect::<Vec<_>>(), [0]);
     }
 
     #[test]
-    fn claims_round_trip_exact_tokens_locators_and_millisecond_spills() {
-        let clock = ManifestClock::new(parse_ts(b"2000-02-28T00:00:00Z"), parse_ts(b"2000-03-03T00:00:00Z"));
-        let mut spill = Vec::new();
-        for id in [b"e1".as_slice(), b"e1\0", b"e123456789", "é".as_bytes()] {
-            let codec = Codec::new();
-            let mixed = links::mix(codec.key(id));
-            for target in [0, 255, 256, 0x5555_aaaa, NONE] {
-                for s in [
-                    b"0000-01-01T00:00:00Z".as_slice(),
-                    b"9999-12-31T23:59:59Z",
-                    b"2000-02-29T00:00:00Z",
-                    b"00000001551",
-                    b"2000-02-29T00:00:00+00:00",
-                    b"2000-02-29T00:00:60Z",
-                    b"9999-12-31T23:59:60Z",
-                    b"not a timestamp",
-                ] {
-                    let (ms, secs) = clock.ingest_for_claim(s);
-                    let claim = Claim::new(mixed, target, Claim::order(ms, secs, &mut spill));
-                    assert_eq!(claim.ingest(&spill), ts::parse_ingest(s));
-                    assert_eq!(claim.target(), target);
-                    let reconstructed = claim.key() | ((mixed >> KEY_BITS) << KEY_BITS);
-                    assert_eq!(id, codec.bytes(links::unmix(reconstructed), &mut [0; 9]));
-                }
-            }
+    fn field_offset_wide_spill_and_mid_block_anchor() {
+        let clock = ManifestClock::new(0, DAY);
+        let mut origin = Origins::default();
+        let mut source = vec![b'x'; WIDE_OFFSET as usize + 19];
+        source[WIDE_OFFSET as usize..(WIDE_OFFSET as usize + 6)].copy_from_slice(b"\"123\",");
+        source.extend_from_slice(b"456");
+        origin.push(0, INVALID);
+        origin.push(WIDE_OFFSET as usize + 1, 17);
+        for _ in 2..ANCHOR_ROWS {
+            origin.push(WIDE_OFFSET as usize + 1, 17);
         }
+        origin.push(WIDE_OFFSET as usize + 19, 17);
+        assert_eq!(origin.ingest(1, &source, &clock), 123);
+        assert_eq!(origin.ingest(ANCHOR_ROWS, &source, &clock), 456);
     }
 }

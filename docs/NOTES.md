@@ -1,5 +1,32 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round 3 bloomlite experiment — 2026-11-21 UTC
+
+One strict CSV pass emits tentative person-partitioned payloads and sequential
+8-byte reversible event tokens. A 4-byte side code per claim stores an ingest
+field offset relative to a 128-claim anchor, plus the payload route (not the
+payload index). A full-width offset spill covers unusually long rows. No
+parsed ingest timestamp is retained. Late validation still reads ingest for
+otherwise valid tentative payloads.
+
+Up to eight private blocked bitsets track `seen` and `repeated`. The merge
+unions both masks and adds the intersection of the `seen` masks to `repeated`.
+Every actual repeat is included, even if its earliest copy has no payload.
+Only candidates go through the event-ID scatter and exact sort; only groups
+with an identical full token reread ingest bytes. Full saturation runs the
+same exact sort over all suspects; byte-exact interning covers non-inline IDs.
+Repair reconstructs slot numbers by counting sequential routes in only the
+batches with known valid losers.
+
+Correctness: 39 reference and native edge cases each, 19 Rust tests, 10 dirty
+seeds, 36 official fixtures per implementation, and both official dev
+comparers (117,038 user rows; 27,400 campaign
+rows). Added forced alias/saturation, wide ingest-offset spill, and reordered
+cross-file coverage. No performance claim: parent owns the native benchmark.
+The principal risks are two random bitset passes (up to 64 MiB per lane plus
+32 MiB for the merged repeat mask), exact sorting under saturation, and the
+extra sequential route count for batches with removals.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

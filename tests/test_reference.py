@@ -90,6 +90,33 @@ def ev(eid, uid, ts, etype="view", pid="p1", price="", ingest=None):
 
 
 class EventClaims(unittest.TestCase):
+    def test_cross_file_claims_with_ingest_last_and_independent_payload_locations(self):
+        from unittest.mock import patch
+
+        t = "2026-10-02T10:00:00Z"
+        early = "2026-10-02T09:59:00Z"
+        late = "2026-10-02T10:01:00Z"
+        long_id = "long-é-event-id"
+        events = [
+            ev(long_id, "wrong-person", t, "purchase", price="101", ingest=late),
+            ev("suppressed", "invalid-winner-loser", t, ingest=late),
+            ev("malformed", "kept", t, ingest=late),
+            ev("late-winner", "", t, ingest=early),
+        ]
+        rows = [
+            f'12,linked-alias,p1,purchase,{t},"{long_id}","{early}"',
+            f',ignore,p1,view,in"valid,suppressed,"{early}"',  # malformed, not a claim
+            f',ignore,p1,view,invalid,suppressed,"{early}"',  # valid syntax, invalid event
+            f',ignore,p1,vi"ew,{t},malformed,{early}',
+            f',wrong-person,p1,view,{t},late-winner,{late}',
+        ]
+        header = "price_cents,user_id,product_id,event_type,ts,event_id,ingest_ts"
+        for name in ("events/part-a.csv", "events/part--a.csv"):
+            with self.subTest(file=name), patch.dict(HEADERS, events=header):
+                u, _ = run_case(events, links=["canonical,linked-alias"], extra={name: rows})
+                self.assertEqual({k: r["revenue_cents"] for k, r in u.items()},
+                                 {("canonical", "2026-10-02"): 12, ("kept", "2026-10-02"): 0})
+
     def test_wide_manifest_cached_and_uncached_ingest_claims(self):
         ancient = "0001-01-02T00:00:00Z"
         preepoch = "1969-12-31T23:59:59Z"
