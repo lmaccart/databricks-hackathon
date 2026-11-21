@@ -1,5 +1,19 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## 2026-11-20 — temporal-cell sessionization candidate (detached wt-timeline)
+
+Parent: `54fd8fe`. Scope: sessionization only; parsing, identity, deduplication, click ordering, sliding attribution and Parquet output contracts unchanged. `fast/src/cells.rs` coalesces full `(person, ts.div_euclid(1_800_000))` keys after dedup. Each 32-byte cell keeps min/max offsets, count and a head into an exact sparse `(category, price, next)` purchase list; revenue is summed from that list. Within-cell gaps are strictly less than GAP. Consecutive nonempty cells join iff `next.min - previous.max <= GAP`, so the original session start, UTC day, counts and purchases survive, including negative timestamps and midnight.
+
+The initial single-table build was replaced by a high-person-bit scatter into cache-sized partitions; each partition uses an exact-key linear-probing table and sorts only its nonempty cells. Partition order is person order. Tables grow for arbitrary skew. Scratch buffers are Rayon job-local. If the distinct cell count exceeds half the shard's event count, discard partial cells/purchases and sort the complete, already-collected wide events. This is a work heuristic, never a correctness assumption or a dataset/window limit. Both paths feed the same attribution loop.
+
+**Exploratory measurements, not an acceptance benchmark:** a throwaway dump contained 977,930 surviving official-dev events and 227,459 cells (23.3%). Grouping 20 dev shards at a time, splitting each into 12 pieces, and alternating 15 single-thread in-process old/new trials measured median 134.63 → 99.64 ns/event for gather/coalesce/sort/session enumeration and a purchase checksum. Attribution, I/O and the rest of the pipeline were excluded; host load was high. An adversarial variant moved every event to a distinct cell: even with the wide fallback it measured 148.91 → 263.64 ns/event. Sparse inputs remain a negative result: fallback avoids sorting wider cell records but cannot undo work already spent coalescing. All dump/benchmark hooks and temporary scripts were removed.
+
+No 20M or 60M runs were launched here. End-to-end benefit is **unproven**; the parent owns paired A/B and the decision to retain this speculative candidate. Do not treat the microbenchmark as a scoreboard or whole-pipeline speedup.
+
+Final candidate verification: release build; 28 Python cases against the reference and again against the binary; five Rust tests, including 3,000 deterministic randomized cell-vs-event-sort comparisons and sparse/dense/empty scratch reuse; 36/36 official fixtures. The adversarial Python cases cover min/max insertion order, empty cells, exactly GAP and GAP+1 ms, equal timestamps, linked people, midnight purchases/category ties, true-start click credit/assist ties, and pre-epoch cells/dates. Changing `<= GAP` to `< GAP` made the original Rust differential tests fail (mutation reverted).
+
+Both dev comparers matched 117,038 user rows and 27,400 campaign rows, with empty stdout. Ten kit seeds at 20k events matched the reference. Official generator: seeds 1–20 at 10k matched the Python oracle; seeds 1–20 at 100k and seeds 2, 9, 15 at 1M matched the parent `54fd8fe` binary. Seed 15 covers leap day. A read-only review of cell growth/reuse, fallback ranges and attribution resets found no issues.
+
 ## First hidden practice result
 
 Leif reports **5.03 s** for `cc9f33e`. At the user-reported 0.68 s lead that is a 7.40× gap on the practice clock. The 2.45 s native baseline below is a different measurement; use interleaved local runs to rank changes and a fresh organizer run to evaluate rank.

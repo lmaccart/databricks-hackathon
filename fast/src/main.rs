@@ -8,7 +8,7 @@
 //!   2. events -> parse in parallel chunks, bucket by hash(event_id)
 //!   3. per event shard: dedup (min ingest_ts) -> keep if valid -> bucket by hash(person)
 //!   4. clicks -> parse, validate, bucket by hash(click_id) -> dedup -> bucket by hash(person)
-//!   5. per person shard: sort, sessionize, credit, assists, aggregate
+//!   5. per person shard: coalesce events into 30-minute cells, sort cells, sessionize, credit, assists, aggregate
 //!   6. write Parquet in parallel
 
 use ahash::RandomState;
@@ -20,10 +20,12 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 mod person;
+mod cells;
 mod events;
 mod links;
 mod output;
 use person::Codec;
+use cells::Cells;
 use links::{People, person_names};
 
 const DAY: i64 = 86_400_000;
@@ -454,8 +456,9 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
     best.map(|b| b as u32)
 }
 
-fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small) -> ShardOut {
-    evs.sort_unstable_by_key(|e| (e.person, e.ts));
+fn process_shard(evs: Vec<Vec<PEv>>, mut cls: Vec<PCl>, sm: &Small, cells: &mut Cells) -> ShardOut {
+    cells.build(&evs);
+    drop(evs);
     cls.sort_unstable_by(|a, b| {
         a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| a.cid.cmp(b.cid))
     });
@@ -468,108 +471,95 @@ fn process_shard(mut evs: Vec<PEv>, mut cls: Vec<PCl>, sm: &Small) -> ShardOut {
     let mut catsum = vec![0i64; sm.cat_names.len()];
 
     let mut ci = 0usize;
-    let mut i = 0usize;
-    while i < evs.len() {
-        let person = evs[i].person;
-        let mut j = i;
-        while j < evs.len() && evs[j].person == person {
-            j += 1;
-        }
-        while ci < cls.len() && cls[ci].person < person {
-            ci += 1;
-        }
-        let c0 = ci;
-        while ci < cls.len() && cls[ci].person == person {
-            ci += 1;
-        }
-        let clicks = &cls[c0..ci];
-        let (mut lo, mut hi) = (0usize, 0usize);
+    let mut clicks: &[PCl] = &[];
+    let (mut lo, mut hi) = (0usize, 0usize);
+    let mut row: Option<(u64, i32)> = None; // person and day of the open user row
+    let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
 
-        let mut cur_day: i32 = i32::MIN;
-        let (mut d_sess, mut d_ev, mut d_rev) = (0i64, 0i64, 0i64);
-
-        let mut k = i;
-        while k < j {
-            // one session is evs[k..m]
-            let start = evs[k].ts;
-            let mut m = k + 1;
-            while m < j && evs[m].ts - evs[m - 1].ts <= GAP {
-                m += 1;
-            }
-            let day = start.div_euclid(DAY) as i32;
-            if day != cur_day {
-                if cur_day != i32::MIN {
-                    let top = top_category(&catsum, &sm.cat_rank);
-                    users.push(UserRow { person, day: cur_day, sessions: d_sess, events: d_ev, revenue: d_rev, top });
-                    catsum.iter_mut().for_each(|x| *x = 0);
-                }
-                cur_day = day;
+    for s in cells.sessions() {
+        let start = s.start;
+        let day = start.div_euclid(DAY) as i32;
+        if row != Some((s.person, day)) {
+            if let Some((person, day)) = row {
+                let top = top_category(&catsum, &sm.cat_rank);
+                users.push(UserRow { person, day, sessions: d_sess, events: d_ev, revenue: d_rev, top });
+                catsum.iter_mut().for_each(|x| *x = 0);
                 (d_sess, d_ev, d_rev) = (0, 0, 0);
             }
-            let mut rev = 0i64;
-            let mut purch = false;
-            for e in &evs[k..m] {
-                if e.price != 0 {
-                    purch = true;
-                    rev += e.price as i64;
-                    catsum[e.cat as usize] += e.price as i64;
+            if row.map(|(person, _)| person) != Some(s.person) {
+                // Sessions come person by person; so do the sorted clicks.
+                for &a in &active {
+                    cnt[a as usize] = 0;
                 }
+                active.clear();
+                while ci < cls.len() && cls[ci].person < s.person {
+                    ci += 1;
+                }
+                let c0 = ci;
+                while ci < cls.len() && cls[ci].person == s.person {
+                    ci += 1;
+                }
+                clicks = &cls[c0..ci];
+                (lo, hi) = (0, 0);
             }
-            d_sess += 1;
-            d_ev += (m - k) as i64;
-            d_rev += rev;
+            row = Some((s.person, day));
+        }
+        let mut rev = 0i64;
+        let mut purch = false;
+        for (cat, price) in cells.purchases(&s) {
+            purch = true;
+            rev += price as i64;
+            catsum[cat as usize] += price as i64;
+        }
+        d_sess += 1;
+        d_ev += s.events;
+        d_rev += rev;
 
-            // slide the click window to [start - 7d, start]
-            while hi < clicks.len() && clicks[hi].ts <= start {
-                let c = clicks[hi].camp as usize;
-                if cnt[c] == 0 {
-                    pos[c] = active.len() as u32;
-                    active.push(c as u32);
-                }
-                cnt[c] += 1;
-                hi += 1;
+        // slide the click window to [start - 7d, start]
+        while hi < clicks.len() && clicks[hi].ts <= start {
+            let c = clicks[hi].camp as usize;
+            if cnt[c] == 0 {
+                pos[c] = active.len() as u32;
+                active.push(c as u32);
             }
-            while lo < hi && clicks[lo].ts < start - WEEK {
-                let c = clicks[lo].camp as usize;
-                cnt[c] -= 1;
-                if cnt[c] == 0 {
-                    let p = pos[c] as usize;
-                    let last = active.pop().unwrap();
-                    if last as usize != c {
-                        active[p] = last;
-                        pos[last as usize] = p as u32;
-                    }
-                }
-                lo += 1;
-            }
-            let credit = if lo < hi {
-                // latest ts; among equal ts the smallest click_id (clicks are sorted by ts, cid)
-                let best = clicks[hi - 1].ts;
-                let mut q = hi - 1;
-                while q > lo && clicks[q - 1].ts == best {
-                    q -= 1;
-                }
-                clicks[q].camp
-            } else {
-                ORGANIC
-            };
-            let e = camps.entry(ckey(credit, day)).or_insert([0; 4]);
-            e[0] += 1;
-            e[1] += purch as i64;
-            e[2] += rev;
-            for &a in &active {
-                camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
-            }
-            k = m;
+            cnt[c] += 1;
+            hi += 1;
         }
-        let top = top_category(&catsum, &sm.cat_rank);
-        users.push(UserRow { person, day: cur_day, sessions: d_sess, events: d_ev, revenue: d_rev, top });
-        catsum.iter_mut().for_each(|x| *x = 0);
+        while lo < hi && clicks[lo].ts < start - WEEK {
+            let c = clicks[lo].camp as usize;
+            cnt[c] -= 1;
+            if cnt[c] == 0 {
+                let p = pos[c] as usize;
+                let last = active.pop().unwrap();
+                if last as usize != c {
+                    active[p] = last;
+                    pos[last as usize] = p as u32;
+                }
+            }
+            lo += 1;
+        }
+        let credit = if lo < hi {
+            // latest ts; among equal ts the smallest click_id (clicks are sorted by ts, cid)
+            let best = clicks[hi - 1].ts;
+            let mut q = hi - 1;
+            while q > lo && clicks[q - 1].ts == best {
+                q -= 1;
+            }
+            clicks[q].camp
+        } else {
+            ORGANIC
+        };
+        let e = camps.entry(ckey(credit, day)).or_insert([0; 4]);
+        e[0] += 1;
+        e[1] += purch as i64;
+        e[2] += rev;
         for &a in &active {
-            cnt[a as usize] = 0;
+            camps.entry(ckey(a, day)).or_insert([0; 4])[3] += 1;
         }
-        active.clear();
-        i = j;
+    }
+    if let Some((person, day)) = row {
+        let top = top_category(&catsum, &sm.cat_rank);
+        users.push(UserRow { person, day, sessions: d_sess, events: d_ev, revenue: d_rev, top });
     }
     ShardOut { users, camps }
 }
@@ -621,7 +611,10 @@ fn main() {
         .zip(by_destination(cl_by_person)).collect();
     jobs.sort_unstable_by_key(|(e, c)| std::cmp::Reverse(
         e.iter().map(Vec::len).sum::<usize>() + c.iter().map(Vec::len).sum::<usize>()));
-    let outs: Vec<_> = jobs.into_par_iter().map(|(e, c)| process_shard(gather(e), gather(c), &sm)).collect();
+    let outs: Vec<_> = jobs
+        .into_par_iter()
+        .map_init(Cells::default, |cells, (e, c)| process_shard(e, gather(c), &sm, cells))
+        .collect();
     log("sessions done");
 
     let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());

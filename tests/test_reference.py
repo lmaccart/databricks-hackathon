@@ -40,20 +40,20 @@ def write(path, header, lines):
 
 
 def run_case(events=(), clicks=(), links=(), products=("p1,shoes", "p2,hats", "p3,bags"),
-             campaigns=("c_1,search", "c_2,social", "c_3,email"), extra=None):
+             campaigns=("c_1,search", "c_2,social", "c_3,email"), extra=None, window=(WS, WE)):
     with tempfile.TemporaryDirectory() as tmp:
-        return _run_case_at(tmp, events, clicks, links, products, campaigns, extra)
+        return _run_case_at(tmp, events, clicks, links, products, campaigns, extra, window)
 
 
 HEADERS = {"events": "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents",
            "clicks": "click_id,user_id,campaign_id,ts", "links": "user_id_a,user_id_b"}
 
 
-def _run_case_at(tmp, events, clicks, links, products, campaigns, extra=None):
+def _run_case_at(tmp, events, clicks, links, products, campaigns, extra=None, window=(WS, WE)):
     data, out = os.path.join(tmp, "data"), os.path.join(tmp, "out")
     os.makedirs(data)
     with open(os.path.join(data, "manifest.json"), "w") as fh:
-        json.dump({"window_start": WS, "window_end": WE}, fh)
+        json.dump({"window_start": window[0], "window_end": window[1]}, fh)
     write(os.path.join(data, "products.csv"), "product_id,category", products)
     write(os.path.join(data, "campaigns.csv"), "campaign_id,channel", campaigns)
     write(os.path.join(data, "events", "part-0.csv"),

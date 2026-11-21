@@ -8,8 +8,9 @@
                                      → map uid → person → PEv buckets by hash(person)
    clicks ──parse+validate ║──> buckets by hash(click_id)
                       └─ per shard ║: dedup → map uid → person → PCl buckets by hash(person)
-   per person shard ║: gather PEv + PCl, sort by (hash, name, ts[, click_id])
-                      walk persons: sessionize → day → credit/assist via sliding 7-day window
+   per person shard ║: scatter PEv by high person-key bits; coalesce (person, floor(ts/GAP))
+                      → sort cells (wide-event fallback for sparse shards); sort PCl by (person, ts, click_id)
+                      walk sessions: day → credit/assist via sliding 7-day window
                       → user rows + (campaign, day) counters
    merge campaign counters → write campaign_daily/part-0.parquet
    user rows ║──> user_daily/part-N.parquet (one file per shard group)
@@ -17,7 +18,8 @@
 ```
 
 ## Files
-- `fast/src/main.rs`: the whole v1 pipeline (~700 lines).
+- `fast/src/main.rs`: pipeline orchestration, timestamp/CSV parsing, sliding attribution and daily aggregation.
+- `fast/src/cells.rs`: exact temporal-cell sessionization; 32-byte cells plus sparse purchase chains. Hash tables compare full person and cell keys, never truncated hashes. If cells exceed half the shard's events, retain the original wide-event sort instead. Partition sizing and fallback affect work only, never output.
 - `fast/Cargo.toml`: rayon, memchr, memmap2, ahash, serde_json, arrow-array, arrow-schema, parquet (no compression codecs).
 - `Dockerfile`: root two-stage build (Rust slim → Debian slim), runs as uid 1000.
 - `reference/pipeline.py`: slow, literal oracle. Any disagreement = a bug in one of them; rules.md decides which.
@@ -35,7 +37,7 @@
 | Union-find root = smallest name | The root is the person's name with no second pass. |
 | Sort clicks by (ts, click_id) | Latest-ts tie → the first of the equal-ts run is the smallest click_id. |
 | Sliding window with per-campaign counts + active list | Assists cost O(active campaigns) per session, and the window only moves forward. Shared-device "mega persons" stay linear. |
-| Gap check `ts[m] − ts[m−1] ≤ 30 min` on sorted events | Equal timestamps give gap 0, so "distinct timestamps" falls out for free. |
+| Coalesce `[k·GAP, (k+1)·GAP)` per exact person; connect when `next.min − prev.max ≤ GAP` | Every within-cell gap is less than GAP. Extrema alone decide connectivity across cells; sparse purchase chains preserve category sums. Negative times use Euclidean division. |
 | `day = start.div_euclid(86_400_000)` → Date32 | UTC date; correct for any epoch. |
 | No `-C target-cpu=native` | The scoring CPU is unknown; an illegal instruction is a crash. |
 
