@@ -60,18 +60,47 @@ pub(super) struct People<'a> {
     lanes: Vec<Lane>,
     roots: Vec<u64>,
     pub(super) count: usize,
-    pub(super) rank_limit: usize,
+    pub(super) local_slots: usize,
 }
 
-// This bit is disjoint from the packed routing shard and the canonical node
-// index. It is internal to the link table, not reserved in arbitrary person keys.
+// Internal to the link table, not reserved in arbitrary person keys.
 const LINKED: u64 = 1 << 63;
-const _: () = assert!(SHARD_SHIFT >= 32 && ((NS as u64 - 1) << SHARD_SHIFT) & LINKED == 0);
+const _: () = assert!(NS == 256);
 
 #[derive(Clone, Copy)]
 pub(super) enum Identity {
-    Linked(u64), // shard bits at their normal position, root node index in low bits
+    Ranked(u32), // low byte is the owner, high bits are the local rank
     Standalone(u64),
+}
+
+impl Identity {
+    #[inline]
+    pub(super) fn owner(self) -> usize {
+        match self {
+            Self::Ranked(rank) => rank as usize & (NS - 1),
+            Self::Standalone(key) => ((key >> SHARD_SHIFT) as usize) & (NS - 1),
+        }
+    }
+}
+
+// Bijective within each block of 256: dense local addresses and no reverse
+// table. Rotate ownership between blocks so a fixed lane or within-block
+// position (e.g. from the vacancy table) does not always pick one owner.
+#[inline]
+fn rank_salt(block: u32) -> u8 {
+    (mix(u64::from(block)) >> SHARD_SHIFT) as u8
+}
+
+#[inline]
+fn encode_rank(index: u32) -> u32 {
+    let low = (index as u8).wrapping_mul(197).wrapping_add(rank_salt(index >> 8));
+    (index & !255) | u32::from(low)
+}
+
+#[inline]
+fn decode_rank(rank: u32) -> u32 {
+    let low = (rank as u8).wrapping_sub(rank_salt(rank >> 8)).wrapping_mul(13);
+    (rank & !255) | u32::from(low)
 }
 
 impl<'a> People<'a> {
@@ -84,7 +113,7 @@ impl<'a> People<'a> {
             let occupant = slot.key.load(Relaxed);
             let value = slot.value;
             if occupant == key {
-                return Identity::Linked(value & !LINKED);
+                return Identity::Ranked(value as u32);
             }
             if value & LINKED == 0 {
                 // Originally empty: no linked key could be past this hole on
@@ -93,7 +122,7 @@ impl<'a> People<'a> {
                 if occupant == 0 && value != NO_RANK {
                     let got = slot.key.compare_exchange(0, key, Relaxed, Relaxed);
                     if got.is_ok() || got == Err(key) {
-                        return Identity::Linked(value);
+                        return Identity::Ranked(value as u32);
                     }
                 }
                 return Identity::Standalone(h);
@@ -104,7 +133,7 @@ impl<'a> People<'a> {
 
     #[inline]
     pub(super) fn original(&self, rank: u32) -> u64 {
-        let r = rank as usize;
+        let r = decode_rank(rank) as usize;
         if r < self.count {
             return self.roots[r];
         }
@@ -265,11 +294,10 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         for (i, slot) in lane.slots.iter_mut().enumerate() {
             if *slot.key.get_mut() != 0 {
                 let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
-                let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
-                slot.value = LINKED | routing | u64::from(rank);
+                slot.value = LINKED | u64::from(encode_rank(rank));
             } else if span.is_some() {
-                let rank = (count + i * LANES + s) as u64;
-                slot.value = (mix(rank) & ((NS as u64 - 1) << SHARD_SHIFT)) | rank;
+                let index = (count + i * LANES + s) as u32;
+                slot.value = u64::from(encode_rank(index));
             } else {
                 slot.value = NO_RANK;
             }
@@ -280,7 +308,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         lanes,
         roots,
         count,
-        rank_limit: span.unwrap_or(count),
+        local_slots: span.unwrap_or(count).div_ceil(NS),
     }
 }
 
@@ -289,6 +317,20 @@ mod slot_tests {
     use super::*;
     use crate::csv::chunks_of;
     use std::path::Path;
+
+    #[test]
+    fn each_rank_block_uses_every_owner_once_and_decodes_exactly() {
+        for block in [0, 1, 209, 18_734, u32::MAX >> 8] {
+            let mut owners = [false; NS];
+            for i in 0..NS as u32 {
+                let index = (block << 8) | i;
+                let rank = encode_rank(index);
+                assert_eq!(decode_rank(rank), index);
+                assert_eq!(rank >> 8, block);
+                assert!(!std::mem::replace(&mut owners[rank as usize & (NS - 1)], true));
+            }
+        }
+    }
 
     #[test]
     fn concurrent_singletons_share_holes_without_masking_aliases() {
@@ -314,9 +356,9 @@ mod slot_tests {
             .map(|i| {
                 let (k, h) = pair[i % 2];
                 match names.lookup(k, h) {
-                    Identity::Linked(v) => {
-                        assert_eq!(names.original(v as u32), h);
-                        (true, v)
+                    Identity::Ranked(v) => {
+                        assert_eq!(names.original(v), h);
+                        (true, u64::from(v))
                     }
                     Identity::Standalone(v) => {
                         assert_eq!(v, h);
@@ -332,10 +374,10 @@ mod slot_tests {
         let root = mix(crate::person::inline(b"Aroot").unwrap());
         for bytes in [b"Aroot".as_slice(), b"Zalias", b"Balias"] {
             let k = crate::person::inline(bytes).unwrap();
-            let Identity::Linked(v) = names.lookup(k, mix(k)) else {
+            let Identity::Ranked(v) = names.lookup(k, mix(k)) else {
                 panic!("alias displaced");
             };
-            assert_eq!(names.original(v as u32), root);
+            assert_eq!(names.original(v), root);
         }
     }
 }

@@ -173,9 +173,7 @@ fn parse<'a>(
         let mut target = NONE;
         if e.uid != 0 {
             let person = people.lookup(e.uid, e.hash);
-            let p = shard(match person {
-                Identity::Linked(routed) | Identity::Standalone(routed) => routed,
-            });
+            let p = person.owner();
             let slot = payload[p].push(person, e.ts, e.price, e.cat, packing, people);
             target = (slot * NS + p) as u32;
         }

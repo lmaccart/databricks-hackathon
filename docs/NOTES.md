@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Round four: direct rank ranges — 2026-11-21
+
+Candidate against `a32d0b7`: the owner is the low rank byte for canonical links and singleton vacancy winners. One reversible permutation of each block of 256 addresses keeps the local index dense and spreads consecutive vacancy slots; it does not assume any bound on the event count of one person. A two-pass histogram/scatter uses only occupied addresses (hash directory for sparse shards), discards click-only ranks, and builds person-local arrays of four-byte millisecond offsets, 12-byte purchases and exact click tokens. The parser still writes eight-byte rank/offset keys because both values must survive claim dedup; ranked click records shrink from 32 to 24 bytes. Hot time ranges use exact min/max/count per `2^20` ms bin instead of sorting. Colliding vacancy claims and windows wider than `2^32` ms retain the full-width path.
+
+Checks on the Apple M2 Pro: 41 Python edge cases on both implementations, 25 Rust tests, all 36 official fixtures on both implementations, 10 dirty-seed diffs, and three 100k official-generator diffs including leap-day seed 15. Both dev checkers matched all 117,038 user rows and 27,400 campaign rows; opaque, reordered IDs matched at one and eight workers. The run was capped at 1M events locally; no Docker, Intel, practice-scale or final-scale runs were made.
+
+Final 1M dev timing, eight workers, 21 alternating pairs: process medians **0.068 → 0.065 s** (5.5% less), but the median paired savings were only **1.4%** (13/21 wins; range −11.9% to +22.7%). Median session phase was **0.012 → 0.012 s** at millisecond resolution. Thus no reliable end-to-end gain or scale claim yet. Per-run clocks are in the ignored `scratch/bench-final-retest.json`.
+
 ## Round-three head-to-head decision — 2026-11-21 07:05 UTC
 
 Keep `7fd1b76` for practice. The partition-local identity join saved 10.1% at 60M against the older scored build on one host, but **lost 2.2% at 60M** against this parser in [their direct Docker comparison](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584). Likewise the three-input parser with independent clocks [reduced full Docker time 8.8%/8.7% against the scored build on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639), but [gained only 1.1% at 20M and lost 1.9% at 60M against the typed-event parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) on another AMD CPU. Sharing the event and ingest civil fields also reversed between AMD and Intel. Full results, including negative trials and the second 60M seed, are in [PERF_157.md](PERF_157.md).
