@@ -60,6 +60,7 @@ pub(super) struct People<'a> {
     lanes: Vec<Lane>,
     roots: Vec<u64>,
     pub(super) count: usize,
+    pub(super) prefix: Option<u8>,
 }
 
 // This bit is disjoint from the packed routing shard and the canonical node
@@ -136,6 +137,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         .map(|c| {
             let mut edges = Vec::new();
             let mut keys: Vec<Vec<u64>> = (0..LANES).map(|_| Vec::new()).collect();
+            let mut prefix_counts = [0usize; 256];
             for_rows(c, |r| {
                 if r[0].is_empty() || r[1].is_empty() {
                     return;
@@ -146,11 +148,25 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
                 for k in [a, b] {
                     keys[mix(k) as usize & (LANES - 1)].push(k);
                 }
+                prefix_counts[r[0][0] as usize] += 1;
+                prefix_counts[r[1][0] as usize] += 1;
             });
-            (edges, keys)
+            (edges, keys, prefix_counts)
         })
         .collect();
-    let (edges, key_parts): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
+    let mut prefix_counts = [0usize; 256];
+    for (_, _, counts) in &parsed {
+        for (sum, &n) in prefix_counts.iter_mut().zip(counts) {
+            *sum += n;
+        }
+    }
+    let prefix = prefix_counts
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n != 0)
+        .max_by_key(|&(b, n)| (*n, std::cmp::Reverse(b)))
+        .map(|(b, _)| b as u8);
+    let (edges, key_parts): (Vec<_>, Vec<_>) = parsed.into_iter().map(|(edges, keys, _)| (edges, keys)).unzip();
     let built: Vec<_> = (0..LANES)
         .into_par_iter()
         .map(|s| {
@@ -243,5 +259,6 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         lanes,
         roots,
         count,
+        prefix,
     }
 }

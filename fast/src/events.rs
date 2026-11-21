@@ -12,7 +12,7 @@ struct Claim {
 
 // An emitted event has at least six commas. At most one row extends past
 // CHUNK, so the stream kind, per-stream ordinal and shard fit in the claim.
-const _: () = assert!(NS == 256 && (CHUNK / 6 + 1) * 4 * NS < u32::MAX as usize);
+const _: () = assert!(NS == 256 && (CHUNK / 6 + 1) * 6 * NS < u32::MAX as usize);
 const NONE: u32 = u32::MAX;
 const KEY_BITS: u32 = u64::BITS - NS.trailing_zeros();
 const KEY_MASK: u64 = (1 << KEY_BITS) - 1;
@@ -110,6 +110,7 @@ fn parse<'a>(
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
+    radix36: Option<stream::RadixLayout>,
 ) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
     let (ws, we, clock) = window;
     let reserve = reserve_per_shard(c.data);
@@ -122,6 +123,9 @@ fn parse<'a>(
             if packing.is_some() {
                 p.packed.times.reserve(reserve / 2);
             }
+            if radix36.is_some() {
+                p.radix36.times.reserve(reserve / 4);
+            }
             p
         })
         .collect();
@@ -131,10 +135,23 @@ fn parse<'a>(
         let mut target = NONE;
         if e.uid != 0 {
             let person = people.lookup(e.uid, e.hash);
+            let radix_id = match person {
+                Identity::Standalone(_) => {
+                    radix36.and_then(|layout| layout.encode(people.codec.bytes(e.uid, &mut [0; 9])))
+                }
+                Identity::Linked(_) => None,
+            };
             let p = shard(match person {
                 Identity::Linked(routed) | Identity::Standalone(routed) => routed,
             });
-            let slot = payload[p].push(person, e.ts, e.price, e.cat, packing, people);
+            let slot = payload[p].push(
+                person,
+                e.ts,
+                e.price,
+                e.cat,
+                stream::RouteKey { packing, radix_id },
+                people,
+            );
             target = (slot * NS + p) as u32;
         }
         // This shard supplies the omitted high bits; within it equality of
@@ -288,11 +305,12 @@ pub(super) fn by_person<'a>(
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
+    radix36: Option<stream::RadixLayout>,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Payload>> {
     let parsed: Vec<_> = chunks
         .par_iter()
-        .map(|c| parse(c, sm, people, window, packing))
+        .map(|c| parse(c, sm, people, window, packing, radix36))
         .collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
@@ -322,12 +340,15 @@ pub(super) fn by_person<'a>(
             let x = target as usize;
             let bucket = &mut payload[x % NS];
             let slot = x / NS;
-            let index = slot / 4;
-            match slot % 4 {
+            let index = slot / 6;
+            match slot % 6 {
                 0 => bucket.packed.times[index] = u64::MAX,
                 1 => bucket.packed.purchases[index].price = 0,
                 2 => bucket.wide.times[index].ts = BAD,
-                _ => bucket.wide.purchases[index].price = 0,
+                3 => bucket.wide.purchases[index].price = 0,
+                4 => bucket.radix36.times[index].ts = BAD,
+                5 => bucket.radix36.purchases[index].price = 0,
+                _ => unreachable!(),
             }
         }
         for dest in payload {
@@ -335,6 +356,8 @@ pub(super) fn by_person<'a>(
             dest.packed.purchases.retain(|p| p.price != 0);
             dest.wide.times.retain(|key| key.ts != BAD);
             dest.wide.purchases.retain(|p| p.price != 0);
+            dest.radix36.times.retain(|key| key.ts != BAD);
+            dest.radix36.purchases.retain(|p| p.price != 0);
         }
     });
     payloads

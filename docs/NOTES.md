@@ -1,5 +1,28 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Standalone radix-36 temporal subshards — 2026-11-21
+
+The `radixseconds` experiment learns the most frequent first byte from valid
+link endpoints and only compacts standalone IDs with that prefix and up to
+eight lowercase ASCII radix-36 suffix bytes. A cumulative length offset keeps
+`u0`, `u00`, and `u000` distinct. Case variants, punctuation, longer suffixes,
+other prefixes, unlinked IDs outside the observed prefix, and unrepresentable
+time windows keep the exact wide path. Compact IDs are decoded from the output
+key; no rank map or normalization is used. At gather, high ID-token bits select
+independent subshards and the remaining ID bits plus the full millisecond
+offset form a 64-bit temporal key. Clicks and purchases use the same token and
+subshard.
+
+Correctness checks: 21 Rust tests, 38 Python tests, 36/36 official fixtures,
+10/10 dirty 20k-event seeds, and exact public-dev output (117,038 user rows;
+27,400 campaign rows). The public-dev paired timing (five alternating
+process pairs, 8 threads) was **0.206 s baseline vs 0.241 s candidate** median
+(candidate 16.7% slower; only 2/5 pairs won, with high run-to-run variance).
+This is not evidence of a production improvement. Per the round constraint,
+no 20M/60M or Docker run was made; do not promote based on the narrower key
+alone. The temporal key is 8 bytes rather than `Wide`'s 16, but the extra
+encoding and subshard conversion currently cost more on the dev run.
+
 ## Practice pick: compact claims, manifest clock and ranked events — 2026-11-21 05:48 UTC
 
 Use [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f) for the next practice slot. Its production source, lockfile and Dockerfile are identical to the tested `62ad4de` (`fast/` tree `f2ea2526a3bdbb4d7d9ece368d446f639ea7a07c`). The integrated suite passed 38 edge cases against each implementation, 19 Rust tests, 10 dirty seeds, all 36 official fixtures, and both dev comparers.

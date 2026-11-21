@@ -44,6 +44,12 @@ fn rs() -> RandomState {
     RandomState::with_seeds(0x9E37_79B9, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F)
 }
 
+#[derive(Clone, Copy)]
+enum UserName {
+    Exact(u64),
+    Radix36(u64),
+}
+
 // ------------------------------------------------------------------ CSV dialect, timestamps
 
 mod csv;
@@ -219,6 +225,7 @@ fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
 struct Clicks {
     packed: Vec<PCl>,
     wide: Vec<PCl>,
+    radix36: Vec<stream::CompactClick>,
 }
 
 fn parse_clicks<'a>(
@@ -227,6 +234,7 @@ fn parse_clicks<'a>(
     window: (i64, i64, &ManifestClock),
     names: &People<'a>,
     packed: bool,
+    radix36: Option<stream::RadixLayout>,
 ) -> Vec<Clicks> {
     let (lo, we, clock) = window;
     let hint = reserve_per_shard(c.data);
@@ -234,6 +242,7 @@ fn parse_clicks<'a>(
         .map(|_| Clicks {
             wide: Vec::with_capacity(if packed { hint / 2 } else { hint }),
             packed: Vec::with_capacity(if packed { hint / 2 } else { 0 }),
+            radix36: Vec::new(),
         })
         .collect();
     #[derive(Clone, Copy, Default)]
@@ -244,18 +253,37 @@ fn parse_clicks<'a>(
         ts: i64,
         camp: u32,
     }
-    let mut emit = |row: PendingClick| {
-        let (dest, person) = match names.lookup(row.uid, row.hash) {
-            Identity::Linked(p) if packed => (&mut b[shard(p)].packed, u64::from(p as u32)),
-            Identity::Linked(p) => (&mut b[shard(p)].wide, names.original(p as u32)),
-            Identity::Standalone(p) => (&mut b[shard(p)].wide, p),
-        };
-        dest.push(PCl {
-            person,
+    let mut emit = |row: PendingClick| match names.lookup(row.uid, row.hash) {
+        Identity::Linked(p) if packed => b[shard(p)].packed.push(PCl {
+            person: u64::from(p as u32),
             ts: row.ts,
             cid: row.cid,
             camp: row.camp,
-        });
+        }),
+        Identity::Linked(p) => b[shard(p)].wide.push(PCl {
+            person: names.original(p as u32),
+            ts: row.ts,
+            cid: row.cid,
+            camp: row.camp,
+        }),
+        Identity::Standalone(p) => {
+            let radix_id = radix36.and_then(|layout| layout.encode(names.codec.bytes(row.uid, &mut [0; 9])));
+            if let Some(id) = radix_id {
+                b[shard(p)].radix36.push(stream::CompactClick {
+                    id,
+                    ts: row.ts,
+                    cid: row.cid,
+                    camp: row.camp,
+                });
+            } else {
+                b[shard(p)].wide.push(PCl {
+                    person: p,
+                    ts: row.ts,
+                    cid: row.cid,
+                    camp: row.camp,
+                });
+            }
+        }
     };
     let mut ring = [PendingClick::default(); 16];
     let mut n = 0usize;
@@ -295,7 +323,7 @@ fn parse_clicks<'a>(
 // ------------------------------------------------------------------ sessions
 
 struct UserRow {
-    person: u64,
+    person: UserName,
     day: i32,
     sessions: i64,
     events: i64,
@@ -362,7 +390,7 @@ fn process_stream<T: Temporal>(
     let mut pi = 0usize;
     while i < evs.len() {
         let rank = evs[i].person(layout);
-        let person = T::name(rank, people);
+        let person = T::name(rank, layout, people);
         let mut j = i;
         while j < evs.len() && evs[j].person(layout) == rank {
             j += 1;
@@ -489,9 +517,24 @@ fn process_shard(
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
+    radix36: Option<stream::RadixLayout>,
 ) -> ShardOut {
-    let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
-    let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
+    let mut packed = Vec::with_capacity(evs.len());
+    let mut wide = Vec::with_capacity(evs.len());
+    let mut compact = Vec::with_capacity(evs.len());
+    for e in evs {
+        packed.push(e.packed);
+        wide.push(e.wide);
+        compact.push(e.radix36);
+    }
+    let mut pc = Vec::with_capacity(cls.len());
+    let mut wc = Vec::with_capacity(cls.len());
+    let mut rc = Vec::with_capacity(cls.len());
+    for c in cls {
+        pc.push(c.packed);
+        wc.push(c.wide);
+        rc.push(c.radix36);
+    }
     let mut out = ShardOut {
         users: Vec::new(),
         camps: Map::with_hasher(rs()),
@@ -500,6 +543,42 @@ fn process_shard(
         process_stream(packed, gather(pc), sm, people, pack, &mut out);
     }
     process_stream(wide, gather(wc), sm, people, (), &mut out);
+    if let Some(layout) = radix36 {
+        let mut groups: Map<u64, (Stream<stream::CompactKey>, Vec<PCl>)> = Map::with_hasher(rs());
+        for s in compact {
+            for row in s.times {
+                let owner = layout.owner(row.id);
+                groups
+                    .entry(owner)
+                    .or_default()
+                    .0
+                    .times
+                    .push(layout.key(row.id, row.ts));
+            }
+            for row in s.purchases {
+                let owner = layout.owner(row.id);
+                groups.entry(owner).or_default().0.purchases.push(stream::Purchase {
+                    key: layout.key(row.id, row.ts),
+                    price: row.price,
+                    cat: row.cat,
+                });
+            }
+        }
+        for clicks in rc {
+            for row in clicks {
+                let owner = layout.owner(row.id);
+                groups.entry(owner).or_default().1.push(PCl {
+                    person: layout.local_id(row.id),
+                    ts: row.ts,
+                    cid: row.cid,
+                    camp: row.camp,
+                });
+            }
+        }
+        for (owner, (stream, clicks)) in groups {
+            process_stream(vec![stream], clicks, sm, people, layout.for_owner(owner), &mut out);
+        }
+    }
     out
 }
 
@@ -556,33 +635,52 @@ fn main() {
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
     let names = person_names(&link_chunks);
     let packing = Packing::new(ws, we, names.count);
+    let radix36 = stream::RadixLayout::new(ws.saturating_sub(WEEK), we, names.prefix);
     log(&format!("links: {} linked ids", names.count));
 
-    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, &log);
+    let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, radix36, &log);
     log("events deduped");
 
     let cl_by_person = cl_chunks
         .par_iter()
-        .map(|c| parse_clicks(c, &sm, (ws.saturating_sub(WEEK), we, &clock), &names, packing.is_some()))
+        .map(|c| {
+            parse_clicks(
+                c,
+                &sm,
+                (ws.saturating_sub(WEEK), we, &clock),
+                &names,
+                packing.is_some(),
+                radix36,
+            )
+        })
         .collect();
     log("clicks routed");
 
-    let len =
-        |e: &Payload| e.packed.times.len() + e.packed.purchases.len() + e.wide.times.len() + e.wide.purchases.len();
+    let len = |e: &Payload| {
+        e.packed.times.len()
+            + e.packed.purchases.len()
+            + e.wide.times.len()
+            + e.wide.purchases.len()
+            + e.radix36.times.len()
+            + e.radix36.purchases.len()
+    };
     let mut jobs: Vec<_> = by_destination(ev_by_person, |e| len(e) > 0)
         .into_iter()
         .zip(by_destination(cl_by_person, |c| {
-            !c.packed.is_empty() || !c.wide.is_empty()
+            !c.packed.is_empty() || !c.wide.is_empty() || !c.radix36.is_empty()
         }))
         .collect();
     jobs.sort_unstable_by_key(|(e, c)| {
         std::cmp::Reverse(
-            e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
+            e.iter().map(len).sum::<usize>()
+                + c.iter()
+                    .map(|x| x.packed.len() + x.wide.len() + x.radix36.len())
+                    .sum::<usize>(),
         )
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(e, c)| process_shard(e, c, &sm, &names, packing, radix36))
         .collect();
     log("sessions done");
 
@@ -626,7 +724,10 @@ fn main() {
                 &ud,
                 &shards,
                 parts,
-                &|p, out| out.extend_from_slice(names.codec.bytes(links::unmix(p), &mut [0; 9])),
+                &|p, out| match p {
+                    UserName::Exact(key) => out.extend_from_slice(names.codec.bytes(links::unmix(key), &mut [0; 9])),
+                    UserName::Radix36(id) => radix36.unwrap().decode(id, out),
+                },
                 &sm.cat_names,
             )
         },

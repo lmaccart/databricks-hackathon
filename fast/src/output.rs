@@ -152,7 +152,7 @@ pub fn user_daily(
     dir: &Path,
     shards: &[&[UserRow]],
     parts: usize,
-    key: &(impl Fn(u64, &mut Vec<u8>) + Sync),
+    key: &(impl Fn(crate::UserName, &mut Vec<u8>) + Sync),
     cats: &[Vec<u8>],
 ) {
     let per = shards.len().div_ceil(parts.max(1)).max(1);
