@@ -1,9 +1,50 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Temporal slab challenger — 2026-11-21 UTC
+
+The challenger keeps `NS=256` and stores the **actual** destination in
+the original 8-bit claim field. In the earlier diagnostic below, a new
+locator was assumed necessary; none is needed because both emission and
+tombstoning address the same physical partition inside the parse batch.
+Independent exact event-ID dedup finishes before any slab sorts.
+
+Slab width comes from the manifest. Up to eight contiguous slabs replace
+the low owner-shard bits, keeping 32 owner groups for eight workers on a
+14-day window. Short/empty windows, spans beyond `u32::MAX` milliseconds,
+or too few groups per worker take the whole-owner path. The exact
+half-open routing includes the first and last valid milliseconds without
+admitting `window_end`. Clicks route to the whole owner group immediately.
+
+Each parallel slab sort drops the raw temporal keys after emitting exact
+person/start/end/count spans and sparse purchases. The final owner-group
+sort orders spans by person/start. A span contains no internal gap over
+30 minutes, so the only gap that can change the result is from the
+running maximum end to the next start for that exact person. Stitching
+adds counts and retains the earliest start and maximum end. Only then
+does the unchanged credit/assist walk run at the final start; sparse
+purchases are sorted by exact person/time and consumed through the final
+inclusive end. No campaign/day partials have to be reconciled across slabs.
+
+Both official dev checkers matched (117,038 user / 27,400 campaign rows,
+empty stdout). Both implementations passed all 36 fixtures and 41 Python
+edge cases; Rust passed 24 unit tests. Ten kit dirty seeds at 20k events
+matched. New cases include a chain through all eight slabs, start/last
+purchases and clicks, cross-file/cross-slab duplicate and bridge removal,
+exact and +1 ms gaps, and opaque identity and unknown-dimension handling.
+
+Nine alternating native ARM64 dev pairs at eight workers, control
+`f4ac682`: median **0.050 → 0.051 s** (−0.7% less time, effectively flat).
+Rounded session phases were 8 ms whole-owner vs 3 ms local sort/scan +
+5 ms final sort/stitch/attribution. This is a challenger for a paired
+20M run, not a promotion recommendation. No local 20M or Docker run was
+performed. Compare on the same data and runner with `tools/bench_pair.py`,
+five or more alternating pairs at eight workers; check exact output before
+interpreting timing.
+
 ## Temporal slab stitching diagnostic — 2026-11-21 UTC
 
-No replacement was implemented or benchmarked; retain `f4ac682` as the control,
-not a tested stitching candidate. Temporary instrumentation of its existing
+No replacement had been implemented at this stage; `f4ac682` is the control.
+Temporary instrumentation of its existing
 whole-owner sorted scan measured slab-local sessions on the 1M-event official
 dev set (eight workers, manifest-aligned, half-open UTC slabs). This is a
 post-sort diagnostic, not a simulation of parallel slab processing. Its
@@ -25,9 +66,9 @@ stream had 21,158, so splitting the hot owner could plausibly improve balance.
 The largest click stream for one packed/wide owner shard had 3,496 entries.
 These distributions do not establish performance or memory at 20M/60M.
 
-The current event claim target embeds an 8-bit owner destination and an
-ordinal into a particular parse-batch payload; direct slab routing needs a
-new exact locator scheme. Repartitioning the already committed payloads instead
+The diagnostic originally assumed direct slab routing would require a new
+locator; the challenger above supersedes that assumption. Repartitioning
+already committed payloads instead
 adds a full-data scatter. Interior aggregation must also merge exact
 person/day category totals across slabs, and clicks must remain accessible
 for the earliest start of a stitched chain. Neither cost has been measured.

@@ -250,6 +250,67 @@ class CsvDialect(unittest.TestCase):
 
 
 class EventsOrder(unittest.TestCase):
+    def test_session_chain_through_every_slab(self):
+        end = ms(WE)
+        stamps = [*range(WS_MS, end, 30 * MIN), end - 1]
+        events = [
+            ev(f"chain{i}", ("phone", "laptop")[i % 2], str(t))
+            for i, t in enumerate(stamps)
+        ]
+        events[0] = ev("chain0", "phone", WS, "purchase", "p1", "11")
+        events[-1] = ev(f"chain{len(stamps)-1}", "laptop", str(end - 1), "purchase", "missing", "17")
+        events += [
+            ev("last-tie", "phone", str(end - 1), "purchase", "p2", "5"),
+            ev("outside-end", "laptop", WE, "purchase", "p2", "200"),
+            ev("outside-start", "phone", str(WS_MS - 1), "purchase", "p2", "200"),
+        ]
+        users, camps = run_case(
+            events=events[::-1], links=["A unseen,phone", "laptop,phone"],
+            extra={"events/part-1.csv": [
+                ev("chain0", "standalone ü", str(end - 1), "purchase", "p2", "999"),
+            ]},
+            clicks=[
+                f"edge,phone,c_2,{WS_MS - 7 * DAY}",
+                f"start,laptop,c_1,{WS_MS}",
+                f"after-start,phone,c_3,{WS_MS + 1}",
+                f"last,laptop,c_3,{end - 1}",
+                f"unknown,phone,c_99,{WS_MS}",
+            ],
+        )
+        day = "2026-10-01"
+        self.assertEqual(set(users), {("A unseen", day)})
+        row = users[("A unseen", day)]
+        self.assertEqual((row["sessions"], row["events"], row["revenue_cents"], row["top_category"]),
+                         (1, len(stamps) + 1, 33, "unknown"))
+        self.assertEqual(set(camps), {("c_1", day), ("c_2", day)})
+        credit, assist = camps[("c_1", day)], camps[("c_2", day)]
+        self.assertEqual((credit["sessions"], credit["purchasing_sessions"],
+                          credit["revenue_cents"], credit["assisted_sessions"]), (1, 1, 33, 1))
+        self.assertEqual((assist["sessions"], assist["assisted_sessions"]), (0, 1))
+
+    def test_slab_edge_gap_and_duplicate_bridge(self):
+        # One exact split at the first 14-day/8 slab edge (Oct 2 18:00 UTC).
+        edge = WS_MS + (ms(WE) - WS_MS) // 8
+        events = []
+        for name, gap in [(" ópaque", 30 * MIN), (" ópaque ", 30 * MIN + 1), ("bridge", 60 * MIN)]:
+            events += [ev(f"{name}-left", name, str(edge - 30 * MIN), "purchase", "p1", "1"),
+                       ev(f"{name}-right", name, str(edge - 30 * MIN + gap), "purchase", "p2", "2")]
+        events.append(ev("losing-bridge", "bridge", str(edge), "purchase", "p1", "999"))
+        users, camps = run_case(
+            events=events,
+            extra={"events/part-1.csv": [
+                ev("losing-bridge", "other-owner", str(edge - 30 * MIN), "purchase", "p1", "4")
+            ]},
+            clicks=[f"earlier, ópaque,c_1,{edge - 30 * MIN}", f"later, ópaque,c_2,{edge}"],
+        )
+        day = "2026-10-02"
+        self.assertEqual({name: (row["sessions"], row["events"], row["revenue_cents"])
+                          for (name, d), row in users.items() if d == day},
+                         {" ópaque": (1, 2, 3), " ópaque ": (2, 2, 3),
+                          "bridge": (2, 2, 3), "other-owner": (1, 1, 4)})
+        self.assertEqual(camps[("c_1", day)]["revenue_cents"], 3)
+        self.assertNotIn(("c_2", day), camps)
+
     def test_line_wider_than_a_parse_chunk_does_not_shift_duplicate_targets(self):
         t = "2026-10-02T12:00:00Z"
         early = "2026-10-02T11:59:59Z"

@@ -13,7 +13,7 @@ struct Claim {
 }
 
 // An emitted event has at least six commas. At most one row extends past
-// CHUNK, so the stream kind, per-stream ordinal and shard fit in the claim.
+// CHUNK, so the stream kind, per-stream ordinal and physical partition fit in the claim.
 const _: () = assert!(NS == 256 && (CHUNK / 6 + 1) * 4 * NS < u32::MAX as usize);
 const NONE: u32 = u32::MAX;
 const KEY_BITS: u32 = u64::BITS - NS.trailing_zeros();
@@ -153,6 +153,7 @@ fn parse<'a>(
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
+    slabs: Slabs,
 ) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
     let reserve = reserve_per_shard(c.data);
     let mut payload: Vec<Payload> = (0..NS)
@@ -173,10 +174,13 @@ fn parse<'a>(
         let mut target = NONE;
         if e.uid != 0 {
             let person = people.lookup(e.uid, e.hash);
-            let p = shard(match person {
+            let owner = shard(match person {
                 Identity::Linked(routed) | Identity::Standalone(routed) => routed,
             });
+            let p = slabs.partition(owner, e.ts);
             let slot = payload[p].push(person, e.ts, e.price, e.cat, packing, people);
+            // Both the claim and removal pass address the actual partition,
+            // not the full owner shard that would have held this row.
             target = (slot * NS + p) as u32;
         }
         // This shard supplies the omitted high bits; within it equality of
@@ -302,11 +306,12 @@ pub(super) fn by_person<'a>(
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
+    slabs: Slabs,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Payload>> {
     let parsed: Vec<_> = chunks
         .par_iter()
-        .map(|c| parse(c, sm, people, window, packing))
+        .map(|c| parse(c, sm, people, window, packing, slabs))
         .collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());

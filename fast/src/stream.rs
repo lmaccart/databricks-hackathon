@@ -1,6 +1,6 @@
 //! Most events carry only a temporal key. Purchases carry their own full
 //! payload until dedup, then contribute a key to the temporal stream as well.
-use super::{Identity, People};
+use super::{GAP, Identity, People};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Wide {
@@ -41,6 +41,7 @@ pub(super) trait Temporal: Copy + Ord {
     type Layout: Copy;
     fn person(self, layout: Self::Layout) -> u64;
     fn ts(self, layout: Self::Layout) -> i64;
+    fn at(self, ts: i64, layout: Self::Layout) -> Self;
     // Only compared within one person's ordered keys.
     fn gap(self, prev: Self) -> u64;
     fn name(person: u64, people: &People) -> u64;
@@ -57,6 +58,11 @@ impl Temporal for Wide {
     #[inline]
     fn ts(self, (): ()) -> i64 {
         self.ts
+    }
+
+    #[inline]
+    fn at(self, ts: i64, (): ()) -> Self {
+        Self { ts, ..self }
     }
 
     #[inline]
@@ -81,6 +87,11 @@ impl Temporal for u64 {
     #[inline]
     fn ts(self, pack: Packing) -> i64 {
         (self & pack.mask).wrapping_add(pack.origin as u64) as i64
+    }
+
+    #[inline]
+    fn at(self, ts: i64, pack: Packing) -> Self {
+        (self & !pack.mask) | (ts as u64).wrapping_sub(pack.origin as u64)
     }
 
     #[inline]
@@ -128,6 +139,78 @@ impl<T: Copy> Stream<T> {
             i
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Span<T> {
+    pub start: T, // exact person and start time
+    pub end: i64,
+    pub count: i64,
+}
+
+pub(super) struct Local<T> {
+    pub spans: Vec<Span<T>>,
+    pub purchases: Vec<Purchase<T>>,
+}
+
+pub(super) fn sort_events<T: Temporal>(pieces: Vec<Stream<T>>) -> (Vec<T>, Vec<Purchase<T>>) {
+    let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
+    let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
+    let mut evs = Vec::with_capacity(ne);
+    let mut purchases = Vec::with_capacity(np);
+    for s in pieces {
+        evs.extend_from_slice(&s.times);
+        evs.extend(s.purchases.iter().map(|p| p.key));
+        purchases.extend_from_slice(&s.purchases);
+    }
+    evs.sort_unstable();
+    (evs, purchases)
+}
+
+pub(super) fn local_spans<T: Temporal>(mut evs: &[T], layout: T::Layout) -> impl Iterator<Item = Span<T>> {
+    std::iter::from_fn(move || {
+        let &start = evs.first()?;
+        let person = start.person(layout);
+        let mut m = 1;
+        while m < evs.len() && evs[m].person(layout) == person && evs[m].gap(evs[m - 1]) <= GAP as u64 {
+            m += 1;
+        }
+        let end = evs[m - 1].ts(layout);
+        evs = &evs[m..];
+        Some(Span {
+            start,
+            end,
+            count: m as i64,
+        })
+    })
+}
+
+pub(super) fn compress<T: Temporal>(pieces: Vec<Stream<T>>, layout: T::Layout) -> Local<T> {
+    let (evs, purchases) = sort_events(pieces);
+    Local {
+        spans: local_spans(&evs, layout).collect(),
+        purchases,
+    }
+}
+
+pub(super) fn stitch<T: Temporal>(mut spans: &[Span<T>], layout: T::Layout) -> impl Iterator<Item = Span<T>> {
+    std::iter::from_fn(move || {
+        let (&first, rest) = spans.split_first()?;
+        spans = rest;
+        let mut session = first;
+        let person = session.start.person(layout);
+        // Local spans cannot hide a gap. Joining consecutive endpoints
+        // preserves that invariant, including chains through more than two slabs.
+        while let Some((&next, rest)) = spans.split_first() {
+            if next.start.person(layout) != person || next.start.ts(layout) > session.end.saturating_add(GAP) {
+                break;
+            }
+            session.end = session.end.max(next.end);
+            session.count += next.count;
+            spans = rest;
+        }
+        Some(session)
+    })
 }
 
 #[derive(Default)]
@@ -180,6 +263,36 @@ mod tests {
         assert_eq!(
             p.encode(u32::MAX - 1, (1i64 << 31) - 1).person(p),
             (u32::MAX - 1) as u64
+        );
+    }
+
+    #[test]
+    fn stitch_keeps_max_end_and_stops_at_exact_person_or_gap_plus_one() {
+        let span = |person, ts, end, count| Span {
+            start: Wide { person, ts },
+            end,
+            count,
+        };
+        let local = [
+            span(1, 0, GAP, 2),
+            span(1, 1, 1, 1),
+            span(1, GAP * 2, GAP * 2, 1),
+            span(1, GAP * 3 + 1, GAP * 3 + 1, 1),
+            span(2, GAP * 3 + 1, GAP * 3 + 1, 1),
+            span(3, i64::MAX - GAP, i64::MAX - 1, 2),
+            span(3, i64::MAX, i64::MAX, 1),
+        ];
+        let got: Vec<_> = stitch(&local, ())
+            .map(|s| (s.start.person, s.start.ts, s.end, s.count))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1, 0, GAP * 2, 4),
+                (1, GAP * 3 + 1, GAP * 3 + 1, 1),
+                (2, GAP * 3 + 1, GAP * 3 + 1, 1),
+                (3, i64::MAX - GAP, i64::MAX, 3),
+            ]
         );
     }
 }
