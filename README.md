@@ -4,6 +4,10 @@ A native Rust entry for the [Databricks Shopping Sessions buildathon](https://ww
 
 **Official practice: 0.99 s**, reported by Leif after 5.03 → 1.78 → 1.57 → 1.54 s. The [leaderboard](https://www.joinbuilders.org/buildathon/leaderboard) displays **0.30 s** at the top. The [verified release](docs/PERF_154.md#allocator-selection) cut warmed full Docker time by about 30% against the 1.54 s control on four-worker Linux runners; it also matched every output row on two 60M seeds. [Cold-input comparison](docs/PERF_154.md#input-page-cache) · [benchmark ledger](docs/PERF_154_RUNS.md).
 
+## Shipped pipeline and attribution
+
+The production pipeline is now **Team 67's MIT-licensed C++** ([github.com/mwkhettab/shopping-sessions-cpp](https://github.com/mwkhettab/shopping-sessions-cpp) at `29ee0cc5c26291c511cad44aec18c6531f050f79`), vendored unmodified in `cpp/pipeline/` with `build.sh` and the Dockerfile build recipe. `cpp/pipeline/LICENSE` is theirs and is copied into the image at `/app/LICENSE`. The Rust pipeline in `fast/` is retained but not shipped (`make build-rust`), and `reference/pipeline.py` remains the independent oracle that every change is checked against. Some older sections below describe the Rust entry.
+
 ## Build and run
 
 ```sh
@@ -16,7 +20,7 @@ docker run --rm --platform linux/amd64 --network none --read-only --user 1000:10
   -v "$PWD/data:/data:ro" -v "$PWD/out:/output" shopping-sessions
 ```
 
-For a native build, run `make build`. Set `DATA_DIR`, `OUTPUT_DIR` and, for reproducible eight-worker timing, `RAYON_NUM_THREADS=8`. Use a **fresh output directory** each run; row order and part count are immaterial. The binary logs phase times to stderr.
+For a native build, run `make build` (`sh build.sh`, output `build/shopping`). The C++ binary reads `DATA_DIR` (default `/data`) and `OUTPUT_DIR` (default `/output`), or two trailing path arguments; `NCPU` sets the worker count (default 8, capped at 16). Use a **fresh output directory** each run; row order and part count are immaterial. The binary logs phase times to stderr.
 
 ## Verify against the organizers’ answers
 
@@ -29,7 +33,7 @@ python -m pip install pyarrow polars
 for name in starter-duckdb generator dev-answer; do unzip -qo "fromsite/$name.zip" -d vendor; done
 make test test-rust test-bin diff fixtures
 make dev
-DATA_DIR=vendor/dev OUTPUT_DIR=out RAYON_NUM_THREADS=8 fast/target/release/shopping_sessions
+DATA_DIR=vendor/dev OUTPUT_DIR=out NCPU=8 build/shopping
 make check-dev OUT=out
 ```
 

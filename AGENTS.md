@@ -6,14 +6,14 @@ You are helping win the Databricks "Shopping Sessions" track of the Builders Bui
 1. `TRACK_BRIEF.md`: scoring, limits, deadline.
 2. `docs/rules.md` (official; if missing, `docs/rules-transcribed.md` and do TASKS.md T1 first). This is the only source of truth for behaviour.
 3. `SPEC.md`: what done means and the priority list.
-4. `ARCHITECTURE.md`: how `fast/src/main.rs` is laid out.
+4. `ARCHITECTURE.md`: how the retained Rust `fast/src/main.rs` is laid out (the shipped C++ is `cpp/pipeline/`; see README).
 5. `TASKS.md`: pick the first unchecked task. Do not skip ahead to speed work while any Phase A or B task is open.
 6. `docs/PERF_PLAYBOOK.md`: only when you reach Phase C.
 
 ## Golden rules
 1. **Correct beats fast.** One differing row means no score. Never trade exactness for speed.
 2. **rules.md wins** over the starters, over this kit, over your intuition. When you change behaviour, quote the rules.md sentence in the commit message.
-3. **Two implementations must agree.** `reference/pipeline.py` is the literal, slow oracle; `fast/` is the entry. A behaviour change goes into both, with a test in `tests/test_reference.py`.
+3. **Two implementations must agree.** `reference/pipeline.py` is the literal, slow oracle; the shipped pipeline is Team 67's MIT-licensed C++ in `cpp/pipeline/` (the Rust in `fast/` is retained, not shipped). A behaviour change goes into both, with a test in `tests/test_reference.py`.
 4. **Never hard-code** anything about a dataset (window, sizes, file counts, IDs, seeds, campaign counts). Data changes per seed and the final uses new data.
 5. **No network at run time**, run as uid 1000, write only `/output` and `/scratch`, logs to stderr, stdout stays empty.
 6. **Strings are bytes.** No trimming, case folding, Unicode normalisation or numeric coercion of IDs. Byte-wise comparison everywhere.
@@ -24,12 +24,13 @@ You are helping win the Databricks "Shopping Sessions" track of the Builders Bui
 ```bash
 # kit root
 make test                     # 15 reference edge cases
-make build                    # cargo build --release in fast/
+make build                    # sh build.sh: native build of cpp/pipeline to build/shopping
+make build-rust               # retained Rust pipeline (cargo, fast/), not shipped
 make test-bin                 # the same edge cases against the binary
 make diff SEEDS=20 EVENTS=30000   # reference vs binary on kit-generated dirty data
 python3 tools/compare_outputs.py EXPECTED_DIR ACTUAL_DIR   # dev-answer dir or output dir on each side
 python3 tools/compare_outputs.py --check ACTUAL_DIR         # schema + rules.md self-check
-DATA_DIR=/path/to/data OUTPUT_DIR=/tmp/out fast/target/release/shopping_sessions
+DATA_DIR=/path/to/data OUTPUT_DIR=/tmp/out NCPU=8 build/shopping
 ```
 `pip install pyarrow` is the only Python dependency.
 
@@ -42,8 +43,7 @@ DATA_DIR=/path/to/data OUTPUT_DIR=/tmp/out fast/target/release/shopping_sessions
 6. Commit with a message that says what changed, the rules.md sentence if behaviour changed, and the timing delta if speed changed.
 
 ## Conventions
-- Rust 2024 edition, `cargo fmt`, `cargo clippy` clean where reasonable.
-- Keep `fast/src/main.rs` readable: one function per phase. Split into modules once it passes ~1,200 lines.
+- `cpp/pipeline/` is vendored from Team 67 (MIT) and kept verbatim; do not reformat it. Rust conventions below apply only to the retained `fast/`: Rust 2024 edition, `cargo fmt`, `cargo clippy` clean where reasonable.
 - Comments explain *why* (which rule) not *what*.
 - Put findings and decisions in `docs/NOTES.md` (create it), newest first, dated.
 

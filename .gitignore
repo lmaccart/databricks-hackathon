@@ -11,3 +11,4 @@ fromsite/
 .venv/
 graphify-out/
 .DS_Store
+build/

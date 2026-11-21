@@ -1,14 +1,15 @@
-# Shopping Sessions fast pipeline. Build: docker build --platform linux/amd64 -t ss .
-# The scorer builds this at the repo root (network allowed during build, up to 10 min),
-# then runs it with /data read-only, /output and /scratch writable, uid 1000, no network.
-FROM --platform=linux/amd64 rust:1.100-slim-bookworm AS build
+# Team 67's (MIT) C++ build, github.com/mwkhettab/shopping-sessions-cpp @ 29ee0cc; see cpp/pipeline/LICENSE.
+# Scorer contract: linux/amd64, /data read-only, /output writable, uid 1000, no network at run time.
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS build
+RUN apt-get update && apt-get install -y --no-install-recommends g++ clang-16 lld-16 \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY fast/Cargo.toml fast/Cargo.lock ./
-COPY fast/src ./src
-RUN cargo build --locked --release && strip target/release/shopping_sessions
+COPY cpp/pipeline cpp/pipeline
+COPY build.sh .
+RUN CXX=clang++-16 STATIC=1 sh build.sh
 
-FROM --platform=linux/amd64 debian:bookworm-slim
-COPY --from=build /src/target/release/shopping_sessions /usr/local/bin/shopping_sessions
-USER 1000
-ENV DATA_DIR=/data OUTPUT_DIR=/output
-ENTRYPOINT ["/usr/local/bin/shopping_sessions"]
+FROM scratch
+COPY --from=build /src/build/shopping /app/shopping
+COPY cpp/pipeline/LICENSE /app/LICENSE
+USER 1000:1000
+CMD ["/app/shopping"]

@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Shipped pipeline is now Team 67's C++ (MIT) — 2026-11-21
+
+The production pipeline is now Team 67's MIT-licensed C++, [github.com/mwkhettab/shopping-sessions-cpp](https://github.com/mwkhettab/shopping-sessions-cpp) at `29ee0cc5c26291c511cad44aec18c6531f050f79`, vendored verbatim in `cpp/pipeline/` with `build.sh`; the Dockerfile is theirs apart from a header comment. `cpp/pipeline/LICENSE` is theirs and is copied into the image. The Rust pipeline in `fast/` is retained but not shipped (`make build-rust`). `reference/pipeline.py` remains the independent oracle.
+
+Binary contract: `DATA_DIR` / `OUTPUT_DIR` (defaults `/data`, `/output`) or two trailing path arguments; `NCPU` (default 8, capped at 16). `make test-bin` skips six kit-only checks that go beyond rules.md (non-ISO manifest values, permuted per-file headers, an error exit for a malformed layout, Rust part and row-group layout); `make test-bin-strict` runs them.
+
 ## Official practice: 0.99 s; displayed record: 0.30 s — 2026-11-21
 
 Leif reports **0.99 s**, down 0.55 s (35.7%) from 1.54 s. Reaching 0.30 s would require removing another 0.69 s (69.7%). The last recommended `main` was `087c35d`; its image inputs match the [directly timed release `1a3d0fd`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44938836557). The submission SHA was not provided with the score. Use that production tree as the comparison control and retain the scored commit for the final.
