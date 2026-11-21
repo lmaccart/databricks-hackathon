@@ -2,7 +2,7 @@
 
 A native Rust entry for the [Databricks Shopping Sessions buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). It reads the mounted CSVs, resolves linked identities, deduplicates events, sessionizes, attributes clicks and assists, and writes `user_daily/` and `campaign_daily/` as Parquet. [Official rules](docs/rules.md) · [architecture](ARCHITECTURE.md) · [review, measurements and open checks](docs/NOTES.md).
 
-**Official practice: 1.54 s** reported for the build with production code from [`7fd1b76`](https://github.com/lmaccart/databricks-hackathon/commit/7fd1b7602280cfce05ac97b6afb703fa42c0b6ba), down from 5.03 → 1.78 → 1.57 s. The reported leaderboard best is **0.30 s**. The [next verified candidate](docs/PERF_154.md#verified-release-checkpoint) cut full Docker time by 17.3% at 20M and 19.3% at 60M against that build on hosted Linux. [All current trials](docs/PERF_154.md) · [previous release benchmarks](docs/PERF_157.md).
+**Official practice: 1.54 s**, down from 5.03 → 1.78 → 1.57 s. The reported leaderboard best is **0.30 s**. The [next practice build](docs/PERF_154.md#allocator-selection) cut full Docker time by about **30%** at both 20M and 60M against the [1.54 s production source](https://github.com/lmaccart/databricks-hackathon/commit/7fd1b7602280cfce05ac97b6afb703fa42c0b6ba) in direct four-worker Linux comparisons. It matched every output row on two 60M seeds. [All current trials](docs/PERF_154_RUNS.md) · [previous release benchmarks](docs/PERF_157.md).
 
 ## Build and run
 
@@ -37,8 +37,8 @@ make check-dev OUT=out
 
 `python tools/opaque_diff.py vendor/dev fast/target/release/shopping_sessions` rewrites all IDs with byte-significant prefixes and trailing NULs, permutes CSV headers, then compares single- and eight-worker runs with Python.
 
-The **Native amd64 performance check** workflow accepts `revision` and `baseline` commit SHAs. Use `challenge` for all-row comparisons and timing on two 20M seeds, `containers` for five paired practice-size Docker runs, and `scale` for an exact 60M check. `scale_pairs` adds three paired 60M Docker runs, each under a 14 GiB no-swap cap. `oracle` checks all 60 generated cases against Python on amd64. The default baseline is the 5.03 s entry; use `4f75f526cef27623e406d2ec1008b40eb1935f23` for the 1.78 s rebuild control. All inputs are generated on the runner.
+The **Native amd64 performance check** workflow accepts `revision` and `baseline` commit SHAs. Use `challenge` for all-row comparisons and timing on two 20M seeds, `containers` for five paired practice-size Docker runs, and `scale_pairs` for three paired 60M Docker runs under a 14 GiB no-swap cap. Setting both `scale` and `scale_pairs` checks two different 60M inputs. `oracle` checks 60 generated cases against Python on amd64. The default baseline is the 5.03 s entry; [this round’s reproduction command](docs/PERF_154.md#reproduce-the-comparisons) pins the 1.54 s control explicitly.
 
 ## Credits
 
-Rust: Rayon, memchr, memmap2, aHash, serde_json, bytes, and the Apache Arrow project's Parquet crate. Python: PyArrow; Polars in the organizers’ test harness. The official generator, fixtures and dev answer are distributed by the organizers and are not checked in. Entry code: [MIT](LICENSE).
+Rust: Rayon, memchr, memmap2, aHash, serde_json, bytes and the Apache Arrow project's Parquet crate. Linux builds link [mimalloc 3.3.2](https://github.com/microsoft/mimalloc) through the pinned `mimalloc` 0.1.52 Rust crate; other platforms use the system allocator. Python: PyArrow; Polars in the organizers’ test harness. The official generator, fixtures and dev answer are distributed by the organizers and are not checked in. Entry code: [MIT](LICENSE).

@@ -6,6 +6,27 @@ Seed 7 has 1.921 GB of event, click and link CSVs before the dimension files and
 
 ## Verified release checkpoint
 
+### Allocator selection
+
+The candidate for the next practice run is [`14ccc10`](https://github.com/lmaccart/databricks-hackathon/commit/14ccc10f1dfc0845760640eeee2fa3db62b3e87a): it combines physical identity slots, person-local temporal ranges, typed Parquet columns, bounded worker-local campaign/day counters and linked mimalloc 3.3.2 on Linux. Its `fast/` Git tree is `4f81720222297220b46c957167e202e3709c1091`. The default allocator policy is deliberate; the extra parser reservation logic and allocator overrides did not consistently clear the incremental practice threshold in direct comparisons.
+
+Direct comparisons against the production source of the 1.54 s entry, on four-worker native AMD EPYC 9V74 runners. Each arrow is a pair of medians in seconds, control → candidate. The Docker clock starts before `docker run` and includes container creation and removal. Both executables receive a warmup and write fresh output on every run.
+
+| Release check | 20M seed 7, native | 20M seed 15, native | 20M seed 7, full Docker | 60M seed 13, full Docker | Pairs won |
+|---|---:|---:|---:|---:|---:|
+| [Python oracle and packaged entry](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937040474) | 1.744 → 1.113 | 1.731 → 1.116 | 2.359 → **1.683** (−28.7%) | 6.617 → **4.627** (−30.1%) | 17/18 |
+| [Independent run and second 60M input](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937344723) | 1.727 → 1.119 | 1.720 → 1.116 | 2.239 → **1.541** (−31.2%) | 6.633 → **4.676** (−29.5%) | 18/18 |
+
+**Correctness:** both 20M inputs, 60 independent Python comparisons, the official dev answer, all 36 official fixtures, opaque IDs, malformed CSV, and colliding/transitive identity graphs matched. The restricted image matched every row against `7fd1b76` on two 60M inputs: **6,615,971** rows on seed 13 and **6,629,430** on seed 948307. With 14 GiB and no swap, Linux `wait4` reported **7.80 and 7.76 GiB peak RSS** respectively; the corresponding cgroup charges were 3.20 and 3.11 GiB. Shared mapped input can be resident without being charged to this cgroup. Timings and memory were taken in separate runs.
+
+On the oracle runner the first unpaired 60M container after data generation took **9.704 s**; the paired candidate median was **4.627 s**. The first run did not time the control under the same conditions. Use the paired numbers for the measured speedup; the organizers' input-cache state and eight pinned hyperthreads may produce different times.
+
+For this exact source on the M2 Pro (system allocator, native arm64, eight workers), medians against `7fd1b76` fell **0.673 → 0.553 s** and **0.622 → 0.513 s** on the two 20M seeds, and **1.625 → 1.356 s** on the 60M holdout. It won 15/15 pairs. The holdout's peak process RSS was 8.00 GiB with four workers. The official dev checkers and 36 fixtures both passed locally; six independent Python holdouts at 250k and 1M events also matched.
+
+A separate eight-worker correctness check kept the same ranked people, their timestamps and their clicks, then added one unused campaign dimension. With 3,503 campaigns the dense counters fit; with 3,504 the same 14-day manifest required sparse counters. Both native outputs matched Python on **7,004 user-days and 3,506 campaign-days**, including assist-only rows on two nonconsecutive dates.
+
+### Earlier checkpoints
+
 [`d754296`](https://github.com/lmaccart/databricks-hackathon/commit/d75429665a35366dfef26096d63cd71c778b19f0) added bounded, per-worker campaign/day counters to the graph and range changes below. Against the scored build it won 18/18 pairs and reduced full Docker by **17.3% / 19.3%** at 20M / 60M. [In a direct comparison to `0558eaa`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936619619), it also won every pair including **1.573 → 1.455 s** at 20M and **4.731 → 4.474 s** at 60M in Docker.
 
 [`0558eaa`](https://github.com/lmaccart/databricks-hackathon/commit/0558eaa7acd59463d21a888e1d418d676301e07f) superseded the first checkpoint below. Its physical-slot identity graph and direct temporal ranges won **18/18 pairs** [against the scored control](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935810599) and **18/18** [against the otherwise identical build without direct ranges](https://github.com/lmaccart/databricks-hackathon/actions/runs/44935810612). The latter comparison gained 3.6% / 3.1% in restricted Docker at 20M / 60M on another model of AMD CPU and passed the 60-case Python oracle. Details below.
@@ -108,10 +129,16 @@ Each row compares a component with and without the other change on the **same** 
 | [First-slot ranks + columns → add worker-local campaign/day counts, Xeon 8370C](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936299807) | 2.281 → **2.090** | 6.923 → **6.480** |
 | [Direct ranges → link Linux mimalloc 3.3.2, same application source](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936526432) | 1.614 → **1.404** | 4.801 → **4.174** |
 | [Scored control → direct ranges + worker-local counts (`d754296`)](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936619511) | 1.779 → **1.471** | 5.512 → **4.448** |
+| [Scored control → direct ranges, worker-local counts and reservation hints (`7619fa6`)](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936619670) | 2.239 → **1.837** | 7.079 → **5.434** |
+| [Scored control → the same three changes plus linked mimalloc (`894f6a7`)](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937040811) | 1.793 → **1.267** | 5.437 → **3.851** |
 | [Add worker-local campaign/day counts to the right-sized direct ranges](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936631125) | 2.072 → **1.928** | 6.378 → **6.181** |
 | [Add allocation hints to direct ranges + worker-local counters (`7619fa6` vs `d754296`)](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936631348) | 2.044 → 1.990 | 5.968 → 5.932 |
 | [Direct ranges vs global temporal sort, identical graph, hints and campaign reduction](https://github.com/lmaccart/databricks-hackathon/actions/runs/44936740314) | 1.517 → 1.488 | 4.642 → 4.598 |
 | [Add linked mimalloc 3 to direct ranges, allocation hints and worker-local counts](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937041255) | 1.434 → **1.254** | 4.490 → **3.868** |
+| [Add worker-local campaign counts to direct ranges + mimalloc 3 (`14ccc10` vs `29ccc90`)](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937040599) | 1.577 → **1.482** | 4.827 → **4.482** |
+| [Add live allocation hints to otherwise identical `14ccc10`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937042928) | 1.487 → 1.481 | 4.619 → 4.523 |
+| [Disable mimalloc page purging vs its defaults](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937148686) | 1.245 → 1.231 | 3.811 → 3.663 |
+| [Align mimalloc purge regions to transparent huge pages vs its defaults](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937148704) | 1.296 → 1.277 | 3.886 → 3.815 |
 
 The initial singleton technique by itself added almost nothing to the columns in the two full-Docker comparisons on the Xeon 8370C. Replacing the graph construction as well made a measurable difference on the 6975P-C: every pair favored physical slots, including all three final-scale pairs. Keeping a slot as the union node eliminates endpoint sorting/deduplication and gives the parser a direct rank to write.
 
@@ -125,6 +152,8 @@ The linked Linux allocator won more than a library microbenchmark: every practic
 
 The alternative with live allocation hints (`894f6a7`) also matched all 2,378,604 rows on this odd-sized input at **2.64 GiB RSS**. Emulated start-to-exit medians were **1.227 s without vs 1.260 s with hints**, with hints winning 2/5 pairs. Both images were about 116 MB as reported by Docker, run as uid 1000, and link the allocator into the executable; no preload or runtime package installation is necessary.
 
+On native AMD, adding those hints to `14ccc10` saved only **0.4% at 20M and 2.1% at 60M** (median paired final-scale savings: **0.4%**). Disabling purging and forcing huge-page-aligned purging also missed the two-seed 3% cutoff: disabling purging saved 0.9% / 1.8% in the native practice medians despite its 3.9% full-Docker gain at 60M. The release uses the allocator defaults and the simpler parser.
+
 For `7619fa6` on the M2 Pro, eight-worker native medians vs `7fd1b76` were **0.622 → 0.502 s**, **0.599 → 0.479 s**, and **1.753 → 1.409 s** on the independent 60M seed (all 15 pairs won). A separate same-executable comparison of four versus eight workers went **0.708 → 0.476 s** on seed 7 and **2.322 → 1.471 s** on the 60M holdout: 1.49× and 1.58× throughput, not 2×. This host has eight performance cores and four efficiency cores; these measured ratios do not predict the speed of eight pinned x86 hyperthreads.
 
 ## Reproduce the comparisons
@@ -132,8 +161,9 @@ For `7619fa6` on the M2 Pro, eight-worker native medians vs `7fd1b76` were **0.6
 ```sh
 # Use an immutable, public full SHA for the trial and the exact scored control.
 control=7fd1b7602280cfce05ac97b6afb703fa42c0b6ba
+candidate=14ccc10f1dfc0845760640eeee2fa3db62b3e87a
 gh workflow run native-bench.yml --ref perf/practice-154 \
-  -f revision="$CANDIDATE" -f baseline="$control" -f challenge=true \
+  -f revision="$candidate" -f baseline="$control" -f challenge=true \
   -f oracle=true -f containers=true -f scale=true -f scale_pairs=true
 
 # Locally: exact output through both the ranked and wide-window paths.

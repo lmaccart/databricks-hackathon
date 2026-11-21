@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Next practice build: link mimalloc 3 to the worker-local campaign pipeline — 2026-11-21
+
+Choose [`14ccc10`](https://github.com/lmaccart/databricks-hackathon/commit/14ccc10f1dfc0845760640eeee2fa3db62b3e87a). Direct comparisons against the scored production source won **35 of 36 pairs** across the [oracle run](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937040474) and the [two-60M-seed run](https://github.com/lmaccart/databricks-hackathon/actions/runs/44937344723). Full Docker medians improved **28.7% / 30.1%** and **31.2% / 29.5%**, at 20M / 60M respectively. The packaged entry matched the 60-case Python matrix and every row on both 60M seeds, peaking at 7.80 GiB RSS. Extra reservation logic and allocator tunables missed the practice threshold head-to-head. [Release evidence and reproduction](PERF_154.md#allocator-selection). Latest official practice: **1.54 s**.
+
 ## Practice candidate: merge campaign counters once per worker — 2026-11-21
 
 [`d754296`](https://github.com/lmaccart/databricks-hackathon/commit/d75429665a35366dfef26096d63cd71c778b19f0) reduced full Docker medians to **1.471 s** from 1.779 s at 20M and **4.448 s** from 5.512 s at 60M. It also beat `0558eaa` directly (7.5% / 5.4% less Docker time). Both comparisons favored the candidate in 18/18 pairs. All 60 native Linux Python cases and the two final-scale row comparisons passed. [Evidence](PERF_154.md#verified-release-checkpoint).
