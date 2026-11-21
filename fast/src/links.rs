@@ -201,7 +201,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
                     let swap = if (ka | kb) >> 63 == 0 {
                         ka > kb
                     } else {
-                        codec.bytes(ka, &mut [0; 9]) > codec.bytes(kb, &mut [0; 9])
+                        codec.bytes(ka, &mut [0; 9]).as_ref() > codec.bytes(kb, &mut [0; 9]).as_ref()
                     };
                     if swap {
                         std::mem::swap(&mut a, &mut b);

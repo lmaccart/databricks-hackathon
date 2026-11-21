@@ -231,14 +231,14 @@ fn decode<'a>(s: &'a [u8], sm: &Small, (ws, we, clock): (i64, i64, &ManifestCloc
 fn fallback<'a>(
     s: &'a [u8],
     sm: &Small,
-    codec: &Codec<'a>,
+    key: &impl Fn(&'a [u8]) -> u64,
     window: (i64, i64, &ManifestClock),
     spill: &mut Vec<i64>,
 ) -> (Option<Pending>, &'a [u8]) {
     let end = memchr::memchr(b'\n', s).map_or(s.len(), |i| i + 1);
     let (line, rest) = s.split_at(end);
     let mut row = None;
-    csv::identity_row::<7>(line, &mut |r| row = decode_fields(r, sm, codec, window, spill));
+    csv::identity_row::<7>(line, &mut |r| row = decode_fields(r, sm, key, window, spill));
     (row, rest)
 }
 
@@ -246,14 +246,14 @@ fn fallback<'a>(
 pub(super) fn for_events<'a>(
     c: &Chunk<'a>,
     sm: &Small,
-    codec: &Codec<'a>,
+    key: &impl Fn(&'a [u8]) -> u64,
     window: (i64, i64, &ManifestClock),
     spill: &mut Vec<i64>,
     mut emit: impl FnMut(Pending),
 ) {
     if !c.identity_order(7) {
         return for_rows(c, |r| {
-            if let Some(e) = decode_fields(r, sm, codec, window, spill) {
+            if let Some(e) = decode_fields(r, sm, key, window, spill) {
                 emit(e);
             }
         });
@@ -264,7 +264,7 @@ pub(super) fn for_events<'a>(
             emit(e);
             rest = tail;
         } else {
-            let (e, tail) = fallback(rest, sm, codec, window, spill);
+            let (e, tail) = fallback(rest, sm, key, window, spill);
             if let Some(e) = e {
                 emit(e);
             }
@@ -334,9 +334,9 @@ mod tests {
                 let (mut want, mut got) = (vec![], vec![]);
                 let (mut want_spill, mut got_spill) = (vec![], vec![]);
                 for_rows(&c, |r| {
-                    want.extend(decode_fields(r, &sm, &codec, window, &mut want_spill))
+                    want.extend(decode_fields(r, &sm, &|id| codec.key(id), window, &mut want_spill))
                 });
-                for_events(&c, &sm, &codec, window, &mut got_spill, |e| got.push(e));
+                for_events(&c, &sm, &|id| codec.key(id), window, &mut got_spill, |e| got.push(e));
                 assert_eq!(got, want, "{row:?}, {after:?}");
                 assert_eq!(got_spill, want_spill);
             }

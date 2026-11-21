@@ -24,6 +24,8 @@ use std::time::Instant;
 mod allocator;
 mod campaign;
 mod dims;
+#[cfg(unix)]
+mod event_input;
 mod events;
 mod links;
 mod output;
@@ -91,7 +93,7 @@ fn parse_price(p: &[u8]) -> Option<u32> {
 
 // ------------------------------------------------------------------ inputs
 
-fn mmap_files(dir: &Path) -> Vec<(PathBuf, Mmap)> {
+fn csv_files(dir: &Path) -> Vec<(PathBuf, u64)> {
     let mut out = Vec::new();
     let rd = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     for e in rd {
@@ -101,12 +103,21 @@ fn mmap_files(dir: &Path) -> Vec<(PathBuf, Mmap)> {
             if !meta.is_file() || meta.len() == 0 {
                 continue;
             }
-            let f = File::open(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-            let m = unsafe { Mmap::map(&f).expect("mmap") };
-            out.push((p, m));
+            out.push((p, meta.len()));
         }
     }
     out
+}
+
+fn mmap_files(dir: &Path) -> Vec<(PathBuf, Mmap)> {
+    csv_files(dir)
+        .into_iter()
+        .map(|(p, _)| {
+            let f = File::open(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            let m = unsafe { Mmap::map(&f).expect("mmap") };
+            (p, m)
+        })
+        .collect()
 }
 
 fn chunks_for<'a>(files: &'a [(PathBuf, Mmap)], cols: &[&str]) -> Vec<Chunk<'a>> {
@@ -615,21 +626,16 @@ fn main() {
     let sm = read_small(&pm, &cm, &data.join("products.csv"), &data.join("campaigns.csv"));
 
     let link_files = mmap_files(&data.join("links"));
+    #[cfg(unix)]
+    let event_files = event_input::Files::open(&data.join("events"), events::COLS);
+    #[cfg(not(unix))]
     let event_files = mmap_files(&data.join("events"));
     let click_files = mmap_files(&data.join("clicks"));
     let link_chunks = chunks_for(&link_files, &["user_id_a", "user_id_b"]);
-    let ev_chunks = chunks_for(
-        &event_files,
-        &[
-            "event_id",
-            "user_id",
-            "ts",
-            "ingest_ts",
-            "event_type",
-            "product_id",
-            "price_cents",
-        ],
-    );
+    #[cfg(unix)]
+    let ev_chunks = event_files.jobs(events::COLS);
+    #[cfg(not(unix))]
+    let ev_chunks = chunks_for(&event_files, events::COLS);
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
     let names = person_names(&link_chunks);
     let packing = Packing::new(ws, we);

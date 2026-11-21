@@ -40,6 +40,24 @@ impl Chunk<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Header {
+    nfields: usize,
+    ncols: usize,
+    idx: [usize; 8],
+}
+
+impl Header {
+    pub(crate) fn chunk(self, data: &[u8]) -> Chunk<'_> {
+        Chunk {
+            data,
+            nfields: self.nfields,
+            ncols: self.ncols,
+            idx: self.idx,
+        }
+    }
+}
+
 /// Decode one physical line after the caller has checked the identity header.
 pub fn identity_row<'a, const N: usize>(line: &'a [u8], f: &mut impl FnMut(&[&'a [u8]; 8])) {
     const { assert!(N <= 8) };
@@ -51,14 +69,9 @@ pub fn chunks_of<'a>(file: &'a [u8], cols: &[&str], path: &Path) -> Vec<Chunk<'a
     chunks_sized(file, cols, path, crate::CHUNK)
 }
 
-fn chunks_sized<'a>(file: &'a [u8], cols: &[&str], path: &Path, size: usize) -> Vec<Chunk<'a>> {
+pub(crate) fn header(bytes: &[u8], cols: &[&str], path: &Path) -> Header {
     assert!(cols.len() <= 8, "at most 8 selected columns");
-    let mut out = Vec::new();
-    if file.is_empty() {
-        return out;
-    }
-    let hdr_end = memchr(b'\n', file).unwrap_or(file.len());
-    let header: Vec<&[u8]> = file[..hdr_end].split(|&c| c == b',').map(header_name).collect();
+    let header: Vec<&[u8]> = bytes.split(|&c| c == b',').map(header_name).collect();
     let mut idx = [0usize; 8];
     for (k, c) in cols.iter().enumerate() {
         idx[k] = header
@@ -67,6 +80,20 @@ fn chunks_sized<'a>(file: &'a [u8], cols: &[&str], path: &Path, size: usize) -> 
             .unwrap_or_else(|| panic!("{}: header lacks column {c}", path.display()));
         assert!(!idx[..k].contains(&idx[k]), "column {c} selected twice");
     }
+    Header {
+        nfields: header.len(),
+        ncols: cols.len(),
+        idx,
+    }
+}
+
+fn chunks_sized<'a>(file: &'a [u8], cols: &[&str], path: &Path, size: usize) -> Vec<Chunk<'a>> {
+    let mut out = Vec::new();
+    if file.is_empty() {
+        return out;
+    }
+    let hdr_end = memchr(b'\n', file).unwrap_or(file.len());
+    let header = header(&file[..hdr_end], cols, path);
     let body = if hdr_end < file.len() {
         &file[hdr_end + 1..]
     } else {
@@ -81,12 +108,7 @@ fn chunks_sized<'a>(file: &'a [u8], cols: &[&str], path: &Path, size: usize) -> 
                 None => body.len(),
             };
         }
-        out.push(Chunk {
-            data: &body[start..end],
-            nfields: header.len(),
-            ncols: cols.len(),
-            idx,
-        });
+        out.push(header.chunk(&body[start..end]));
         start = end;
     }
     out

@@ -516,8 +516,8 @@ pub fn user_daily(dir: &Path, shards: &[&UserColumns], parts: usize, codec: &Cod
             let (mut pos, mut start) = (0, 0);
             for &(token, end) in &s.people {
                 let mut scratch = [0; 9];
-                let name =
-                    std::str::from_utf8(codec.bytes(links::unmix(token), &mut scratch)).expect("IDs must be UTF-8");
+                let bytes = codec.bytes(links::unmix(token), &mut scratch);
+                let name = std::str::from_utf8(bytes.as_ref()).expect("IDs must be UTF-8");
                 let bytes = text_size(name);
                 while pos < end {
                     if batch.rows == GROUP_ROWS || (batch.rows > 0 && batch.names.len() + bytes > DICT_BYTES) {

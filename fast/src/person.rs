@@ -2,7 +2,9 @@
 //! bytes fit in 63 bits. Every other spelling uses a collision-checked interner;
 //! no hash (or truncated hash) is ever accepted as proof of identity.
 use crate::{Map, rs};
-use std::sync::RwLock;
+use std::borrow::Borrow;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, RwLock};
 
 const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
 const EXTERNAL: u64 = 1 << 63;
@@ -45,9 +47,44 @@ pub fn pack_inline(word: u64, tail: u8) -> u64 {
 
 #[derive(Default)]
 struct Spill<'a> {
-    by_name: Map<&'a [u8], usize>,
-    by_index: Vec<&'a [u8]>,
+    by_name: Map<Name<'a>, usize>,
+    by_index: Vec<Name<'a>>,
 }
+
+#[derive(Clone)]
+pub enum Name<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Arc<[u8]>),
+}
+
+impl AsRef<[u8]> for Name<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
+impl Borrow<[u8]> for Name<'_> {
+    fn borrow(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+impl Hash for Name<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
+}
+
+impl PartialEq for Name<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for Name<'_> {}
 
 pub struct Codec<'a> {
     long: [RwLock<Spill<'a>>; LANES],
@@ -64,7 +101,14 @@ impl<'a> Codec<'a> {
 
     #[inline]
     pub fn key(&self, bytes: &'a [u8]) -> u64 {
-        inline(bytes).unwrap_or_else(|| self.intern(bytes))
+        inline(bytes).unwrap_or_else(|| self.intern(bytes, || Name::Borrowed(bytes)))
+    }
+
+    #[inline]
+    pub fn ephemeral_key(&self, bytes: &[u8]) -> u64 {
+        // The reader reuses its block after parsing; only a new external ID
+        // must outlive it. Already-interned links and inline IDs need no copy.
+        inline(bytes).unwrap_or_else(|| self.intern(bytes, || Name::Owned(Arc::from(bytes))))
     }
 
     #[inline]
@@ -72,41 +116,45 @@ impl<'a> Codec<'a> {
         if (a | b) & EXTERNAL == 0 {
             a < b
         } else {
-            self.bytes(a, &mut [0; 9]) < self.bytes(b, &mut [0; 9])
+            self.bytes(a, &mut [0; 9]).as_ref() < self.bytes(b, &mut [0; 9]).as_ref()
         }
     }
 
     #[cold]
-    fn intern(&self, bytes: &'a [u8]) -> u64 {
+    fn intern(&self, bytes: &[u8], retain: impl FnOnce() -> Name<'a>) -> u64 {
         let i = (self.hash.hash_one(bytes) as usize) & (LANES - 1);
         let shard = &self.long[i];
         let known = shard.read().unwrap().by_name.get(bytes).copied();
         let n = known.unwrap_or_else(|| {
             let mut data = shard.write().unwrap();
             let Spill { by_name, by_index } = &mut *data;
-            *by_name.entry(bytes).or_insert_with(|| {
-                let index = by_index.len();
-                by_index.push(bytes);
+            if let Some(&index) = by_name.get(bytes) {
                 index
-            })
+            } else {
+                let index = by_index.len();
+                let name = retain();
+                by_index.push(name.clone());
+                by_name.insert(name, index);
+                index
+            }
         });
         EXTERNAL | ((n as u64) << LANES.trailing_zeros()) | i as u64
     }
 
     #[inline]
-    pub fn bytes<'b>(&self, key: u64, buf: &'b mut [u8; 9]) -> &'b [u8]
+    pub fn bytes<'b>(&self, key: u64, buf: &'b mut [u8; 9]) -> Name<'b>
     where
         'a: 'b,
     {
         if key & EXTERNAL != 0 {
             let names = self.long[(key as usize) & (LANES - 1)].read().unwrap();
-            return names.by_index[((key ^ EXTERNAL) >> LANES.trailing_zeros()) as usize];
+            return names.by_index[((key ^ EXTERNAL) >> LANES.trailing_zeros()) as usize].clone();
         }
         for (i, v) in buf.iter_mut().enumerate() {
             *v = ((key >> (7 * (8 - i))) & 127) as u8;
         }
         let len = 9 - (key.trailing_zeros() as usize / 7).min(9);
-        &buf[..len]
+        Name::Borrowed(&buf[..len])
     }
 }
 
@@ -114,6 +162,21 @@ impl<'a> Codec<'a> {
 mod tests {
     use super::*;
     use crate::links::{mix, unmix};
+
+    #[test]
+    fn recycled_read_buffers_do_not_change_external_ids() {
+        let codec = Codec::new();
+        let linked = "linked person 名".as_bytes();
+        let new = "unlinked person 名".as_bytes();
+        let mut page = linked.to_vec();
+        assert_eq!(codec.key(linked), codec.ephemeral_key(&page));
+        page.clear();
+        page.extend_from_slice(new);
+        let id = codec.ephemeral_key(&page);
+        page.fill(b'x');
+        assert_eq!(codec.key(new), id);
+        assert_eq!(codec.bytes(id, &mut [0; 9]).as_ref(), new);
+    }
 
     #[test]
     fn every_ascii_lane_survives_routing_and_decoding() {
@@ -133,7 +196,7 @@ mod tests {
             .collect();
         for input in &inputs {
             let key = codec.key(input);
-            assert_eq!(codec.bytes(unmix(mix(key)), &mut [0; 9]), input.as_slice());
+            assert_eq!(codec.bytes(unmix(mix(key)), &mut [0; 9]).as_ref(), input.as_slice());
         }
     }
 }

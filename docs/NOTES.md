@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Positioned event-read trial — 2026-11-21
+
+Trial on `14ccc10` only. Match the mmap planner's physical-LF chunk cuts and stable size ordering, then use `read_exact_at` into one reusable buffer per active worker (8 MiB plus a 1 KiB boundary probe). Files with long headers or a cut lacking an LF in the probe keep their original mmap path, with borrowed IDs. A positioned block only copies previously unseen external IDs that would otherwise outlive its buffer. The CSV decoder and all attribution rules are unchanged. The two 20M practice inputs reach the proposed path throughout: 272 blocks on seed 7 and 209 on seed 15, with no file-level mmap fallbacks.
+
+Five alternating eight-worker whole-process pairs on a loaded M2 Pro: seed 7 **6.545 → 6.757 s** (+3.2%, 0/5 wins); seed 15 **7.230 → 7.269 s** (+0.5%, 2/5 wins). Median paired regressions were 3.3% and 6.3%; the event phase was 15.0% and 6.6% slower. These are local, contended measurements, not Linux or scorer timings. The added copy did not earn a practice challenger. Both official dev checkers and the mixed positioned/mmap boundary differential passed.
+
 ## Campaign folds ported to physical-slot gridranges — 2026-11-21
 
 Ported the `edd5c36` campaign/day sink to the `0558eaa` ranked-range and typed-output pipeline without replacing those changes. `Reduce::person` sends both ranked and wide sessions to the same worker-local sink. Dense assists plus directly indexed sparse credit triples are enabled only within the manifest-derived, worker-bounded 32 MiB grid; arbitrary spans/dimensions retain per-shard hash maps. Broadcast creates one fold per Rayon worker, and heavy-first owners are claimed dynamically. The donor reportedly won 10/10 AMD pairs with 6.4–7.9% incremental savings; this integration was not locally timed (and no local input exceeded 1M events). Validation: 45 Python edge cases, 28 Rust tests, 45 binary cases, 36 official fixtures, 10 dirty seeds, both dev comparers (117,038 user / 27,400 campaign rows), and schema self-check passed; clippy clean.

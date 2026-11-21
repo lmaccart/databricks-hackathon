@@ -6,6 +6,16 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 mod word;
 
+pub(super) const COLS: &[&str] = &[
+    "event_id",
+    "user_id",
+    "ts",
+    "ingest_ts",
+    "event_type",
+    "product_id",
+    "price_cents",
+];
+
 #[derive(Clone, Copy)]
 struct Claim {
     key_and_target: u64,
@@ -111,14 +121,14 @@ struct Pending {
 fn decode_fields<'a>(
     r: &[&'a [u8]; 8],
     sm: &Small,
-    codec: &Codec<'a>,
+    key: &impl Fn(&'a [u8]) -> u64,
     (ws, we, clock): (i64, i64, &ManifestClock),
     spill: &mut Vec<i64>,
 ) -> Option<Pending> {
     if r[0].is_empty() {
         return None;
     }
-    let claim_key = links::mix(codec.key(r[0]));
+    let claim_key = links::mix(key(r[0]));
     let (ingest, seconds) = clock.ingest_for_claim(r[3]);
     let ts = clock.parse_ts(r[2]);
     let mut next = Pending {
@@ -134,7 +144,7 @@ fn decode_fields<'a>(
             _ => None,
         };
         if let Some(price) = purchase {
-            next.uid = codec.key(r[1]);
+            next.uid = key(r[1]);
             next.hash = links::mix(next.uid);
             next.price = price;
             next.cat = if price == 0 {
@@ -150,7 +160,8 @@ fn decode_fields<'a>(
 fn parse<'a>(
     c: &Chunk<'a>,
     sm: &Small,
-    people: &People<'a>,
+    people: &People<'_>,
+    key: impl Fn(&'a [u8]) -> u64,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
 ) -> (Vec<Payload>, Vec<Vec<Claim>>, Vec<i64>) {
@@ -183,7 +194,7 @@ fn parse<'a>(
     };
     let mut ring = [Pending::default(); 16];
     let mut n = 0usize;
-    word::for_events(c, sm, &people.codec, window, &mut spill, |next| {
+    word::for_events(c, sm, &key, window, &mut spill, |next| {
         if next.uid != 0 {
             people.prefetch(next.hash);
         }
@@ -295,16 +306,26 @@ fn losers(parts: Vec<(usize, Vec<Claim>)>, spills: &[Vec<i64>]) -> Vec<Location>
 }
 
 pub(super) fn by_person<'a>(
-    chunks: &[Chunk<'a>],
+    #[cfg(unix)] jobs: &[event_input::Job<'a>],
+    #[cfg(not(unix))] chunks: &[Chunk<'a>],
     sm: &Small,
     people: &People<'a>,
     window: (i64, i64, &ManifestClock),
     packing: Option<Packing>,
     log: &impl Fn(&str),
 ) -> Vec<Vec<Payload>> {
+    #[cfg(unix)]
+    let parsed: Vec<_> = jobs
+        .par_iter()
+        .map(|job| match job {
+            event_input::Job::Mapped(c) => parse(c, sm, people, |id| people.codec.key(id), window, packing),
+            _ => job.with_block(|c| parse(&c, sm, people, |id| people.codec.ephemeral_key(id), window, packing)),
+        })
+        .collect();
+    #[cfg(not(unix))]
     let parsed: Vec<_> = chunks
         .par_iter()
-        .map(|c| parse(c, sm, people, window, packing))
+        .map(|c| parse(c, sm, people, |id| people.codec.key(id), window, packing))
         .collect();
     log("events parsed");
     let mut payloads = Vec::with_capacity(parsed.len());
@@ -394,7 +415,7 @@ mod tests {
                     assert_eq!(claim.ingest(&spill), ts::parse_ingest(s));
                     assert_eq!(claim.target(), target);
                     let reconstructed = claim.key() | ((mixed >> KEY_BITS) << KEY_BITS);
-                    assert_eq!(id, codec.bytes(links::unmix(reconstructed), &mut [0; 9]));
+                    assert_eq!(id, codec.bytes(links::unmix(reconstructed), &mut [0; 9]).as_ref());
                 }
             }
         }
