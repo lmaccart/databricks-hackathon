@@ -2,7 +2,7 @@
 
 The official time reported by Leif is **1.57 s** on the build with production sources from [`9758471`](https://github.com/lmaccart/databricks-hackathon/commit/9758471d06bbd916f8d029780d4d734e81bcc13f). The reported record, **0.63 s**, would require a further **59.9% reduction**. CI timings below measure actual inputs, but are not official practice times.
 
-**First verified release:** [`7fd1b76`](https://github.com/lmaccart/databricks-hackathon/commit/7fd1b7602280cfce05ac97b6afb703fa42c0b6ba) won **18/18** pairs in its [release run](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876665326), including all eight full-Docker pairs. It decodes common event fields from the original bytes in one pass and keeps the strict fallback.
+**Recommended practice commit:** [`7fd1b76`](https://github.com/lmaccart/databricks-hackathon/commit/7fd1b7602280cfce05ac97b6afb703fa42c0b6ba) won **18/18** pairs in its [release run](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876665326), including all eight full-Docker pairs. It decodes common event fields from the original bytes in one pass and keeps the strict fallback. This round tested **57 distinct candidate commits** in **74 two-seed comparison jobs** (including component comparisons and packaged releases).
 
 In that release run, the individual full-container savings ranged from **5.0% to 6.5%** on the five 20M pairs and **4.7% to 7.4%** on the three 60M pairs. The 5.7% headline at each scale is the ratio of the two medians.
 
@@ -39,6 +39,7 @@ Times below are seconds, **control → candidate**. The control is `9758471` unl
 | [Typed event grammar: validate and pack the ID with the same load](https://github.com/lmaccart/databricks-hackathon/actions/runs/44875889484) | 1.744 → **1.628** | 1.719 → **1.604** |
 | [Repeat on AMD EPYC 9V45; actual images also compared](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876117068) | 1.419 → **1.333** | 1.410 → **1.311** |
 | [Erase and validate quotes in SIMD tiles](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876025834) | 1.803 → **1.723** | 1.771 → **1.689** |
+| [Typed event parser vs SIMD quote-erasing tiles directly](https://github.com/lmaccart/databricks-hackathon/actions/runs/44878133727) | 1.722 → 1.675 | 1.689 → 1.638 |
 | [Join aliases after parsing into raw-user partitions](https://github.com/lmaccart/databricks-hackathon/actions/runs/44874977224) | 1.795 → 1.741 | 1.777 → 1.710 |
 | [Repeat partition-local join on AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44875630980) | 2.201 → 2.155 | 2.216 → 2.120 |
 | [Typed grammar plus partition-local join vs **join alone**](https://github.com/lmaccart/databricks-hackathon/actions/runs/44875992068) | 1.740 → **1.660** | 1.719 → **1.628** |
@@ -108,6 +109,7 @@ What the direct comparisons show:
 
 - Postponing the exact alias lookup reduced the Intel event phase from **0.844 to 0.637 s** and click parsing from **0.139 to 0.095 s**, but added a **0.165 s join** plus cost in the session phase. With the typed parser already present, this design saved only 0.8% and 2.2% in its first direct comparison.
 - Compressing quote pairs did help on both seeds. Fusing validation and ID encoding saved more. In contrast, compact duplicate evidence followed by random rereads, or a new retrieval graph built from scratch at startup, cost more than their smaller intermediates saved.
+- In a [direct comparison to the quote-erasing parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44878133727), `7fd1b76` also won the 20M full-Docker median, **1.865 → 1.820 s**. At 60M they were effectively tied (**5.616 → 5.626 s**, 0.2% slower for `7fd1b76`).
 - The partition-local join also missed the incremental threshold in [a Docker comparison against the typed parser](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877045584): **2.278 → 2.253 s** at 20M but **6.835 → 6.988 s** at 60M. Its 10.1% final-scale win over the *older scored build* is real; that is not a reason to add the shuffle to the typed parser.
 - Sharing civil date/hour decoding won all ten native pairs on the first AMD run of the combined parser. On Intel it lost all ten pairs against the version that parsed the two clock fields independently. Against the event-only parser on that Intel host, full Docker regressed **1.758 → 1.827 s at 20M and 5.347 → 5.641 s at 60M**. A global change to the clock on the strength of the AMD run alone would have been a poor bet.
 - With independent clocks, extending the grammar to links and clicks improved the native medians by 1.3–2.6% in direct comparisons. In the [direct Docker follow-up](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595939) it saved 1.1% at 20M (2.199 → 2.176 s), but cost 1.9% at 60M (6.324 → 6.443 s).
@@ -124,6 +126,8 @@ To resolve that discrepancy, we ran the scored binary, event-only parser and ind
 
 The independent Python oracle checks 20 seeds each at 10k, 100k and 1M events. The added grammar corpus mutates timestamps, quoted fields, IDs and ignored prices on real physical lines. Each mutant competes with a later valid event for a different shopper, and valid lines follow malformed ones. This catches the difference between *invalid earliest* (suppresses the event) and *malformed earliest* (never enters dedup). As a negative control, deliberately dropping invalid claims before dedup produced **2,658 extra user-day rows** and a differing campaign row; the new verifier rejected it.
 
+The [native Linux/amd64 stress run of `7fd1b76`](https://github.com/lmaccart/databricks-hackathon/actions/runs/44878208735) passed that 60-case matrix and all 7,254 mixed grammar cases, then matched Python on the transformed 1M-event dev input at both one and eight workers. The transformation permutes headers and adds non-ASCII, embedded NUL and trailing NUL bytes to IDs across the input tables.
+
 For the typed parser, six additional Python comparisons passed on three seeds outside the timing and standard oracle sets (6331, 20261121, 31415927; 250k and 1M events each). A second final-scale input, seed 20261121 with **60M events and 15M clicks**, matched the scored control row-for-row on native ARM64: **6,643,504 user-day and 28,014 campaign-day rows**. This was an exactness check, not an extra timing result.
 
 The shared-clock and independent-clock click/link candidates also matched this second 60M input. Across the two tables there were **10,042,701 sessions** and **17,123,475,935 cents** in each; the user table contained 58,625,071 retained events. The campaign table recorded 108,071,722 assists and none for `organic`.
@@ -137,6 +141,7 @@ The 60M timing comparisons below use the same workload (seed 13, 15M clicks, 14 
 | [Three-input parser with shared event/ingest clock fields](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877352490) | 1.874 → 1.816 s | 5.777 → 5.628 s |
 | [Packaged three-input shared-clock parser `6852f23`, AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877520113) | 2.429 → 2.242 s | 7.434 → 6.782 s |
 | [Three-input parser with independent clocks, AMD EPYC 7763](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877595639) | 2.457 → 2.241 s | 7.440 → 6.790 s |
+| [Packaged independent-clock three-input parser `e5bdad2`, AMD EPYC 9V74](https://github.com/lmaccart/databricks-hackathon/actions/runs/44877836250) | 2.592 → 2.360 s | 7.323 → 6.646 s |
 | [Partition-local identity join](https://github.com/lmaccart/databricks-hackathon/actions/runs/44875630980) | 2.402 → 2.334 s | 7.285 → 6.856 s |
 | [Typed event grammar plus partition-local join](https://github.com/lmaccart/databricks-hackathon/actions/runs/44876241143) | 1.900 → 1.758 s | 5.879 → 5.284 s |
 
