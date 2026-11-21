@@ -35,6 +35,8 @@ make check-dev OUT=out
 
 `make fixtures` checks the Rust binary and the independent Python oracle against the starter's hand-written answers. `make check-dev` uses both the official comparer and a second per-key diff. `tools/official_diff.py` runs differential checks on other official seeds. `python tools/bench_pair.py BASELINE CANDIDATE DATA_DIR` compares five alternating-order pairs, with fresh output directories and one warmup per binary. The competition clock also includes container startup.
 
+`python tools/opaque_diff.py vendor/dev fast/target/release/shopping_sessions` rewrites all IDs with byte-significant prefixes and trailing NULs, permutes CSV headers, then compares single- and eight-worker runs with Python.
+
 The **Native amd64 performance check** workflow accepts `revision` and `baseline` commit SHAs. Use `challenge` for all-row comparisons and timing on two 20M seeds, `containers` for five paired practice-size Docker runs, and `scale` for an exact 60M check. `scale_pairs` adds three paired 60M Docker runs, each under a 14 GiB no-swap cap. `oracle` checks all 60 generated cases against Python on amd64. The default baseline is the 5.03 s entry; use `4f75f526cef27623e406d2ec1008b40eb1935f23` for the 1.78 s rebuild control. All inputs are generated on the runner.
 
 ## Credits

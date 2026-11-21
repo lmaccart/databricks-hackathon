@@ -62,3 +62,14 @@ The duplicate census roughly halved the time spent resolving claims, but the ext
 Two different session representations also helped. The linked-rank sort reuses the node index from the union-find as an exact person ID; a compact event carries only rank and time unless it is a purchase. The chronological sweep counts events in bins no wider than the session gap and merges each person's extrema across adjacent occupied bins. It falls back to exact sorting if aggregation does not compress the input sufficiently. Neither optimization changes which events join a session or the UTC start day credited.
 
 **Other platforms and rejected prototypes.** On a working M2 Pro (eight workers) the combined `8e3525e` had mixed five-pair medians against `4f75f52`: 0.767 → 0.835 s and 0.759 → 0.708 s. The seed-7 candidate writer interval was 0.145 s vs 0.072 s, despite unchanged writer code. Use the native amd64 pairs to judge the target. A shared atomic first-witness table was 16% slower on Mac dev, and a two-field CSV shape cache was 5–7% slower. Both prototypes passed fixtures and dev but were not promoted to 20M CI.
+
+## Reproduce a release comparison
+
+After pushing the revision to GitHub, this dispatch regenerates the two practice sets, runs the independent Python matrix, times the full containers, and compares every final-scale row:
+
+```sh
+gh workflow run native-bench.yml --ref main \
+  -f revision="$(git rev-parse HEAD)" \
+  -f baseline=4f75f526cef27623e406d2ec1008b40eb1935f23 \
+  -f challenge=true -f oracle=true -f containers=true -f scale_pairs=true
+```
