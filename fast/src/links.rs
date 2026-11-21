@@ -1,10 +1,10 @@
 //! Build the canonical-name lookup in parallel, including transitive paths
 //! that span input files. Canonical node indexes also serve as exact sort ranks.
-use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows, shard};
+use super::{Chunk, Codec, NS, for_rows, shard};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
-// The raw-user partition and the eventual singleton owner use the same bits.
+// Projection lanes are indexed by the raw bits, independently of final owner.
 const LANES: usize = NS;
 
 #[inline]
@@ -58,32 +58,188 @@ impl Lane {
 
 pub(super) struct People<'a> {
     pub(super) codec: Codec<'a>,
-    lanes: Vec<Lane>,
+    projection: Projection,
+    owners: Vec<Exact<u32>>,
     roots: Vec<u64>,
     pub(super) count: usize,
 }
 
-// This bit is disjoint from the packed routing shard and the canonical node
-// index. It is internal to the link table, not reserved in arbitrary person keys.
-const LINKED: u64 = 1 << 63;
-const _: () = assert!(SHARD_SHIFT >= 32 && ((NS as u64 - 1) << SHARD_SHIFT) & LINKED == 0);
+pub(super) const STANDALONE: u32 = u32::MAX;
+const ESCAPE: u8 = u8::MAX;
+const _: () = assert!(NS == 256);
 
-#[derive(Clone, Copy)]
-pub(super) enum Identity {
-    Linked(u64), // shard bits at their normal position, root node index in low bits
-    Standalone(u64),
+// These keys are already exact, mixed, nonzero tokens, not hash fingerprints.
+struct Exact<V> {
+    keys: Vec<u64>,
+    values: Vec<V>,
+    mask: usize,
+}
+
+impl<V: Copy + Default> Exact<V> {
+    fn new(n: usize) -> Self {
+        let cap = (n * 2 + 1).next_power_of_two();
+        Self {
+            keys: vec![0; cap],
+            values: vec![V::default(); cap],
+            mask: cap - 1,
+        }
+    }
+
+    #[inline]
+    fn find(&self, key: u64) -> usize {
+        // Overflow aliases already agree on the projection's low bits.
+        let mut i = (key ^ (key >> 32)) as usize & self.mask;
+        while self.keys[i] != 0 && self.keys[i] != key {
+            i = (i + 1) & self.mask;
+        }
+        i
+    }
+
+    fn insert(&mut self, key: u64, value: V) {
+        let i = self.find(key);
+        self.keys[i] = key;
+        self.values[i] = value;
+    }
+
+    #[inline]
+    fn get(&self, key: u64) -> Option<V> {
+        let i = self.find(key);
+        (self.keys[i] == key).then(|| self.values[i])
+    }
+}
+
+enum Overflow {
+    None,
+    Sparse(Exact<u8>),
+    // Bound space and probes when many aliases of one raw lane share a slot.
+    Dense(Vec<(u64, u8)>),
+}
+
+impl Overflow {
+    #[cold]
+    fn owner(&self, hash: u64, default_owner: u8) -> u8 {
+        match self {
+            Self::None => default_owner,
+            Self::Sparse(m) => m.get(hash).unwrap_or(default_owner),
+            Self::Dense(entries) => match entries.binary_search_by_key(&hash, |e| e.0) {
+                Ok(i) => entries[i].1,
+                Err(_) => default_owner,
+            },
+        }
+    }
+}
+
+struct Projection {
+    routes: Vec<u8>,
+    conflicts: Vec<Vec<u64>>,
+    shift: u32,
+    mask: usize,
+    overflow: Vec<Overflow>,
+}
+
+struct AliasPart {
+    bounds: [usize; NS + 1],
+    aliases: Vec<(u64, u32)>,
+}
+
+impl AliasPart {
+    fn for_owner(&self, owner: usize) -> &[(u64, u32)] {
+        &self.aliases[self.bounds[owner]..self.bounds[owner + 1]]
+    }
+
+    fn routed(&self) -> impl Iterator<Item = (u64, u8)> + '_ {
+        (0..NS).flat_map(|owner| self.for_owner(owner).iter().map(move |&(hash, _)| (hash, owner as u8)))
+    }
+}
+
+impl Projection {
+    fn build(parts: &[AliasPart], count: usize) -> Self {
+        // Use disjoint raw-lane ranges in a single shared read-only table.
+        // Each gets the same power-of-two capacity, averaging 2–4 slots per alias.
+        let cap = (count.div_ceil(LANES) * 2).next_power_of_two().max(16);
+        let mut routes = vec![0; cap * LANES];
+        let (conflicts, overflow) = routes
+            .par_chunks_mut(cap)
+            .zip(parts)
+            .enumerate()
+            .map(|(raw, (routes, part))| {
+                let mask = routes.len() - 1;
+                let mut occupied = vec![0u64; routes.len().div_ceil(64)];
+                let mut conflicts = vec![0u64; occupied.len()];
+                routes.fill(raw as u8);
+                for (hash, owner) in part.routed() {
+                    let i = hash as usize & mask;
+                    let bit = 1u64 << (i % 64);
+                    if occupied[i / 64] & bit == 0 {
+                        occupied[i / 64] |= bit;
+                        routes[i] = owner;
+                    } else if routes[i] != owner {
+                        conflicts[i / 64] |= bit;
+                        routes[i] = ESCAPE;
+                    }
+                }
+                // A literal owner 255 shares the byte marker. When the
+                // conflict bit is clear, neither build nor lookup needs its key.
+                let exceptions = || {
+                    part.routed().filter(|&(hash, _)| {
+                        let i = hash as usize & mask;
+                        conflicts[i / 64] & (1u64 << (i % 64)) != 0
+                    })
+                };
+                let overflow = if conflicts.iter().all(|&w| w == 0) {
+                    Overflow::None
+                } else {
+                    let e = exceptions().count();
+                    if e > part.aliases.len() / 2 {
+                        let mut entries: Vec<_> = exceptions().collect();
+                        entries.sort_unstable_by_key(|e| e.0);
+                        Overflow::Dense(entries)
+                    } else {
+                        let mut exact = Exact::new(e);
+                        for (hash, owner) in exceptions() {
+                            exact.insert(hash, owner);
+                        }
+                        Overflow::Sparse(exact)
+                    }
+                };
+                (conflicts, overflow)
+            })
+            .unzip();
+        Self {
+            routes,
+            conflicts,
+            shift: cap.trailing_zeros(),
+            mask: cap - 1,
+            overflow,
+        }
+    }
+
+    #[inline]
+    fn owner(&self, hash: u64) -> usize {
+        let raw = shard(hash);
+        let slot = hash as usize & self.mask;
+        let owner = self.routes[(raw << self.shift) | slot];
+        if owner == ESCAPE && (self.conflicts[raw][slot / 64] >> (slot % 64)) & 1 != 0 {
+            self.overflow[raw].owner(hash, raw as u8) as usize
+        } else {
+            owner as usize
+        }
+    }
 }
 
 impl<'a> People<'a> {
     #[inline]
-    pub(super) fn lookup(&self, key: u64, h: u64) -> Identity {
-        let lane = &self.lanes[shard(h)];
-        let s = lane.slots[lane.find(key, h)];
-        if s.value & LINKED != 0 {
-            Identity::Linked(s.value ^ LINKED)
+    pub(super) fn owner(&self, hash: u64) -> usize {
+        if self.count == 0 {
+            shard(hash)
         } else {
-            Identity::Standalone(h)
+            self.projection.owner(hash)
         }
+    }
+
+    #[inline]
+    pub(super) fn rank(&self, owner: usize, hash: u64) -> u32 {
+        self.owners[owner].get(hash).unwrap_or(STANDALONE)
     }
 
     #[inline]
@@ -209,19 +365,89 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         });
     let mut roots = keys;
     roots.par_iter_mut().for_each(|k| *k = mix(*k));
-    lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
-        for slot in &mut lane.slots {
-            if slot.key != 0 {
+    let parts: Vec<_> = lanes
+        .par_iter_mut()
+        .enumerate()
+        .map(|(s, lane)| {
+            // Counting scatter within each source lane. An owner then reads one
+            // slice from each lane, without a square grid of allocated buffers.
+            let mut ends = [0usize; NS + 1];
+            for slot in lane.slots.iter_mut().filter(|s| s.key != 0) {
                 let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
-                let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
-                slot.value = LINKED | routing | u64::from(rank);
+                slot.value = u64::from(rank);
+                ends[shard(roots[rank as usize]) + 1] += 1;
             }
-        }
-    });
+            for i in 1..=NS {
+                ends[i] += ends[i - 1];
+            }
+            let mut next = ends;
+            let mut aliases = vec![(0, 0); ends[NS]];
+            for slot in lane.slots.iter().filter(|s| s.key != 0) {
+                let owner = shard(roots[slot.value as usize]);
+                aliases[next[owner]] = (mix(slot.key), slot.value as u32);
+                next[owner] += 1;
+            }
+            AliasPart { bounds: ends, aliases }
+        })
+        .collect();
+    drop(lanes);
+    drop(parent);
+    drop(edges);
+    let (projection, owners) = rayon::join(
+        || Projection::build(&parts, count),
+        || {
+            (0..NS)
+                .into_par_iter()
+                .map(|owner| {
+                    let slices = || parts.iter().map(|part| part.for_owner(owner));
+                    let mut exact = Exact::new(slices().map(<[_]>::len).sum());
+                    for &(hash, rank) in slices().flatten() {
+                        exact.insert(hash, rank);
+                    }
+                    exact
+                })
+                .collect()
+        },
+    );
     People {
         codec,
-        lanes,
+        projection,
+        owners,
         roots,
         count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SHARD_SHIFT;
+
+    #[test]
+    fn projection_distinguishes_sparse_escape_from_literal_owner_255() {
+        let raw = 3;
+        let token = |suffix: u64| ((raw as u64) << SHARD_SHIFT) | suffix;
+        let mut parts: Vec<_> = (0..NS)
+            .map(|_| AliasPart {
+                bounds: [0; NS + 1],
+                aliases: Vec::new(),
+            })
+            .collect();
+        let part = &mut parts[raw];
+        for (owner, low) in [(1, 1), (2, 2), (2, 3), (2, 4), (255, 17), (255, 5)] {
+            part.bounds[owner + 1] += 1;
+            part.aliases.push((token(low), 0));
+        }
+        for i in 1..=NS {
+            part.bounds[i] += part.bounds[i - 1];
+        }
+        let projection = Projection::build(&parts, 6);
+        assert!(matches!(projection.overflow[raw], Overflow::Sparse(_)));
+        assert_eq!(projection.owner(token(1)), 1);
+        assert_eq!(projection.owner(token(17)), 255);
+        assert_eq!(projection.owner(token(33)), raw);
+        assert_eq!(projection.owner(token(5)), 255);
+        assert_eq!(projection.owner(token(21)), 255);
+        assert_eq!(projection.owner(token(6)), raw);
     }
 }

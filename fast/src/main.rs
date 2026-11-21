@@ -5,10 +5,10 @@
 //! Phases (see ARCHITECTURE.md):
 //!   0. small tables (manifest, products, campaigns)
 //!   1. links  -> union-find -> id -> person name
-//!   2. events -> raw-user payload partitions, claims by event ID
+//!   2. events -> final-owner payload partitions, claims by event ID
 //!   3. reject losing payloads after exact minimum-ingest selection on suspect IDs
-//!   4. clicks -> raw-user partitions (identical copies are idempotent)
-//!   5. cache-local identity join, then per-owner sort, sessionize and aggregate
+//!   4. clicks -> final-owner partitions (identical copies are idempotent)
+//!   5. per-owner identity join into sort buffers, then sessionize and aggregate
 //!   6. write Parquet in parallel
 
 use ahash::RandomState;
@@ -24,9 +24,9 @@ mod links;
 mod output;
 mod person;
 mod stream;
-use links::{Identity, People, person_names};
+use links::{People, STANDALONE, person_names};
 use person::Codec;
-use stream::{Packing, Payload, Stream, Temporal};
+use stream::{Packing, Purchase, Stream, Temporal, Wide};
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
@@ -203,33 +203,17 @@ fn by_destination<T>(batches: Vec<Vec<T>>, nonempty: impl Fn(&T) -> bool) -> Vec
     jobs
 }
 
-fn gather<T: Copy>(mut pieces: Vec<Vec<T>>) -> Vec<T> {
-    if pieces.len() <= 1 {
-        return pieces.pop().unwrap_or_default();
-    }
-    let size: usize = pieces.iter().map(Vec::len).sum();
-    let mut rows = Vec::with_capacity(size);
-    for piece in pieces {
-        rows.extend_from_slice(&piece);
-    }
-    rows
-}
+type Payload = Stream<Wide>;
 
-#[derive(Default)]
-struct Clicks {
-    packed: Vec<PCl>,
-    wide: Vec<PCl>,
-}
-
-fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, window: (i64, i64, &ManifestClock), names: &People<'a>) -> Vec<Clicks> {
+fn parse_clicks<'a>(
+    c: &Chunk<'a>,
+    sm: &Small,
+    window: (i64, i64, &ManifestClock),
+    names: &People<'a>,
+) -> Vec<Vec<PCl>> {
     let (lo, we, clock) = window;
     let hint = reserve_per_shard(c.data);
-    let mut b: Vec<_> = (0..NS)
-        .map(|_| Clicks {
-            wide: Vec::with_capacity(hint),
-            packed: Vec::new(),
-        })
-        .collect();
+    let mut b: Vec<_> = (0..NS).map(|_| Vec::with_capacity(hint)).collect();
     for_rows(c, |r| {
         // click_id,user_id,campaign_id,ts. Copies are identical, so validating before dedup is equivalent.
         let (cid, uid, camp) = (r[0], r[1], r[2]);
@@ -243,7 +227,7 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, window: (i64, i64, &ManifestClock
         }
         let key = names.codec.key(uid);
         let hash = links::mix(key);
-        b[shard(hash)].wide.push(PCl {
+        b[names.owner(hash)].push(PCl {
             person: hash,
             ts,
             cid: names.codec.key(cid),
@@ -253,105 +237,34 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, window: (i64, i64, &ManifestClock
     b
 }
 
-// Each task probes just one raw-user partition of the exact link table.
+// Each task probes only its final-owner partition of the exact link table.
 // A small direct-mapped cache resolves repeated hot IDs without another probe.
 struct JoinCache<'a, 'b> {
     people: &'a People<'b>,
+    owner: usize,
     keys: Vec<u64>,
-    values: Vec<Identity>,
+    ranks: Vec<u32>,
 }
 
 impl<'a, 'b> JoinCache<'a, 'b> {
-    fn new(people: &'a People<'b>) -> Self {
+    fn new(people: &'a People<'b>, owner: usize) -> Self {
         Self {
             people,
+            owner,
             keys: vec![0; 4096],
-            values: vec![Identity::Standalone(0); 4096],
+            ranks: vec![STANDALONE; 4096],
         }
     }
 
     #[inline]
-    fn resolve(&mut self, hash: u64) -> Identity {
+    fn rank(&mut self, hash: u64) -> u32 {
         let i = hash as usize & (self.keys.len() - 1);
         if self.keys[i] != hash {
             self.keys[i] = hash;
-            self.values[i] = self.people.lookup(links::unmix(hash), hash);
+            self.ranks[i] = self.people.rank(self.owner, hash);
         }
-        self.values[i]
+        self.ranks[i]
     }
-}
-
-type JoinJobs = Vec<(Vec<Payload>, Vec<Clicks>)>;
-
-fn join_raw(
-    events: Vec<Vec<Payload>>,
-    clicks: Vec<Vec<Clicks>>,
-    people: &People,
-    packing: Option<Packing>,
-) -> JoinJobs {
-    let raw_events = by_destination(events, |p| !p.wide.times.is_empty() || !p.wide.purchases.is_empty());
-    let raw_clicks = by_destination(clicks, |p| !p.wide.is_empty());
-    let joined: Vec<_> = raw_events
-        .into_par_iter()
-        .zip(raw_clicks.into_par_iter())
-        .map(|(mut evs, mut cls)| {
-            let mut cache = JoinCache::new(people);
-            let mut moved_e: Vec<Payload> = (0..NS).map(|_| Payload::default()).collect();
-            let mut moved_c: Vec<Clicks> = (0..NS).map(|_| Clicks::default()).collect();
-            for part in &mut evs {
-                part.wide.times.retain(|row| match cache.resolve(row.person) {
-                    Identity::Standalone(_) => true,
-                    id @ Identity::Linked(p) => {
-                        moved_e[shard(p)].push(id, row.ts, 0, 0, packing, people);
-                        false
-                    }
-                });
-                part.wide.purchases.retain(|row| match cache.resolve(row.key.person) {
-                    Identity::Standalone(_) => true,
-                    id @ Identity::Linked(p) => {
-                        moved_e[shard(p)].push(id, row.key.ts, row.price, row.cat, packing, people);
-                        false
-                    }
-                });
-            }
-            for part in &mut cls {
-                part.wide.retain(|row| match cache.resolve(row.person) {
-                    Identity::Standalone(_) => true,
-                    Identity::Linked(p) => {
-                        let dest = &mut moved_c[shard(p)];
-                        let mut row = *row;
-                        if packing.is_some() {
-                            row.person = u64::from(p as u32);
-                            dest.packed.push(row);
-                        } else {
-                            row.person = people.original(p as u32);
-                            dest.wide.push(row);
-                        }
-                        false
-                    }
-                });
-            }
-            (evs, cls, moved_e, moved_c)
-        })
-        .collect();
-    let mut jobs: JoinJobs = (0..NS).map(|_| (Vec::new(), Vec::new())).collect();
-    for (raw, (evs, cls, moved_e, moved_c)) in joined.into_iter().enumerate() {
-        jobs[raw].0.extend(evs);
-        jobs[raw].1.extend(cls);
-        for (dest, (e, c)) in moved_e.into_iter().zip(moved_c).enumerate() {
-            if !e.packed.times.is_empty()
-                || !e.packed.purchases.is_empty()
-                || !e.wide.times.is_empty()
-                || !e.wide.purchases.is_empty()
-            {
-                jobs[dest].0.push(e);
-            }
-            if !c.packed.is_empty() || !c.wide.is_empty() {
-                jobs[dest].1.push(c);
-            }
-        }
-    }
-    jobs
 }
 
 // ------------------------------------------------------------------ sessions
@@ -391,24 +304,19 @@ fn top_category(catsum: &[i64], rank: &[u32]) -> Option<u32> {
 }
 
 fn process_stream<T: Temporal>(
-    pieces: Vec<Stream<T>>,
+    Stream {
+        times: mut evs,
+        mut purchases,
+    }: Stream<T>,
     mut cls: Vec<PCl>,
     sm: &Small,
     people: &People,
     layout: T::Layout,
     ShardOut { users, camps }: &mut ShardOut,
 ) {
-    let np = pieces.iter().map(|s| s.purchases.len()).sum::<usize>();
-    let ne = pieces.iter().map(|s| s.times.len()).sum::<usize>() + np;
-    if ne == 0 {
+    let np = purchases.len();
+    if evs.is_empty() {
         return;
-    }
-    let mut evs = Vec::with_capacity(ne);
-    let mut purchases = Vec::with_capacity(np);
-    for s in pieces {
-        evs.extend_from_slice(&s.times);
-        evs.extend(s.purchases.iter().map(|p| p.key));
-        purchases.extend_from_slice(&s.purchases);
     }
     evs.sort_unstable();
     purchases.sort_unstable_by_key(|p| p.key);
@@ -546,22 +454,88 @@ fn process_stream<T: Temporal>(
 }
 
 fn process_shard(
+    owner: usize,
     evs: Vec<Payload>,
-    cls: Vec<Clicks>,
+    cls: Vec<Vec<PCl>>,
     sm: &Small,
     people: &People,
     packing: Option<Packing>,
 ) -> ShardOut {
-    let (packed, wide): (Vec<_>, Vec<_>) = evs.into_iter().map(|e| (e.packed, e.wide)).unzip();
-    let (pc, wc): (Vec<_>, Vec<_>) = cls.into_iter().map(|c| (c.packed, c.wide)).unzip();
     let mut out = ShardOut {
         users: Vec::new(),
         camps: Map::with_hasher(rs()),
     };
-    if let Some(pack) = packing {
-        process_stream(packed, gather(pc), sm, people, pack, &mut out);
+    if evs.is_empty() {
+        return out;
     }
-    process_stream(wide, gather(wc), sm, people, (), &mut out);
+    let mut cache = JoinCache::new(people, owner);
+    let mut packed = Stream::default();
+    let mut wide = Stream::default();
+    let (n, p) = evs
+        .iter()
+        .fold((0, 0), |(n, p), e| (n + e.times.len(), p + e.purchases.len()));
+    if packing.is_some() {
+        packed.times.reserve(n + p);
+        packed.purchases.reserve(p);
+    } else {
+        wide.times.reserve(n + p);
+        wide.purchases.reserve(p);
+    }
+    for part in evs {
+        for mut key in part.times {
+            if key.ts == BAD {
+                continue;
+            }
+            let rank = cache.rank(key.person);
+            if rank != STANDALONE {
+                if let Some(pack) = packing {
+                    packed.times.push(pack.encode(rank, key.ts));
+                    continue;
+                }
+                key.person = people.original(rank);
+            }
+            wide.times.push(key);
+        }
+        for mut row in part.purchases {
+            if row.price == 0 {
+                continue;
+            }
+            let rank = cache.rank(row.key.person);
+            if rank != STANDALONE {
+                if let Some(pack) = packing {
+                    let key = pack.encode(rank, row.key.ts);
+                    packed.times.push(key);
+                    packed.purchases.push(Purchase {
+                        key,
+                        price: row.price,
+                        cat: row.cat,
+                    });
+                    continue;
+                }
+                row.key.person = people.original(rank);
+            }
+            wide.times.push(row.key);
+            wide.purchases.push(row);
+        }
+    }
+    let mut pc = Vec::new();
+    let mut wc = Vec::new();
+    for mut row in cls.into_iter().flatten() {
+        let rank = cache.rank(row.person);
+        if rank != STANDALONE {
+            if packing.is_some() {
+                row.person = u64::from(rank);
+                pc.push(row);
+                continue;
+            }
+            row.person = people.original(rank);
+        }
+        wc.push(row);
+    }
+    if let Some(pack) = packing {
+        process_stream(packed, pc, sm, people, pack, &mut out);
+    }
+    process_stream(wide, wc, sm, people, (), &mut out);
     out
 }
 
@@ -629,18 +603,19 @@ fn main() {
         .collect();
     log("clicks parsed");
 
-    let len =
-        |e: &Payload| e.packed.times.len() + e.packed.purchases.len() + e.wide.times.len() + e.wide.purchases.len();
-    let mut jobs = join_raw(ev_by_person, cl_by_person, &names, packing);
-    log("identity join");
-    jobs.sort_unstable_by_key(|(e, c)| {
+    let mut jobs: Vec<_> = by_destination(ev_by_person, |p| !p.times.is_empty() || !p.purchases.is_empty())
+        .into_iter()
+        .zip(by_destination(cl_by_person, |p| !p.is_empty()))
+        .enumerate()
+        .collect();
+    jobs.sort_by_cached_key(|(_, (e, c))| {
         std::cmp::Reverse(
-            e.iter().map(len).sum::<usize>() + c.iter().map(|x| x.packed.len() + x.wide.len()).sum::<usize>(),
+            e.iter().map(|p| p.times.len() + p.purchases.len()).sum::<usize>() + c.iter().map(Vec::len).sum::<usize>(),
         )
     });
     let outs: Vec<_> = jobs
         .into_par_iter()
-        .map(|(e, c)| process_shard(e, c, &sm, &names, packing))
+        .map(|(owner, (e, c))| process_shard(owner, e, c, &sm, &names, packing))
         .collect();
     log("sessions done");
 

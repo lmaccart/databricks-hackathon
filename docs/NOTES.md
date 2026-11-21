@@ -1,5 +1,13 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Coarse final-owner projection — 2026-11-21
+
+The parser routes full raw tokens directly to final-owner buffers. One byte supplies the owner for a homogeneous projection slot; cross-owner conflicts use exact full-token overflow, with sorted overflow for heavily conflicted lanes. A standalone token may inherit a linked slot's owner, but the owner-local exact join never treats that placement as identity. The gather skips in-place duplicate tombstones and builds the final packed/wide sort buffers without copying payloads across shards.
+
+Against `7444732` on the 1M public dev input, five alternating native 8-worker pairs after warmup gave median **0.097 → 0.092 s** (5.8% less time; candidate won all five pairs). The separate identity stage disappeared (0.010 s in the control); parse was 0.023 → 0.024 s and link setup 0.015 → 0.017 s. No 20M, Docker, or final-scale run in this experiment.
+
+Checks: 42 edge cases against each implementation, 22 Rust tests, 36 official fixtures against each implementation, 10 dirty seeds at 30k, and exact public dev comparison with both checkers.
+
 ## Raw-user partitioned identity join experiment — 2026-11-21
 
 Parse typed event and click payloads by raw-user shard, dedup events against those raw slot locations, and join each shard against its own exact link-table lane. A direct-mapped exact-token cache avoids repeated probes for hot IDs. Standalone events/clicks stay in their original buffers; linked rows move to canonical-owner shards. Link graph construction remains complete and precedes parsing. This increases interim event width and linked-row copying, so performance and 60M peak RSS need parent-side measurement; no 20M/60M benchmark was run here.
