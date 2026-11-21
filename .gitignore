@@ -1,0 +1,13 @@
+target/
+vendor/*
+!vendor/.keep
+data/
+out/
+scratch/
+*.parquet
+__pycache__/
+fromsite/
+/*.pdf
+.venv/
+graphify-out/
+.DS_Store
