@@ -149,8 +149,7 @@ impl Payload {
     ) -> usize {
         let purchase = usize::from(price != 0);
         let person = match identity {
-            Identity::Linked(routed) => {
-                let rank = routed as u32;
+            Identity::Linked(rank) => {
                 if let Some(p) = packing {
                     return self.packed.push(p.encode(rank, ts), price, cat) * 4 + purchase;
                 }

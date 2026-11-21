@@ -1,5 +1,11 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Prehashed grouped identity join — 2026-11-21
+
+At `b136db4`, identity lanes now probe the reversible mixed user token directly, using grouped 16-byte fingerprints and separate key/root arrays instead of unmixing on each cache miss. Root tags are 32-bit (zero means no linked entry); canonical owner routes are stored in a byte side table. The direct-mapped join cache now carries 64-bit keys, 32-bit root tags and byte routes instead of a 16-byte `Identity` value. Join streams prefetch cold lane groups in 16-row blocks, resolve compact root/route tags, compact standalone rows in place, and scatter linked rows.
+
+Checks: Rust unit tests (20), reference tests (40), binary tests (40), official fixtures (36/36 for both oracle and binary), both public dev comparers (117,038 user rows and 27,400 campaign rows; zero differences), and 10 dirty seeds at 30k events. No 20M/60M timing was run by design; this checkpoint is for parent-side incremental timing.
+
 ## Raw-user partitioned identity join experiment — 2026-11-21
 
 Parse typed event and click payloads by raw-user shard, dedup events against those raw slot locations, and join each shard against its own exact link-table lane. A direct-mapped exact-token cache avoids repeated probes for hot IDs. Standalone events/clicks stay in their original buffers; linked rows move to canonical-owner shards. Link graph construction remains complete and precedes parsing. This increases interim event width and linked-row copying, so performance and 60M peak RSS need parent-side measurement; no 20M/60M benchmark was run here.

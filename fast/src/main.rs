@@ -37,6 +37,7 @@ const NS: usize = 256; // shards for every hash partition
 const SHARD_SHIFT: u32 = 40;
 const CHUNK: usize = 8 << 20; // bytes per parse task
 const ORGANIC: u32 = u32::MAX;
+const JOIN_BLOCK: usize = 16;
 
 type Map<K, V> = HashMap<K, V, RandomState>;
 
@@ -254,11 +255,12 @@ fn parse_clicks<'a>(c: &Chunk<'a>, sm: &Small, window: (i64, i64, &ManifestClock
 }
 
 // Each task probes just one raw-user partition of the exact link table.
-// A small direct-mapped cache resolves repeated hot IDs without another probe.
+// Zero is an exact standalone result; linked ranks are stored plus one.
 struct JoinCache<'a, 'b> {
     people: &'a People<'b>,
     keys: Vec<u64>,
-    values: Vec<Identity>,
+    roots: Vec<u32>,
+    routes: Vec<u8>,
 }
 
 impl<'a, 'b> JoinCache<'a, 'b> {
@@ -266,18 +268,29 @@ impl<'a, 'b> JoinCache<'a, 'b> {
         Self {
             people,
             keys: vec![0; 4096],
-            values: vec![Identity::Standalone(0); 4096],
+            roots: vec![0; 4096],
+            routes: vec![0; 4096],
         }
     }
 
     #[inline]
-    fn resolve(&mut self, hash: u64) -> Identity {
+    fn resolve(&mut self, hash: u64) -> (u32, u8) {
         let i = hash as usize & (self.keys.len() - 1);
         if self.keys[i] != hash {
             self.keys[i] = hash;
-            self.values[i] = self.people.lookup(links::unmix(hash), hash);
+            let root = self.people.lookup_tag(hash);
+            self.roots[i] = root;
+            self.routes[i] = if root == 0 { 0 } else { self.people.route(root - 1) };
         }
-        self.values[i]
+        (self.roots[i], self.routes[i])
+    }
+
+    #[inline]
+    fn prefetch(&self, hash: u64) {
+        let i = hash as usize & (self.keys.len() - 1);
+        if self.keys[i] != hash {
+            self.people.prefetch(hash);
+        }
     }
 }
 
@@ -299,37 +312,104 @@ fn join_raw(
             let mut moved_e: Vec<Payload> = (0..NS).map(|_| Payload::default()).collect();
             let mut moved_c: Vec<Clicks> = (0..NS).map(|_| Clicks::default()).collect();
             for part in &mut evs {
-                part.wide.times.retain(|row| match cache.resolve(row.person) {
-                    Identity::Standalone(_) => true,
-                    id @ Identity::Linked(p) => {
-                        moved_e[shard(p)].push(id, row.ts, 0, 0, packing, people);
-                        false
+                let mut kept = 0;
+                for base in (0..part.wide.times.len()).step_by(JOIN_BLOCK) {
+                    let end = (base + JOIN_BLOCK).min(part.wide.times.len());
+                    let mut roots = [0u32; JOIN_BLOCK];
+                    let mut routes = [0u8; JOIN_BLOCK];
+                    for row in &part.wide.times[base..end] {
+                        cache.prefetch(row.person);
                     }
-                });
-                part.wide.purchases.retain(|row| match cache.resolve(row.key.person) {
-                    Identity::Standalone(_) => true,
-                    id @ Identity::Linked(p) => {
-                        moved_e[shard(p)].push(id, row.key.ts, row.price, row.cat, packing, people);
-                        false
+                    for i in base..end {
+                        let (root, route) = cache.resolve(part.wide.times[i].person);
+                        roots[i - base] = root;
+                        routes[i - base] = route;
                     }
-                });
+                    for i in base..end {
+                        let row = part.wide.times[i];
+                        let root = roots[i - base];
+                        if root == 0 {
+                            part.wide.times[kept] = row;
+                            kept += 1;
+                        } else {
+                            moved_e[routes[i - base] as usize].push(
+                                Identity::Linked(root - 1),
+                                row.ts,
+                                0,
+                                0,
+                                packing,
+                                people,
+                            );
+                        }
+                    }
+                }
+                part.wide.times.truncate(kept);
+                let mut kept = 0;
+                for base in (0..part.wide.purchases.len()).step_by(JOIN_BLOCK) {
+                    let end = (base + JOIN_BLOCK).min(part.wide.purchases.len());
+                    let mut roots = [0u32; JOIN_BLOCK];
+                    let mut routes = [0u8; JOIN_BLOCK];
+                    for row in &part.wide.purchases[base..end] {
+                        cache.prefetch(row.key.person);
+                    }
+                    for i in base..end {
+                        let (root, route) = cache.resolve(part.wide.purchases[i].key.person);
+                        roots[i - base] = root;
+                        routes[i - base] = route;
+                    }
+                    for i in base..end {
+                        let row = part.wide.purchases[i];
+                        let root = roots[i - base];
+                        if root == 0 {
+                            part.wide.purchases[kept] = row;
+                            kept += 1;
+                        } else {
+                            moved_e[routes[i - base] as usize].push(
+                                Identity::Linked(root - 1),
+                                row.key.ts,
+                                row.price,
+                                row.cat,
+                                packing,
+                                people,
+                            );
+                        }
+                    }
+                }
+                part.wide.purchases.truncate(kept);
             }
             for part in &mut cls {
-                part.wide.retain(|row| match cache.resolve(row.person) {
-                    Identity::Standalone(_) => true,
-                    Identity::Linked(p) => {
-                        let dest = &mut moved_c[shard(p)];
-                        let mut row = *row;
-                        if packing.is_some() {
-                            row.person = u64::from(p as u32);
-                            dest.packed.push(row);
-                        } else {
-                            row.person = people.original(p as u32);
-                            dest.wide.push(row);
-                        }
-                        false
+                let mut kept = 0;
+                for base in (0..part.wide.len()).step_by(JOIN_BLOCK) {
+                    let end = (base + JOIN_BLOCK).min(part.wide.len());
+                    let mut roots = [0u32; JOIN_BLOCK];
+                    let mut routes = [0u8; JOIN_BLOCK];
+                    for row in &part.wide[base..end] {
+                        cache.prefetch(row.person);
                     }
-                });
+                    for i in base..end {
+                        let (root, route) = cache.resolve(part.wide[i].person);
+                        roots[i - base] = root;
+                        routes[i - base] = route;
+                    }
+                    for i in base..end {
+                        let mut row = part.wide[i];
+                        let root = roots[i - base];
+                        if root == 0 {
+                            part.wide[kept] = row;
+                            kept += 1;
+                        } else {
+                            let dest = &mut moved_c[routes[i - base] as usize];
+                            if packing.is_some() {
+                                row.person = u64::from(root - 1);
+                                dest.packed.push(row);
+                            } else {
+                                row.person = people.original(root - 1);
+                                dest.wide.push(row);
+                            }
+                        }
+                    }
+                }
+                part.wide.truncate(kept);
             }
             (evs, cls, moved_e, moved_c)
         })

@@ -1,6 +1,6 @@
 //! Build the canonical-name lookup in parallel, including transitive paths
 //! that span input files. Canonical node indexes also serve as exact sort ranks.
-use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows, shard};
+use super::{Chunk, Codec, NS, for_rows, shard};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -31,28 +31,90 @@ pub(super) fn unmix(x: u64) -> u64 {
     y ^ (y >> 27) ^ (y >> 54)
 }
 
-#[derive(Clone, Copy, Default)]
-struct Slot {
-    key: u64,
-    value: u64,
-}
+const GROUP: usize = 16;
+const EMPTY: u8 = 0x80;
 
 struct Lane {
-    slots: Vec<Slot>,
+    ctrl: Vec<u8>,
+    keys: Vec<u64>,
+    roots: Vec<u32>,
     mask: usize,
 }
 
 impl Lane {
+    fn new(cap: usize) -> Self {
+        debug_assert!(cap.is_power_of_two() && cap >= GROUP);
+        Self {
+            ctrl: vec![EMPTY; cap],
+            keys: vec![0; cap],
+            roots: vec![0; cap],
+            mask: cap - 1,
+        }
+    }
+
     #[inline]
-    fn find(&self, key: u64, hash: u64) -> usize {
-        let mut i = hash as usize & self.mask;
+    fn fingerprint(hash: u64) -> u8 {
+        (hash >> 57) as u8
+    }
+
+    // Probe 16 control bytes at once conceptually; keeping fingerprints and
+    // payloads separate avoids loading root data for non-matching keys.
+    #[inline]
+    fn find(&self, hash: u64) -> usize {
+        let groups = (self.mask + 1) / GROUP;
+        let mut group = (hash as usize >> 4) & (groups - 1);
+        let mut step = 0usize;
+        let fingerprint = Self::fingerprint(hash);
         loop {
-            let k = self.slots[i].key;
-            if k == key || k == 0 {
+            let base = group * GROUP;
+            let mut empty = None;
+            for offset in 0..GROUP {
+                let i = base + offset;
+                if self.ctrl[i] == fingerprint && self.keys[i] == hash {
+                    return i;
+                }
+                if self.ctrl[i] == EMPTY && empty.is_none() {
+                    empty = Some(i);
+                }
+            }
+            if let Some(i) = empty {
                 return i;
             }
-            i = (i + 1) & self.mask;
+            step += 1;
+            group = (group + step) & (groups - 1);
         }
+    }
+
+    #[inline]
+    fn insert(&mut self, hash: u64, root: u32) {
+        let i = self.find(hash);
+        debug_assert_eq!(self.ctrl[i], EMPTY);
+        self.keys[i] = hash;
+        self.roots[i] = root;
+        self.ctrl[i] = Self::fingerprint(hash);
+    }
+
+    #[inline]
+    fn get(&self, hash: u64) -> u32 {
+        let i = self.find(hash);
+        if self.ctrl[i] == Self::fingerprint(hash) && self.keys[i] == hash {
+            self.roots[i]
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn prefetch(&self, hash: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let base = ((hash as usize >> 4) & ((self.mask + 1) / GROUP - 1)) * GROUP;
+            _mm_prefetch(self.ctrl.as_ptr().add(base) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.keys.as_ptr().add(base) as *const i8, _MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = hash;
     }
 }
 
@@ -60,35 +122,35 @@ pub(super) struct People<'a> {
     pub(super) codec: Codec<'a>,
     lanes: Vec<Lane>,
     roots: Vec<u64>,
+    routes: Vec<u8>,
     pub(super) count: usize,
 }
 
-// This bit is disjoint from the packed routing shard and the canonical node
-// index. It is internal to the link table, not reserved in arbitrary person keys.
-const LINKED: u64 = 1 << 63;
-const _: () = assert!(SHARD_SHIFT >= 32 && ((NS as u64 - 1) << SHARD_SHIFT) & LINKED == 0);
-
 #[derive(Clone, Copy)]
 pub(super) enum Identity {
-    Linked(u64), // shard bits at their normal position, root node index in low bits
+    Linked(u32),
     Standalone(u64),
 }
 
 impl<'a> People<'a> {
     #[inline]
-    pub(super) fn lookup(&self, key: u64, h: u64) -> Identity {
-        let lane = &self.lanes[shard(h)];
-        let s = lane.slots[lane.find(key, h)];
-        if s.value & LINKED != 0 {
-            Identity::Linked(s.value ^ LINKED)
-        } else {
-            Identity::Standalone(h)
-        }
+    pub(super) fn lookup_tag(&self, hash: u64) -> u32 {
+        self.lanes[shard(hash)].get(hash)
+    }
+
+    #[inline]
+    pub(super) fn prefetch(&self, hash: u64) {
+        self.lanes[shard(hash)].prefetch(hash);
     }
 
     #[inline]
     pub(super) fn original(&self, rank: u32) -> u64 {
         self.roots[rank as usize]
+    }
+
+    #[inline]
+    pub(super) fn route(&self, rank: u32) -> u8 {
+        self.routes[rank as usize]
     }
 }
 
@@ -142,16 +204,9 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
             keys.sort_unstable();
             keys.dedup();
             let cap = (keys.len() * 2 + 1).next_power_of_two();
-            let mut lane = Lane {
-                slots: vec![Slot::default(); cap],
-                mask: cap - 1,
-            };
+            let mut lane = Lane::new(cap.max(GROUP));
             for (j, &k) in keys.iter().enumerate() {
-                let i = lane.find(k, mix(k));
-                lane.slots[i] = Slot {
-                    key: k,
-                    value: j as u64,
-                };
+                lane.insert(mix(k), j as u32);
             }
             (lane, keys)
         })
@@ -173,7 +228,7 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
     let index = |key| {
         let hash = mix(key);
         let s = shard(hash);
-        (offsets[s] + lanes[s].slots[lanes[s].find(key, hash)].value as usize) as u32
+        (offsets[s] + lanes[s].get(hash) as usize) as u32
     };
     edges
         .par_iter()
@@ -210,18 +265,38 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
     let mut roots = keys;
     roots.par_iter_mut().for_each(|k| *k = mix(*k));
     lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
-        for slot in &mut lane.slots {
-            if slot.key != 0 {
-                let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
-                let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
-                slot.value = LINKED | routing | u64::from(rank);
+        for i in 0..lane.ctrl.len() {
+            if lane.ctrl[i] != EMPTY {
+                let rank = root(&parent, (offsets[s] + lane.roots[i] as usize) as u32);
+                lane.roots[i] = rank + 1;
             }
         }
     });
+    let routes = roots.iter().map(|&h| shard(h) as u8).collect();
     People {
         codec,
         lanes,
         roots,
+        routes,
         count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prehashed_lane_matches_exact_tokens_across_probe_groups() {
+        let mut lane = Lane::new(128);
+        let keys: Vec<_> = (0..40).map(|i| ((i as u64) << 40) | 0x123).collect();
+        for (root, &key) in keys.iter().enumerate() {
+            lane.insert(key, root as u32 + 1);
+        }
+        for (root, &key) in keys.iter().enumerate() {
+            assert_eq!(lane.get(key), root as u32 + 1);
+        }
+        assert_eq!(lane.get((90u64 << 40) | 0x123), 0);
+        assert_eq!(lane.get(((1u64 << 40) | 0x123) ^ 1), 0);
     }
 }
