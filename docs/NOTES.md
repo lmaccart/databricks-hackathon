@@ -1,5 +1,9 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## 1.54 s control: measure launch and test output/identity changes — 2026-11-21
+
+On a four-worker hosted Intel, the complete header-only Docker run took 0.0847 s; full practice took 1.8042 s on the same clock. The in-container `written` medians were 0.0010 s and 1.6370 s. [Clocks, two-seed timings and rejected rewrites](PERF_154.md). The column writer won 10/10 native pairs (2.6% / 3.7% less time); exact singleton ranks won 9/10 (2.8% / 2.5%). Synthetic LLVM PGO lost all 18 practice and final-scale pairs. These are local-to-runner comparisons, not organizer scores.
+
 ## Official practice: 1.54 s — 2026-11-21
 
 Leif reports **1.54 s** for the latest repo build and several teams tied at **0.30 s**. At the time of that report `main` was `dfbd330`, with the same Dockerfile, lockfile and production sources as `7fd1b76`. Use `7fd1b76` as the timing control. The change from the previous official result was 0.03 s (1.9%); reaching 0.30 s requires 1.24 s less (80.5%). [New trials](PERF_154.md).
