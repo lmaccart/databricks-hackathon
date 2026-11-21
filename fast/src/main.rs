@@ -481,41 +481,43 @@ fn main() {
         .collect();
     log("sessions done");
 
-    let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
-    for o in &outs {
-        for (k, v) in &o.camps {
-            let e = camps.entry(*k).or_insert([0; 4]);
-            for q in 0..4 {
-                e[q] += v[q];
-            }
-        }
-    }
     let ud = outd.join("user_daily");
     let cd = outd.join("campaign_daily");
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
 
-    let camp_rows: Vec<output::CampRow> = camps
-        .iter()
-        .map(|(k, v)| {
-            let c = (*k >> 32) as u32;
-            let (campaign, channel) = if c == ORGANIC {
-                (&b"organic"[..], &b"organic"[..])
-            } else {
-                (sm.camp_names[c as usize], sm.camp_channel[c as usize])
-            };
-            output::CampRow {
-                campaign,
-                channel,
-                day: *k as u32 as i32,
-                counts: *v,
-            }
-        })
-        .collect();
     let shards: Vec<&[UserRow]> = outs.iter().map(|o| &o.users[..]).collect();
     let parts = rayon::current_num_threads().clamp(1, 16);
     rayon::join(
-        || output::campaign_daily(&cd.join("part-0.parquet"), &camp_rows),
+        || {
+            let mut camps: Map<u64, [i64; 4]> = Map::with_hasher(rs());
+            for o in &outs {
+                for (k, v) in &o.camps {
+                    let e = camps.entry(*k).or_insert([0; 4]);
+                    for q in 0..4 {
+                        e[q] += v[q];
+                    }
+                }
+            }
+            let camp_rows: Vec<output::CampRow> = camps
+                .iter()
+                .map(|(k, v)| {
+                    let c = (*k >> 32) as u32;
+                    let (campaign, channel) = if c == ORGANIC {
+                        (&b"organic"[..], &b"organic"[..])
+                    } else {
+                        (sm.camp_names[c as usize], sm.camp_channel[c as usize])
+                    };
+                    output::CampRow {
+                        campaign,
+                        channel,
+                        day: *k as u32 as i32,
+                        counts: *v,
+                    }
+                })
+                .collect();
+            output::campaign_daily(&cd.join("part-0.parquet"), &camp_rows)
+        },
         || {
             output::user_daily(
                 &ud,

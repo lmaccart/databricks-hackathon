@@ -7,6 +7,14 @@
 - **Final size, seed 13:** 60M events + 15M clicks took **12.323 s** for one full `docker run` under a **14 GiB memory cap with swap disabled**. Stdout was empty. The organizer’s comparer matched all **6,615,971 rows** against the scored baseline `cc9f33e`: 6,587,957 in `user_daily` and 28,014 in `campaign_daily`, with zero differing rows or duplicate keys.
 - **Practice size, seed 7:** across five alternating pairs on 20M events + 5M clicks, full Docker medians were **5.779 s baseline → 2.153 s rebuild (2.68×)**, including startup and removal. Process-only medians on that runner were 5.783 s → 2.050 s. These are CI measurements; the confirmed official practice time remains 5.03 s for `cc9f33e`.
 
+## Output round-two challenge — 2026-11-20
+
+- `rules.md` permits table-wide `INT32` when every value fits: “Any integer width and any Parquet string encoding is accepted; `day` must be a Parquet `DATE`.” The typed writer now scans each table's daily integers once, chooses one physical width per column for every file, and retains `INT64` fallback for any out-of-range count or revenue sum. Rust metadata tests cover a wide `i64::MAX` in one file and a narrow sibling file, PLAIN/uncompressed pages, DATE, nullable category, UTF-8/NUL strings, empty tables, and page payloads <= 2 MiB.
+- Once all `ShardOut`s are fixed, campaign merging/materialization now runs in the same Rayon join as user-file writing. This overlaps the serial campaign aggregation with output without changing either table's aggregation.
+- One non-repeated local M2 pass on `vendor/practice` (20M events + 5M clicks): baseline `sessions done → written` was **0.129 s**; final candidate was **0.034 s** (-74%). This was one pass per version, not the five-run Phase C median; cold/warm cache and run-order effects make the delta exploratory, not a stable benchmark. Whole-process times (1.418 s baseline, 0.709 s final) are not comparable because the candidate followed a warmed input cache.
+- Rejected the ArrowWriter experiment despite its zero-copy string-value access: in the same one-pass comparison its output interval was 0.148 s, and its binary grew from 1.3 MiB to 3.8 MiB. `SerializedRowGroupWriter::append_column` only splices already encoded chunks; the maintained public API offers no direct raw-page injection with a supported footer path.
+- Final candidate checks: Rust tests, 32 reference tests and binary tests, 10 generated 20k-event seeds, 36/36 official fixtures, dev answer via the kit comparer, and dev parquet readback through Polars all passed. No five-run or Linux performance claim.
+
 ## Rebuilt pipeline: whole-process comparisons
 
 Scored baseline `cc9f33e` vs the SIMD/direct-routing/typed-writer candidate (`3f1d667`). Official practice time is known only for the baseline, **5.03 s**.

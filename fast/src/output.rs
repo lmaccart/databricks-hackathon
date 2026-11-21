@@ -6,7 +6,8 @@
 //! thrift code write bytes; nothing here touches the file format.
 //!
 //! Schema (rules.md, Outputs): strings are `BYTE_ARRAY (STRING)`, `day` is
-//! `INT32 (DATE)`, counts are `INT64`, only `top_category` is nullable.
+//! `INT32 (DATE)`, integers are table-wide `INT32` or `INT64`, only
+//! `top_category` is nullable.
 //! Every string is checked to be UTF-8 before it reaches a page; NUL bytes
 //! and non-ASCII text are legal and byte-exact.
 use crate::UserRow;
@@ -73,8 +74,18 @@ fn string(name: &str, optional: bool) -> Arc<Type> {
 fn date(name: &str) -> Arc<Type> {
     field(name, Physical::INT32, Some(LogicalType::Date), false)
 }
-fn long(name: &str) -> Arc<Type> {
-    field(name, Physical::INT64, None, false)
+fn count(name: &str, use_i32: bool) -> Arc<Type> {
+    field(
+        name,
+        if use_i32 { Physical::INT32 } else { Physical::INT64 },
+        None,
+        false,
+    )
+}
+
+#[inline]
+fn fits_i32(value: i64) -> bool {
+    i32::try_from(value).is_ok()
 }
 
 /// Fixed-width column: `value` is called once per row, in order.
@@ -93,6 +104,19 @@ fn fixed<'a, T: DataType, R: 'a>(
             return;
         }
         cw.typed::<T>().write_batch(&buf, None, None).expect("write column");
+    }
+}
+
+fn fixed_count<'a, R: 'a>(
+    cw: &mut SerializedColumnWriter<'_>,
+    rows: impl Iterator<Item = &'a R>,
+    use_i32: bool,
+    value: impl Fn(&R) -> i64,
+) {
+    if use_i32 {
+        fixed::<Int32Type, _>(cw, rows, |r| value(r) as i32);
+    } else {
+        fixed::<Int64Type, _>(cw, rows, value);
     }
 }
 
@@ -156,12 +180,19 @@ pub fn user_daily(
     cats: &[Vec<u8>],
 ) {
     let per = shards.len().div_ceil(parts.max(1)).max(1);
+    // Select one physical integer width for the whole table so parts agree.
+    let mut narrow = [true; 3];
+    for r in shards.iter().flat_map(|s| s.iter()) {
+        narrow[0] &= fits_i32(r.sessions);
+        narrow[1] &= fits_i32(r.events);
+        narrow[2] &= fits_i32(r.revenue);
+    }
     let sch = schema(vec![
         string("user_id", false),
         date("day"),
-        long("sessions"),
-        long("events"),
-        long("revenue_cents"),
+        count("sessions", narrow[0]),
+        count("events", narrow[1]),
+        count("revenue_cents", narrow[2]),
         string("top_category", true),
     ]);
     // part-0 always exists so the table is never an empty folder.
@@ -189,13 +220,13 @@ pub fn user_daily(
             fixed::<Int32Type, _>(&mut c, rows(), |r| r.day);
             close(c);
             let mut c = next(&mut rg);
-            fixed::<Int64Type, _>(&mut c, rows(), |r| r.sessions);
+            fixed_count(&mut c, rows(), narrow[0], |r| r.sessions);
             close(c);
             let mut c = next(&mut rg);
-            fixed::<Int64Type, _>(&mut c, rows(), |r| r.events);
+            fixed_count(&mut c, rows(), narrow[1], |r| r.events);
             close(c);
             let mut c = next(&mut rg);
-            fixed::<Int64Type, _>(&mut c, rows(), |r| r.revenue);
+            fixed_count(&mut c, rows(), narrow[2], |r| r.revenue);
             close(c);
             let mut c = next(&mut rg);
             strings(&mut c, rows(), true, |r, out| match r.top {
@@ -221,14 +252,21 @@ pub struct CampRow<'a> {
 }
 
 pub fn campaign_daily(path: &Path, rows: &[CampRow<'_>]) {
+    // All output files for this table share these table-wide physical widths.
+    let mut narrow = [true; 4];
+    for row in rows {
+        for q in 0..4 {
+            narrow[q] &= fits_i32(row.counts[q]);
+        }
+    }
     let sch = schema(vec![
         string("campaign_id", false),
         string("channel", false),
         date("day"),
-        long("sessions"),
-        long("purchasing_sessions"),
-        long("revenue_cents"),
-        long("assisted_sessions"),
+        count("sessions", narrow[0]),
+        count("purchasing_sessions", narrow[1]),
+        count("revenue_cents", narrow[2]),
+        count("assisted_sessions", narrow[3]),
     ]);
     let mut w = file(path, sch);
     if !rows.is_empty() {
@@ -250,10 +288,121 @@ pub fn campaign_daily(path: &Path, rows: &[CampRow<'_>]) {
         close(c);
         for q in 0..4 {
             let mut c = next(&mut rg);
-            fixed::<Int64Type, _>(&mut c, rows.iter(), |r| r.counts[q]);
+            fixed_count(&mut c, rows.iter(), narrow[q], |r| r.counts[q]);
             close(c);
         }
         rg.close().expect("close row group");
     }
     w.close().expect("close file");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parquet::basic::{Compression, ConvertedType, Encoding, Repetition, Type as Physical};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn temp_dir() -> std::path::PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "shopping-sessions-output-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn table_wide_widths_and_plain_page_metadata() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let id_tail = "x".repeat(260);
+        let rows: Vec<_> = (0..9000)
+            .map(|i| UserRow {
+                person: i,
+                day: 0,
+                sessions: if i == 0 { i64::MAX } else { 1 },
+                events: i as i64 + 1,
+                revenue: if i == 0 { i64::MAX } else { i as i64 },
+                top: (i % 3 != 0).then_some(0),
+            })
+            .collect();
+        let key = |person: u64, out: &mut Vec<u8>| {
+            out.extend_from_slice(b"\0");
+            out.extend_from_slice("雪🛒".as_bytes());
+            out.extend_from_slice(id_tail.as_bytes());
+            out.extend_from_slice(person.to_string().as_bytes());
+        };
+        let cats = ["カテゴリ🎁".as_bytes().to_vec()];
+        user_daily(&dir, &[&rows[..4500], &rows[4500..]], 2, &key, &cats);
+
+        for part in 0..2 {
+            let reader =
+                SerializedFileReader::new(File::open(dir.join(format!("part-{part}.parquet"))).unwrap()).unwrap();
+            assert_eq!(reader.num_row_groups(), 1);
+            let rg = reader.get_row_group(0).unwrap();
+            assert_eq!(rg.metadata().num_rows(), 4500);
+            let schema = rg.metadata().schema_descr();
+            assert_eq!(schema.column(0).physical_type(), Physical::BYTE_ARRAY);
+            assert_eq!(schema.column(0).converted_type(), ConvertedType::UTF8);
+            assert_eq!(schema.column(1).physical_type(), Physical::INT32);
+            assert_eq!(schema.column(1).converted_type(), ConvertedType::DATE);
+            assert_eq!(schema.column(2).physical_type(), Physical::INT64);
+            assert_eq!(schema.column(3).physical_type(), Physical::INT32);
+            assert_eq!(schema.column(4).physical_type(), Physical::INT64);
+            assert_eq!(schema.column(5).get_basic_info().repetition(), Repetition::OPTIONAL);
+            for col in 0..rg.num_columns() {
+                let meta = rg.metadata().column(col);
+                assert_eq!(meta.compression(), Compression::UNCOMPRESSED);
+                assert!(meta.statistics().is_none());
+            }
+            if part == 1 {
+                let mut pages = rg.get_column_page_reader(0).unwrap();
+                let mut page_count = 0;
+                while let Some(page) = pages.get_next_page().unwrap() {
+                    assert_eq!(page.encoding(), Encoding::PLAIN);
+                    assert!(page.buffer().len() <= 2 * 1024 * 1024);
+                    page_count += 1;
+                }
+                assert!(page_count > 1);
+            }
+        }
+
+        let camp_path = dir.join("campaign.parquet");
+        campaign_daily(
+            &camp_path,
+            &[
+                CampRow {
+                    campaign: "c_\0é".as_bytes(),
+                    channel: "social🫶".as_bytes(),
+                    day: 0,
+                    counts: [1, 1, i64::MAX, 0],
+                },
+                CampRow {
+                    campaign: b"c_2",
+                    channel: b"search",
+                    day: 1,
+                    counts: [2, 1, 3, 1],
+                },
+            ],
+        );
+        let camp = SerializedFileReader::new(File::open(camp_path).unwrap()).unwrap();
+        let camp_rg = camp.get_row_group(0).unwrap();
+        let schema = camp_rg.metadata().schema_descr();
+        assert_eq!(schema.column(3).physical_type(), Physical::INT32);
+        assert_eq!(schema.column(4).physical_type(), Physical::INT32);
+        assert_eq!(schema.column(5).physical_type(), Physical::INT64);
+        assert_eq!(schema.column(6).physical_type(), Physical::INT32);
+
+        let empty = temp_dir();
+        std::fs::create_dir_all(&empty).unwrap();
+        user_daily(&empty, &[], 1, &|_, _| {}, &[]);
+        campaign_daily(&empty.join("campaign.parquet"), &[]);
+        for name in ["part-0.parquet", "campaign.parquet"] {
+            let reader = SerializedFileReader::new(File::open(empty.join(name)).unwrap()).unwrap();
+            assert_eq!(reader.num_row_groups(), 0);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(empty).unwrap();
+    }
 }
