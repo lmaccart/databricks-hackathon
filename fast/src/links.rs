@@ -2,7 +2,7 @@
 //! that span input files. Canonical node indexes also serve as exact sort ranks.
 use super::{Chunk, Codec, NS, SHARD_SHIFT, for_rows};
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
 const LANES: usize = 64;
 
@@ -30,9 +30,9 @@ pub(super) fn unmix(x: u64) -> u64 {
     y ^ (y >> 27) ^ (y >> 54)
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 struct Slot {
-    key: u64,
+    key: AtomicU64,
     value: u64,
 }
 
@@ -46,7 +46,7 @@ impl Lane {
     fn find(&self, key: u64, hash: u64) -> usize {
         let mut i = (hash >> LANES.trailing_zeros()) as usize & self.mask;
         loop {
-            let k = self.slots[i].key;
+            let k = self.slots[i].key.load(Relaxed);
             if k == key || k == 0 {
                 return i;
             }
@@ -60,6 +60,7 @@ pub(super) struct People<'a> {
     lanes: Vec<Lane>,
     roots: Vec<u64>,
     pub(super) count: usize,
+    pub(super) rank_limit: usize,
 }
 
 // This bit is disjoint from the packed routing shard and the canonical node
@@ -77,17 +78,38 @@ impl<'a> People<'a> {
     #[inline]
     pub(super) fn lookup(&self, key: u64, h: u64) -> Identity {
         let lane = &self.lanes[h as usize & (LANES - 1)];
-        let s = lane.slots[lane.find(key, h)];
-        if s.value & LINKED != 0 {
-            Identity::Linked(s.value ^ LINKED)
-        } else {
-            Identity::Standalone(h)
+        let mut i = (h >> LANES.trailing_zeros()) as usize & lane.mask;
+        loop {
+            let slot = &lane.slots[i];
+            let occupant = slot.key.load(Relaxed);
+            let value = slot.value;
+            if occupant == key {
+                return Identity::Linked(value & !LINKED);
+            }
+            if value & LINKED == 0 {
+                // Originally empty: no linked key could be past this hole on
+                // its probe sequence. Let one exact singleton own its unused
+                // rank forever. A collision keeps the full-width stream.
+                if occupant == 0 && value != NO_RANK {
+                    let got = slot.key.compare_exchange(0, key, Relaxed, Relaxed);
+                    if got.is_ok() || got == Err(key) {
+                        return Identity::Linked(value);
+                    }
+                }
+                return Identity::Standalone(h);
+            }
+            i = (i + 1) & lane.mask;
         }
     }
 
     #[inline]
     pub(super) fn original(&self, rank: u32) -> u64 {
-        self.roots[rank as usize]
+        let r = rank as usize;
+        if r < self.count {
+            return self.roots[r];
+        }
+        let pos = r - self.count;
+        mix(self.lanes[pos % LANES].slots[pos / LANES].key.load(Relaxed))
     }
 
     #[inline]
@@ -111,6 +133,8 @@ impl<'a> People<'a> {
         let _ = addr;
     }
 }
+
+const NO_RANK: u64 = !LINKED;
 
 #[inline]
 fn root(parent: &[AtomicU32], mut x: u32) -> u32 {
@@ -163,13 +187,13 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
             keys.dedup();
             let cap = (keys.len() * 2 + 1).next_power_of_two();
             let mut lane = Lane {
-                slots: vec![Slot::default(); cap],
+                slots: std::iter::repeat_with(Slot::default).take(cap).collect(),
                 mask: cap - 1,
             };
             for (j, &k) in keys.iter().enumerate() {
                 let i = lane.find(k, mix(k));
                 lane.slots[i] = Slot {
-                    key: k,
+                    key: AtomicU64::new(k),
                     value: j as u64,
                 };
             }
@@ -229,12 +253,25 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         });
     let mut roots = keys;
     roots.par_iter_mut().for_each(|k| *k = mix(*k));
+    let span = lanes
+        .iter()
+        .map(|l| l.slots.len())
+        .max()
+        .unwrap_or(0)
+        .checked_mul(LANES)
+        .and_then(|n| n.checked_add(count))
+        .filter(|&n| n <= u32::MAX as usize);
     lanes.par_iter_mut().enumerate().for_each(|(s, lane)| {
-        for slot in &mut lane.slots {
-            if slot.key != 0 {
+        for (i, slot) in lane.slots.iter_mut().enumerate() {
+            if *slot.key.get_mut() != 0 {
                 let rank = root(&parent, (offsets[s] + slot.value as usize) as u32);
                 let routing = roots[rank as usize] & ((NS as u64 - 1) << SHARD_SHIFT);
                 slot.value = LINKED | routing | u64::from(rank);
+            } else if span.is_some() {
+                let rank = (count + i * LANES + s) as u64;
+                slot.value = (mix(rank) & ((NS as u64 - 1) << SHARD_SHIFT)) | rank;
+            } else {
+                slot.value = NO_RANK;
             }
         }
     });
@@ -243,5 +280,62 @@ pub(super) fn person_names<'a>(chunks: &[Chunk<'a>]) -> People<'a> {
         lanes,
         roots,
         count,
+        rank_limit: span.unwrap_or(count),
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+    use crate::csv::chunks_of;
+    use std::path::Path;
+
+    #[test]
+    fn concurrent_singletons_share_holes_without_masking_aliases() {
+        let input = b"user_id_a,user_id_b\nZalias,Aroot\nAroot,Balias\n";
+        let chunks = chunks_of(input, &["user_id_a", "user_id_b"], Path::new("links.csv"));
+        let names = person_names(&chunks);
+        let mut groups = std::collections::HashMap::<(usize, usize), Vec<(u64, u64)>>::new();
+        let mut clash = None;
+        for n in 0..1024 {
+            let k = crate::person::inline(format!("u{n}").as_bytes()).unwrap();
+            let h = mix(k);
+            let s = h as usize & (LANES - 1);
+            let v = groups.entry((s, names.lanes[s].find(k, h))).or_default();
+            v.push((k, h));
+            if v.len() == 2 {
+                clash = Some([v[0], v[1]]);
+                break;
+            }
+        }
+        let pair = clash.unwrap();
+        let observed: Vec<_> = (0..1024usize)
+            .into_par_iter()
+            .map(|i| {
+                let (k, h) = pair[i % 2];
+                match names.lookup(k, h) {
+                    Identity::Linked(v) => {
+                        assert_eq!(names.original(v as u32), h);
+                        (true, v)
+                    }
+                    Identity::Standalone(v) => {
+                        assert_eq!(v, h);
+                        (false, v)
+                    }
+                }
+            })
+            .collect();
+        assert_ne!(observed[0].0, observed[1].0);
+        for (i, v) in observed.iter().enumerate() {
+            assert_eq!(*v, observed[i % 2]);
+        }
+        let root = mix(crate::person::inline(b"Aroot").unwrap());
+        for bytes in [b"Aroot".as_slice(), b"Zalias", b"Balias"] {
+            let k = crate::person::inline(bytes).unwrap();
+            let Identity::Linked(v) = names.lookup(k, mix(k)) else {
+                panic!("alias displaced");
+            };
+            assert_eq!(names.original(v as u32), root);
+        }
     }
 }

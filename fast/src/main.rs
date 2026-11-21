@@ -555,7 +555,7 @@ fn main() {
     );
     let cl_chunks = chunks_for(&click_files, &["click_id", "user_id", "campaign_id", "ts"]);
     let names = person_names(&link_chunks);
-    let packing = Packing::new(ws, we, names.count);
+    let packing = Packing::new(ws, we, names.rank_limit);
     log(&format!("links: {} linked ids", names.count));
 
     let ev_by_person = events::by_person(&ev_chunks, &sm, &names, (ws, we, &clock), packing, &log);
