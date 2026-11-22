@@ -114,10 +114,49 @@ static int manifest_ok(void) {
     return manifest_value_ok(buf, "\"window_start\"") && manifest_value_ok(buf, "\"window_end\"");
 }
 
+/* Input pages that are not resident make the pipeline's first pass wait on
+ * storage one fault at a time. PREFETCH_WORKERS short-lived children ask the
+ * kernel to read every input CSV ahead (POSIX_FADV_WILLNEED), sharing the files
+ * round-robin, while this process checks headers and execs the pipeline. Advice
+ * never changes file contents, so output is unaffected; on resident pages it
+ * is a cheap no-op. SS_PREFETCH=0 disables it. */
+#define PREFETCH_WORKERS 4
+static void prefetch_inputs(void) {
+#if defined(__linux__)
+    const char *env = getenv("SS_PREFETCH");
+    if (env && strcmp(env, "0") == 0) return;
+    static const char *subs[] = {"links", "events", "clicks"};
+    for (int k = 0; k < PREFETCH_WORKERS; k++) {
+        pid_t pid = fork();
+        if (pid != 0) continue; /* parent (or fork failure): carry on */
+        int i = 0;
+        for (unsigned s = 0; s < sizeof subs / sizeof *subs; s++) {
+            char path[4096];
+            snprintf(path, sizeof path, "%s/%s", data_dir, subs[s]);
+            DIR *d = opendir(path);
+            if (!d) continue;
+            for (struct dirent *e; (e = readdir(d));) {
+                if (!ends_with_csv(e->d_name) || i++ % PREFETCH_WORKERS != k) continue;
+                char file[8192];
+                snprintf(file, sizeof file, "%s/%s", path, e->d_name);
+                int fd = open(file, O_RDONLY);
+                if (fd >= 0) {
+                    posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+                    close(fd);
+                }
+            }
+            closedir(d);
+        }
+        _exit(0);
+    }
+#endif
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     data_dir = getenv("DATA_DIR");
     if (!data_dir || !*data_dir) data_dir = "/data";
+    prefetch_inputs();
     const char *fast = getenv("SS_FAST_BIN");
     const char *general = getenv("SS_GENERAL_BIN");
     if (!fast) fast = "/app/shopping";
