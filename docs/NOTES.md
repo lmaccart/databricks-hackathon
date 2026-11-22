@@ -1,5 +1,16 @@
 # Shopping Sessions review — 2026-11-20 (Houston)
 
+## Official practice scores for the launcher builds — 2026-11-21
+
+| Commit | What changed | Official practice |
+|---|---|---:|
+| `087c35d` (Rust release) | — | 0.99 s |
+| `43c76dc` | Team 67's C++ behind the header launcher | 0.976 s |
+| `60cb439` | + run the C++ only with AVX-512 VBMI2 | 0.9805 s |
+| `d6b1d2b` | + 4 children issue `POSIX_FADV_WILLNEED` on every input CSV at start | **0.9537 s** |
+
+Very different pipelines (Rust and Team 67's C++, up to 3.5x apart warm on the same Xeon by Team 67's measurement) scored within 1.5% of each other, and read-ahead gave the clearest gain. Our working hypothesis is that the scorer's runs are limited by reading input that is not yet resident; it is not verified. Leif reported the scores.
+
 ## Shipped pipeline is now Team 67's C++ (MIT) — 2026-11-21
 
 The production pipeline is now Team 67's MIT-licensed C++, [github.com/mwkhettab/shopping-sessions-cpp](https://github.com/mwkhettab/shopping-sessions-cpp) at `29ee0cc5c26291c511cad44aec18c6531f050f79`, vendored verbatim in `cpp/pipeline/` with `build.sh`; the Dockerfile is theirs apart from a header comment. `cpp/pipeline/LICENSE` is theirs and is copied into the image. The Rust pipeline in `fast/` is retained but not shipped (`make build-rust`). `reference/pipeline.py` remains the independent oracle.
