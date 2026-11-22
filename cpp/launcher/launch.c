@@ -120,7 +120,7 @@ static int manifest_ok(void) {
  * round-robin, while this process checks headers and execs the pipeline. Advice
  * never changes file contents, so output is unaffected; on resident pages it
  * is a cheap no-op. SS_PREFETCH=0 disables it. */
-#define PREFETCH_WORKERS 4
+#define PREFETCH_WORKERS 16
 static void prefetch_inputs(void) {
 #if defined(__linux__)
     const char *env = getenv("SS_PREFETCH");
