@@ -7,7 +7,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends g++ clang-16 ll
 WORKDIR /src
 COPY cpp/pipeline cpp/pipeline
 COPY build.sh .
-RUN CXX=clang++-16 STATIC=1 sh build.sh
+# GCC, as in Team 67's 0.33 s submission (dc216ac / corrected 5230d48): build.sh's
+# non-Clang branch is exactly that release's command. Their later Clang build scored 0.976 s for us.
+RUN CXX=g++ STATIC=1 sh build.sh
 COPY cpp/launcher cpp/launcher
 RUN clang-16 -O2 -static -o build/launch cpp/launcher/launch.c
 
