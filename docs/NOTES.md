@@ -8,8 +8,10 @@
 | `43c76dc` | Team 67's C++ behind the header launcher | 0.976 s |
 | `60cb439` | + run the C++ only with AVX-512 VBMI2 | 0.9805 s |
 | `d6b1d2b` | + 4 children issue `POSIX_FADV_WILLNEED` on every input CSV at start | **0.9537 s** |
+| `7232e41` | 16 read-ahead children instead of 4 | 0.9589 s |
+| `2d748f6` | DIAGNOSTIC: 8 children read every input byte before the pipeline starts | 1.0642 s |
 
-Very different pipelines (Rust and Team 67's C++, up to 3.5x apart warm on the same Xeon by Team 67's measurement) scored within 1.5% of each other, and read-ahead gave the clearest gain. Our working hypothesis is that the scorer's runs are limited by reading input that is not yet resident; it is not verified. Leif reported the scores.
+Very different pipelines (Rust and Team 67's C++, up to 3.5x apart warm on the same Xeon by Team 67's measurement) scored within 1.5% of each other, and read-ahead gave the clearest gain. The read-everything diagnostic added only 0.11 s (about 17 GB/s for 1.9 GB), the speed of resident pages, against 0.15-0.2 s for the same diagnostic warm in the local arm64 image. So the scorer's input is effectively resident and input reading is not the limit; more read-ahead tuning is not worth submissions. Leif reported the scores.
 
 ## Shipped pipeline is now Team 67's C++ (MIT) — 2026-11-21
 
